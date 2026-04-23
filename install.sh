@@ -1,4 +1,13 @@
 #!/bin/bash
-# Stub. Real implementation in Task 18.
-echo "install.sh stub - not yet implemented"
-exit 1
+# Agam installer. Runs on macOS host.
+set -u
+command -v uv >/dev/null || { echo "ERR: install uv first -- https://docs.astral.sh/uv/"; exit 1; }
+command -v claude >/dev/null || { echo "ERR: install Claude Code first -- https://claude.ai/code"; exit 1; }
+command -v docker >/dev/null || { echo "WARN: docker not found. Watchdog + bootstrap require a running claude-code container. Install Docker Desktop to enable these."; }
+[[ "$(uname)" == "Darwin" ]] || { echo "ERR: macOS only for v1."; exit 1; }
+[[ -f "$HOME/.claude/.credentials.json" ]] || { echo "ERR: no OAuth credentials at ~/.claude/.credentials.json. Run 'claude' interactively once to authenticate, then rerun ./install.sh."; exit 1; }
+
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_DIR"
+uv sync
+uv run agam init "$@"
