@@ -1,0 +1,110 @@
+Write a work journal entry to a temp file. The watchdog will append it to work-log.md.
+
+SESSION SIGNALS: {{SESSION_SIGNALS}}
+
+Length guide based on highest-weight signal present:
+- SHIPPED / DECIDED / LEARNED: 100-300 words, outcome-focused narrative
+- BUILT / EXPLORED / DEBUGGED: 50-150 words, focus on what changed or was found
+- ROUTINE: 2-3 sentences
+- BRIEF: 1 line or skip entirely
+
+CONTEXT:
+<context>
+{{CONTEXT_SUMMARY}}
+</context>
+
+PROJECT: {{PROJECT_NAME}}
+DATE: {{DATE}}
+TIME: {{TIME}}
+OUTPUT_PATH: {{OUTPUT_PATH}}
+SINCE_ISO: {{SINCE_ISO}}
+
+## Delta mode (critical)
+
+SINCE_ISO controls what you summarize:
+
+- If SINCE_ISO is "SESSION-START": this is a fresh log for this session.
+  Summarize the whole transcript normally.
+
+- If SINCE_ISO is an ISO timestamp (e.g. "2026-04-22T09:15:30"):
+  this session was already logged earlier. Summarize ONLY the activity that
+  happened AFTER that timestamp. Messages from before SINCE_ISO have been
+  logged already; re-stating them creates duplicates in the journal.
+
+  Each transcript message has a "timestamp" field. Skip any message whose
+  timestamp is <= SINCE_ISO. Summarize only the remainder.
+
+- If SINCE_ISO is set AND there is no substantive new activity after the
+  cutoff (nothing beyond trivial chat, no files changed, no decisions made):
+  write EXACTLY the single line `SKIP` to OUTPUT_PATH and exit.
+
+## Step A: Read the transcript
+
+Read {{JSONL_PATH}} in chunks (offset/limit). Extract: topics worked on, actions taken,
+key decisions, problems and fixes, files actually changed.
+Only look at "role": "human" or "role": "assistant" lines.
+Skip: token counts, tool call JSON, system-reminder tags, base64, images, large code blocks.
+If no path provided, skip and use context only.
+
+Apply the delta cutoff above while reading.
+
+## Step B: Read existing work-log for style reference
+
+Read ~/.claude/work-log.md (last ~100 lines are enough). This is READ-ONLY -- do NOT try
+to Edit or Write to work-log.md. The file is protected; any attempt will be blocked.
+You are only reading it to match the existing voice and formatting style.
+
+## Step C: Assess whether to write anything
+
+If the session is BRIEF (no real work, smoke tests, exploration-only with no decisions):
+write EXACTLY the single line `SKIP` to OUTPUT_PATH and exit. Do not pad trivial sessions.
+
+## Step D: Write the entry to OUTPUT_PATH
+
+WRITING RULES:
+- First person ("I did", "I fixed", "I decided")
+- Conversational, like personal notes -- not a report
+- Outcome-focused: what actually changed, not just what was tried
+- Include the "why" not just the "what"
+- Mention dead ends and failed approaches
+- ASCII only, straight quotes, no emojis, no unicode
+
+ANTI-AI RULES (critical -- these will be checked):
+- NO em dashes (use -- instead)
+- NO: delve, navigate, landscape, crucial, foster, underscores, Moreover, Furthermore,
+  Notably, Importantly, harness, leverage, robust, streamline, paradigm, holistic,
+  synergy, pivotal, nuanced, multifaceted, comprehensive
+- NO rule of three (don't list exactly 3 adjectives/examples in parallel)
+- NO "This [noun] [verb]s the..." pattern
+- NO starting sentences with conjunctive adverbs (However, Additionally, etc.)
+- Write like a tired developer jotting notes, not an AI writing a report
+
+## Step E: Format and write
+
+MANDATORY: You MUST end this run by calling the Write tool exactly once with
+path = OUTPUT_PATH. Every run writes OUTPUT_PATH -- no exceptions. If you
+decided the session is BRIEF/trivial or the delta is empty, the file MUST
+contain the literal 4 characters: SKIP (one line, nothing else). Otherwise
+the file contains the body text only.
+
+Do NOT respond conversationally and exit without writing OUTPUT_PATH. The
+watchdog checks for OUTPUT_PATH's existence; if missing, the session is
+marked skipped-no-output and this run is wasted.
+
+The watchdog will prepend the date/time/project header when it appends to
+work-log.md, so your entry should contain ONLY the body text -- NOT the
+`## {{DATE}}` or `### {{TIME}}` headers.
+
+Example body (what you write to OUTPUT_PATH for a real-work session):
+
+    Picked up the foo refactor. The API call was timing out because the retry logic
+    was wrapping the wrong exception type. Swapped to match on requests.ConnectTimeout
+    instead of TimeoutError. Tests pass now.
+
+    Files modified: src/api/client.py, tests/test_client.py
+
+That is all. No headers, no leading `---`, no trailing blank lines. Just the body.
+
+Example for a trivial session (what you write to OUTPUT_PATH):
+
+    SKIP

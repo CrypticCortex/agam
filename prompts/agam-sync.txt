@@ -1,0 +1,78 @@
+Analyze a work session and propose updates to the user's Agam identity files.
+You ONLY analyze and output proposals. You do NOT write any files.
+
+SESSION SIGNALS: {{SESSION_SIGNALS}}
+
+CONTEXT:
+<context>
+{{CONTEXT_SUMMARY}}
+</context>
+
+## Step A: Ground yourself in the user's identity FIRST
+
+Before analyzing anything else, read:
+- ~/.claude/agam/AGAM.md  (who this person is, values, how they work, lessons learned)
+- ~/.claude/agam/THISAI.md  (active goals with projects grouped under them)
+
+This is your filter. A lesson is only worth proposing if it's genuinely specific to
+this person's patterns and current goals -- not generic advice they already know.
+Check the "What I've Learned" section -- if a similar lesson already exists, don't propose it again.
+
+## Step B: Check existing Agam for duplicates
+
+Read to avoid repeating what's already captured:
+- ~/.claude/agam/AGAM.md "What I've Learned" section (lessons, corrections, insights)
+- ~/.claude/agam/THISAI.md (projects and goals)
+
+Also read ~/.claude/agam/SUVADU.md (changelog) -- if THISAI.md hasn't been
+updated in 10+ days, flag confidence as lower in your analysis.
+
+## Step C: Read work-log for cross-session patterns
+
+Read ~/.claude/work-log.md. Look at the 15 most recent entries.
+
+Look for:
+- Same issue appearing 2+ times across sessions = strong LESSONS candidate
+- Same project/theme across 3+ consecutive sessions = NARRATIVES candidate
+- Recurring tools/libraries mentioned 3+ times across entries = consider adding to AGAM.md "How I Work"
+
+Do NOT compute or emit time-based staleness or goal-drift signals. Stall detection
+and goal-drift are derived elsewhere on-demand (session-patterns.py gaps). If you
+are tempted to write "not in work-log for N days" or "stalled X days" -- don't.
+Those are not session-originated; they are calendar arithmetic and produce noise.
+
+## Step D: Read the session transcript
+
+Read {{JSONL_PATH}} in chunks. Confirm:
+- Which files were actually modified (vs. just read) -- confirms BUILT/SHIPPED signals
+- What specific problems were solved
+- Any decisions made that contradicted prior assumptions
+- Anything that surprised or was counterintuitive
+
+## Step E: Generate proposals
+
+If this session did not touch files, ship code, or make decisions, emit `none` for
+every AUTO_APPLY section. Zero proposals is a valid and expected outcome for trivial
+sessions (smoke tests, exploration, chat). Do not invent work that wasn't done.
+
+Output ONLY in this exact format. Nothing before or after it.
+
+---AGAM SYNC PROPOSALS---
+SIGNALS: [list the session signal tags, e.g. SHIPPED, DECIDED, BUILT]
+
+AUTO_APPLY:
+THISAI_PROJECTS: [one line per project touched: "Project Name -- status note". Or: none]
+THISAI_GOALS: [one line per goal: "Goal Name -- progress note FROM THIS SESSION ONLY". Or: none]
+MEMORY: [one line per entry: "filename.md | type (user/feedback/project/reference) | one-line content summary". Or: none]
+LESSON: [confidence: HIGH or MEDIUM. "[lesson] **Title.** Explanation (2-4 sentences). Source: DATE session." Or: none]
+CORRECTION: ["[correction] **Title** (DATE). 2-sentence summary. [Full narrative: docs/corrections/wrong-NAME.md]" + full narrative content for the file. Or: none]
+INSIGHT: ["[insight] **Title.** Explanation (2-4 sentences). Source: DATE session." Or: none]
+---END PROPOSALS---
+
+Rules for each section:
+- THISAI_PROJECTS: only projects that had real work this session (files changed)
+- THISAI_GOALS: only if this session advanced or blocked the goal. Never emit time-based,
+  mtime-based, or staleness-based bullets. Propose only what is evidenced in THIS transcript.
+- LESSON: high bar -- must be specific to this person's work style, not textbook advice
+- INSIGHT: very high bar -- must be genuinely non-obvious and counterintuitive
+- CORRECTION: only if an actual held belief was proven incorrect this session
