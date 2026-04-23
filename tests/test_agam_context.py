@@ -87,16 +87,17 @@ def test_learned_does_not_crash_on_empty_kg(agam_env):
 
 
 def test_agam_home_redirect_isolates(tmp_path):
-    """If AGAM_HOME points at a dir with no identity files, the tool should not
-    read from the user's real ~/.claude/agam/. Verify by passing a dir containing
-    a sentinel file and confirming the tool's boot output reflects the sentinel,
-    not the user's real identity."""
+    """If AGAM_HOME points at a dir with a sentinel AGAM.md, `learned`
+    subcommand must surface that sentinel (not content from the user's real
+    ~/.claude/agam/). Upstream `cmd_boot()` does not read AGAM.md -- the
+    graph-recall hook injects identity on demand -- so `learned` is the
+    observable that proves the env override actually redirects file reads."""
     fake_home = tmp_path / "empty-agam"
     fake_home.mkdir()
     (fake_home / "AGAM.md").write_text(
-        "# AGAM\n\nSENTINEL-STRING-UNLIKELY-TO-APPEAR-IN-REAL-IDENTITY\n"
+        "# AGAM\n\n## What I've Learned\n\n"
+        "SENTINEL-STRING-UNLIKELY-TO-APPEAR-IN-REAL-IDENTITY\n"
     )
-    (fake_home / "THISAI.md").write_text("# THISAI\n\nsentinel direction\n")
     env = {
         **os.environ,
         "AGAM_HOME": str(fake_home),
@@ -104,13 +105,13 @@ def test_agam_home_redirect_isolates(tmp_path):
         "AGAM_WORK_LOG": str(tmp_path / "fake-work-log.md"),
         "AGAM_PROJECTS_DIR": str(tmp_path / "nonexistent-projects"),
     }
-    # Create empty KG + work log so the tool doesn't fail on missing files
+    # Fresh KG + stub work log so learned does not fail on missing deps
     conn = sqlite3.connect(tmp_path / "nonexistent.db")
     conn.executescript(SCHEMA.read_text())
     conn.close()
     (tmp_path / "fake-work-log.md").write_text("# empty\n")
     r = subprocess.run(
-        ["uv", "run", "--script", str(TOOL), "boot"],
+        ["uv", "run", "--script", str(TOOL), "learned"],
         env=env,
         capture_output=True,
         text=True,

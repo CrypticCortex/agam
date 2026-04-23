@@ -274,18 +274,6 @@ def cmd_boot():
     """
     parts = []
 
-    # Identity header (reads AGAM.md first line / title if available so callers
-    # can visually confirm the right AGAM_HOME was resolved).
-    if AGAM_MD.exists():
-        try:
-            identity_text = AGAM_MD.read_text().strip()
-            if identity_text:
-                # Grab first ~20 non-empty lines as the identity preamble.
-                preamble_lines = [ln for ln in identity_text.splitlines() if ln.strip()][:20]
-                parts.append("## Identity\n" + "\n".join(preamble_lines))
-        except OSError:
-            pass
-
     # Project-relevant lessons (scan CWD for context signals)
     # This is the primary value of boot -- lessons that apply to THIS project
     db = get_db()
@@ -478,10 +466,7 @@ def cmd_learned():
     if match:
         print(truncate(match.group(1)))
     else:
-        # Fall back to the whole AGAM.md so the caller sees *something*
-        # instead of a silent failure when the section is absent.
-        print("[NOTE] No 'What I've Learned' section found; showing AGAM.md in full.")
-        print(truncate(text))
+        print(f"[NOT FOUND] No 'What I've Learned' section in AGAM.md at {AGAM_MD}")
 
 
 def main():
