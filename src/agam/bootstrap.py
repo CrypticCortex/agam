@@ -33,10 +33,13 @@ import concurrent.futures
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 
 def scan_transcripts(
@@ -642,3 +645,246 @@ def reconcile_candidates(
         f"ERR: reconciliation failed twice{detail}. Candidates saved to "
         f"{save_path}."
     )
+
+
+# ---- Orchestration (Task 22) --------------------------------------------
+
+
+def _default_state_path() -> Path:
+    """Default location for the durable bootstrap state file.
+
+    Computed at call time so ``monkeypatch.setenv("HOME", ...)`` works in
+    tests without needing explicit injection.
+    """
+    return Path(os.path.expanduser("~/.claude/.agam-bootstrap-state.json"))
+
+
+def _load_state(path: Path) -> dict | None:
+    """Return parsed state from ``path``, or ``None`` if missing/malformed.
+
+    A malformed state file is treated identically to an absent one: we log
+    a warning to stderr and tell the caller to start fresh. Never raises.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError):
+        return None
+    except OSError as exc:
+        print(
+            f"[agam.bootstrap] run_bootstrap: cannot read state {path}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(
+            f"[agam.bootstrap] run_bootstrap: state file {path} is malformed "
+            f"({exc}); starting clean.",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _save_state(path: Path, state: dict) -> None:
+    """Atomically write ``state`` to ``path``.
+
+    Writes to a tempfile in the same directory, fsyncs, then ``os.replace``.
+    Same-dir tempfile guarantees the rename is atomic on POSIX (same
+    filesystem). We clean up the tempfile on any error so we never leave
+    stray ``.tmp`` files behind.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        # Best-effort cleanup; re-raise the original error for the caller.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _notify(message: str) -> None:
+    """Fire a macOS notification via ``osascript``. Silent on failure.
+
+    Missing ``osascript`` (e.g. running inside a Linux devcontainer) should
+    not abort the bootstrap. Callers can still pass an explicit ``notify_fn``
+    if they want different behavior.
+    """
+    safe = message.replace('"', "'")
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{safe}" with title "Agam"',
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        # osascript not available or timed out; swallow.
+        return
+
+
+def _install_sigint_handler(flush_fn: Callable[[], None]):
+    """Install a SIGINT handler that calls ``flush_fn`` then re-raises.
+
+    Returns the previous handler so the caller can restore it in a
+    ``finally`` block. The re-raise path uses Python's default SIGINT
+    semantics -- ``KeyboardInterrupt`` -- so existing ``try/except`` logic
+    stays well-behaved.
+    """
+    previous = signal.getsignal(signal.SIGINT)
+
+    def handler(signum, frame):
+        try:
+            flush_fn()
+        except Exception as exc:  # noqa: BLE001 -- best-effort flush
+            print(
+                f"[agam.bootstrap] SIGINT: flush_fn raised: {exc}",
+                file=sys.stderr,
+            )
+        # Convert to KeyboardInterrupt so callers see the standard
+        # Python cancellation exception.
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGINT, handler)
+    return previous
+
+
+def run_bootstrap(
+    projects_dir: Path,
+    days: int = 30,
+    *,
+    model_haiku: str = "haiku-4-5",
+    model_sonnet: str = "sonnet-4-6",
+    state_path: Path | None = None,
+    candidates_path: Path | None = None,
+    notify_fn: Callable[[str], None] | None = None,
+    resume: bool = True,
+) -> dict:
+    """Run the end-to-end bootstrap: scan + extract + reconcile, durably.
+
+    Processes one transcript at a time so SIGINT or a mid-run crash loses
+    at most one transcript's worth of work. After every transcript the
+    state file is atomically rewritten, so a later ``resume=True`` run
+    picks up exactly where this one left off.
+
+    Args:
+        projects_dir: Root of the Claude Code projects tree.
+        days: mtime filter (see ``scan_transcripts``).
+        model_haiku: Extraction model.
+        model_sonnet: Reconciliation model.
+        state_path: Override for the durable state file. Defaults to
+            ``~/.claude/.agam-bootstrap-state.json``.
+        candidates_path: Forwarded to ``reconcile_candidates`` for its
+            double-failure fallback write.
+        notify_fn: Callable invoked at 50% progress and on completion.
+            Defaults to the macOS ``osascript`` notifier; tests inject a
+            list-appender.
+        resume: When true (default), consults the state file to skip
+            already-processed transcripts. Set false to force a clean run.
+
+    Returns:
+        ``{"entities": [...], "relationships": [...]}`` from the Sonnet
+        reconciliation pass. Zero transcripts -> empty result, no calls
+        to extract / reconcile / notify.
+    """
+    state_path = state_path or _default_state_path()
+    notifier = notify_fn if notify_fn is not None else _notify
+
+    processed: list[str] = []
+    candidates: list[dict] = []
+    if resume:
+        prior = _load_state(state_path)
+        if prior:
+            p = prior.get("processed")
+            c = prior.get("candidates")
+            if isinstance(p, list):
+                processed = [str(x) for x in p]
+            if isinstance(c, list):
+                candidates = [x for x in c if isinstance(x, dict)]
+
+    all_transcripts = scan_transcripts(projects_dir, days=days)
+    processed_set = set(processed)
+    pending = [t for t in all_transcripts if str(t) not in processed_set]
+
+    if not all_transcripts:
+        # Nothing to do at all. Don't touch the state file or notifier.
+        return {"entities": [], "relationships": []}
+
+    # Denominator for the 50% gate is the full scan, so resume runs that
+    # finish the 2nd half still skip the (already-fired) 50% notification.
+    total = len(all_transcripts)
+    halfway_threshold = total // 2 if total >= 2 else None
+    halfway_fired = len(processed) >= (halfway_threshold or total + 1)
+
+    def flush():
+        _save_state(
+            state_path,
+            {"processed": list(processed), "candidates": list(candidates)},
+        )
+
+    prior_handler = _install_sigint_handler(flush)
+    try:
+        for transcript in pending:
+            new = extract_from_transcript(transcript, model=model_haiku)
+            candidates.extend(new)
+            processed.append(str(transcript))
+            flush()
+
+            if (
+                not halfway_fired
+                and halfway_threshold is not None
+                and len(processed) >= halfway_threshold
+            ):
+                halfway_fired = True
+                try:
+                    notifier("Agam bootstrap: 50% complete")
+                except Exception as exc:  # noqa: BLE001 -- notifier is advisory
+                    print(
+                        f"[agam.bootstrap] run_bootstrap: notify 50% failed: {exc}",
+                        file=sys.stderr,
+                    )
+
+        result = reconcile_candidates(
+            candidates, model=model_sonnet, candidates_path=candidates_path
+        )
+    finally:
+        signal.signal(signal.SIGINT, prior_handler)
+
+    # Success: clean up state + ping user.
+    try:
+        state_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(
+            f"[agam.bootstrap] run_bootstrap: could not delete state "
+            f"{state_path}: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        notifier("Agam bootstrap: done")
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[agam.bootstrap] run_bootstrap: notify done failed: {exc}",
+            file=sys.stderr,
+        )
+
+    return result
