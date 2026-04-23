@@ -447,3 +447,198 @@ def extract_all(
                     file=sys.stderr,
                 )
     return all_candidates
+
+
+# ---- Reconciliation -----------------------------------------------------
+
+
+_RECONCILE_PROMPT_TEMPLATE = """\
+You are reconciling entity + relationship candidates extracted from many
+Claude Code session transcripts. Merge duplicates, resolve name variants
+(different capitalizations, abbreviations), union properties, and return a
+clean JSON object.
+
+Return ONLY a single JSON object with two keys: "entities" and
+"relationships". No prose, no markdown fences.
+
+Schema:
+{{
+  "entities":      [{{"name": "...", "type": "...", "description": "..."}}],
+  "relationships": [{{"source": "...", "relation": "...", "target": "..."}}]
+}}
+
+Candidates:
+{candidates}
+"""
+
+_RECONCILE_STRICT_SUFFIX = (
+    "\n\nRETURN ONLY VALID JSON. NO PROSE. NO CODE FENCES. "
+    "NO LEADING OR TRAILING TEXT."
+)
+
+
+def _dedupe_entities(entities: list[dict]) -> list[dict]:
+    """Collapse entities that share a case-insensitive ``name``.
+
+    Properties are unioned across variants (later variants win on conflict for
+    scalar fields, but ``props`` dicts are merged key-by-key). The first
+    variant's ``name`` is preserved verbatim so casing is stable for the
+    prompt.
+    """
+    merged: dict[str, dict] = {}
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        name = ent.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        key = name.lower()
+        if key not in merged:
+            merged[key] = {k: v for k, v in ent.items()}
+            continue
+        existing = merged[key]
+        for k, v in ent.items():
+            if k == "name":
+                continue
+            if k == "props" and isinstance(v, dict):
+                existing_props = existing.get("props") or {}
+                if not isinstance(existing_props, dict):
+                    existing_props = {}
+                merged_props = {**existing_props, **v}
+                existing["props"] = merged_props
+            elif k not in existing or not existing.get(k):
+                existing[k] = v
+    return list(merged.values())
+
+
+def _dedupe_relationships(relationships: list[dict]) -> list[dict]:
+    """Collapse relationships with identical ``(source, relation, target)``."""
+    seen: dict[tuple, dict] = {}
+    for rel in relationships:
+        if not isinstance(rel, dict):
+            continue
+        key = (rel.get("source"), rel.get("relation"), rel.get("target"))
+        if None in key:
+            continue
+        if key not in seen:
+            seen[key] = {k: v for k, v in rel.items()}
+    return list(seen.values())
+
+
+def _regroup_by_kind(candidates: list[dict]) -> dict:
+    """Split a flat ``[{kind, ...}]`` list into ``{entities, relationships}``.
+
+    Candidate tags beyond ``entity`` / ``relationship`` are silently dropped
+    rather than raised. The extraction pass only ever emits those two kinds.
+    """
+    entities: list[dict] = []
+    relationships: list[dict] = []
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        kind = c.get("kind")
+        if kind == "entity":
+            # Entities carry ``source`` as transcript provenance; drop it so
+            # the reconciler sees only model fields.
+            trimmed = {k: v for k, v in c.items() if k not in ("kind", "source")}
+            entities.append(trimmed)
+        elif kind == "relationship":
+            # Relationships keep their own ``source`` (subject of the
+            # relation); ``source_transcript`` is the provenance.
+            trimmed = {k: v for k, v in c.items() if k not in ("kind", "source_transcript")}
+            relationships.append(trimmed)
+    return {"entities": entities, "relationships": relationships}
+
+
+def _parse_reconciliation_response(raw: str) -> dict:
+    """Parse ``claude -p --output-format stream-json`` output for Sonnet.
+
+    Raises:
+        json.JSONDecodeError: when no parseable JSON object can be recovered
+            from the output. The retry loop in ``reconcile_candidates``
+            catches this to decide whether to re-prompt.
+    """
+    payload = _parse_stream_json(raw)
+    if isinstance(payload, dict) and (
+        "entities" in payload or "relationships" in payload
+    ):
+        return {
+            "entities": payload.get("entities") or [],
+            "relationships": payload.get("relationships") or [],
+        }
+    raise json.JSONDecodeError(
+        "no reconciliation JSON in stream-json output", raw or "", 0
+    )
+
+
+def _default_candidates_path() -> Path:
+    return Path(os.path.expanduser("~/.claude/.agam-bootstrap-candidates.json"))
+
+
+def reconcile_candidates(
+    candidates: list[dict],
+    model: str = "sonnet-4-6",
+    candidates_path: Path | None = None,
+) -> dict:
+    """Merge extracted candidates into a single reconciled KG payload.
+
+    Flow:
+
+    1. Regroup the flat candidate list by ``kind``.
+    2. Dedupe client-side to keep the Sonnet prompt small.
+    3. Call ``_run_claude`` with ``model`` (default Sonnet) and a 600s timeout.
+    4. On ``json.JSONDecodeError``, retry once with a stricter JSON-only
+       suffix appended to the prompt.
+    5. On a second failure, write the deduped candidates to
+       ``candidates_path`` (default ``~/.claude/.agam-bootstrap-candidates.json``)
+       and raise ``SystemExit`` with an actionable message.
+
+    Returns:
+        ``{"entities": [...], "relationships": [...]}`` with keys in that
+        order regardless of the model's ordering.
+    """
+    grouped = _regroup_by_kind(candidates)
+    deduped = {
+        "entities": _dedupe_entities(grouped["entities"]),
+        "relationships": _dedupe_relationships(grouped["relationships"]),
+    }
+
+    save_path = candidates_path or _default_candidates_path()
+    base_prompt = _RECONCILE_PROMPT_TEMPLATE.format(
+        candidates=json.dumps(deduped, ensure_ascii=False, indent=2)
+    )
+
+    attempts = [base_prompt, base_prompt + _RECONCILE_STRICT_SUFFIX]
+    last_error: Exception | None = None
+    for prompt in attempts:
+        try:
+            stdout = _run_claude(prompt, model, timeout=600)
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+        try:
+            return _parse_reconciliation_response(stdout)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+
+    # Both attempts failed. Persist deduped candidates so a later pass can
+    # resume without re-running Haiku extraction.
+    try:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_text(
+            json.dumps(deduped, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(
+            f"[agam.bootstrap] reconcile: could not save candidates to "
+            f"{save_path}: {exc}",
+            file=sys.stderr,
+        )
+
+    detail = f" ({last_error})" if last_error else ""
+    sys.exit(
+        f"ERR: reconciliation failed twice{detail}. Candidates saved to "
+        f"{save_path}."
+    )
