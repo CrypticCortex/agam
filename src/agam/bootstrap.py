@@ -4,7 +4,7 @@ This module feeds Claude Code session transcripts (JSONL files under
 ``~/.claude/projects/<path-slug>/<session-id>.jsonl``) through an
 extraction + reconciliation pipeline to seed the knowledge graph.
 
-Task 19 implements only the pre-LLM scan + cost-estimate primitives:
+Task 19 primitives (pre-LLM):
 
 - ``scan_transcripts`` -- enumerate candidate JSONL files, filtered by mtime.
 - ``estimate_cost`` -- rough USD estimate for a Haiku extraction + Sonnet
@@ -12,13 +12,28 @@ Task 19 implements only the pre-LLM scan + cost-estimate primitives:
 - ``count_tokens_in_file`` -- ~4-chars-per-token heuristic. Intentionally
   avoids a real tokenizer dependency; we are estimating, not metering.
 
-Tasks 20-22 will extend this module with the actual LLM calls, resume/state
-tracking, and KG writes. Those layers are out of scope here.
+Task 20 adds the Haiku extraction pass:
+
+- ``_discover_container`` -- find a running claude-code devcontainer.
+- ``_run_claude`` -- shared helper that shells out to
+  ``docker exec <container> claude -p``. Task 21 (Sonnet reconciliation)
+  reuses this same helper -- only the ``model`` arg differs.
+- ``extract_from_transcript`` -- chunk a JSONL transcript, prompt Haiku
+  for entities + relationships, parse the stream-json output.
+- ``extract_all`` -- thread-pool fan-out across many transcripts.
+
+LLM calls go through ``docker exec`` intentionally. Users already
+authenticate via ``~/.claude/.credentials.json`` (OAuth managed by the
+Claude Code CLI); we do NOT take an Anthropic API key.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
+import json
 import os
+import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -116,3 +131,319 @@ def count_tokens_in_file(path: Path) -> int:
     except (OSError, UnicodeError):
         return 0
     return len(text) // 4
+
+
+# ---- LLM plumbing --------------------------------------------------------
+
+
+_DEFAULT_CONTAINER_PATTERN = "claude-code|claude-code"
+
+
+def _discover_container() -> str | None:
+    """Return the name of a running claude-code devcontainer, or ``None``.
+
+    Two selection modes:
+
+    1. ``AGAM_CONTAINER_NAME`` -- explicit override. We only verify the
+       named container is actually running; no pattern matching.
+    2. Otherwise match ``docker ps`` rows against ``AGAM_CONTAINER_PATTERN``
+       (default: ``claude-code|claude-code``) on ``"<name> <image>"``.
+
+    Any ``subprocess`` failure (``docker`` not installed, daemon down)
+    surfaces as ``None`` so callers can emit a single clean error.
+    """
+    pattern = os.environ.get("AGAM_CONTAINER_PATTERN", _DEFAULT_CONTAINER_PATTERN)
+    override = os.environ.get("AGAM_CONTAINER_NAME", "")
+
+    try:
+        if override:
+            r = subprocess.run(
+                ["docker", "ps", "--format", "{{.Names}}"],
+                capture_output=True,
+                text=True,
+            )
+            return override if override in r.stdout.split() else None
+
+        r = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}} {{.Image}}"],
+            capture_output=True,
+            text=True,
+        )
+        for line in r.stdout.splitlines():
+            if re.search(pattern, line, re.I):
+                return line.split()[0]
+        return None
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _run_claude(prompt: str, model: str, *, timeout: int = 300) -> str:
+    """Run ``claude -p`` inside the devcontainer and return raw stdout.
+
+    This is the single choke point for every LLM call Agam makes. Task 21
+    reuses it for Sonnet reconciliation. Anthropic SDK is deliberately NOT
+    imported; the user's existing ``~/.claude/.credentials.json`` OAuth is
+    what authorizes the call.
+
+    Raises:
+        SystemExit: no claude-code container is running.
+        RuntimeError: ``claude -p`` exited non-zero.
+    """
+    container = _discover_container()
+    if not container:
+        sys.exit(
+            "ERR: no claude-code container running. Start your devcontainer "
+            "and re-run `agam bootstrap`."
+        )
+    r = subprocess.run(
+        [
+            "docker",
+            "exec",
+            "-i",
+            container,
+            "claude",
+            "-p",
+            "--model",
+            model,
+            "--output-format",
+            "stream-json",
+        ],
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"claude -p failed (rc={r.returncode}): {r.stderr[:500]}"
+        )
+    return r.stdout
+
+
+# ---- Extraction ----------------------------------------------------------
+
+
+_EXTRACTION_PROMPT_TEMPLATE = """\
+You are extracting structured knowledge from a Claude Code session transcript.
+
+Read the transcript chunk below. Return ONLY a single JSON object with two
+keys: "entities" and "relationships". No prose, no markdown fences.
+
+Schema:
+{{
+  "entities":      [{{"name": "...", "type": "...", "description": "..."}}],
+  "relationships": [{{"source": "...", "relation": "...", "target": "..."}}]
+}}
+
+Entity types: project, service, bug, pattern, goal, person, decision, lesson.
+Relations: uses, depends-on, caused-by, relates-to, owns, fixes, affects.
+
+If nothing is worth extracting, return {{"entities": [], "relationships": []}}.
+
+Transcript chunk:
+---
+{chunk}
+---
+"""
+
+
+def _chunk_text(text: str, chunk_tokens: int) -> list[str]:
+    """Split ``text`` into chunks of ~``chunk_tokens`` tokens each.
+
+    Uses the 4-chars-per-token heuristic from ``count_tokens_in_file``.
+    A short text (single chunk) is returned as-is. This is deliberately
+    simple; real tokenizer-aware splitting is a future optimization.
+    """
+    chunk_chars = max(1, chunk_tokens * 4)
+    if len(text) <= chunk_chars:
+        return [text]
+    return [text[i : i + chunk_chars] for i in range(0, len(text), chunk_chars)]
+
+
+def _load_transcript_text(path: Path) -> str:
+    """Load a JSONL transcript, skipping malformed lines with a stderr warning.
+
+    Each line is parsed to validate it's JSON, then the raw line is kept for
+    inclusion in the prompt. That way the model sees the original shape,
+    including tool uses and roles, rather than a lossy reconstruction.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(
+            f"[agam.bootstrap] extract: cannot read {path}: {exc}",
+            file=sys.stderr,
+        )
+        return ""
+
+    good_lines: list[str] = []
+    for lineno, line in enumerate(raw.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            json.loads(stripped)
+        except json.JSONDecodeError:
+            print(
+                f"[agam.bootstrap] extract: skipping malformed JSONL "
+                f"at {path}:{lineno}",
+                file=sys.stderr,
+            )
+            continue
+        good_lines.append(line)
+    return "\n".join(good_lines)
+
+
+def _parse_stream_json(stdout: str) -> dict | None:
+    """Parse ``claude -p --output-format stream-json`` output.
+
+    Strategy: walk the lines, prefer the terminal ``type == "result"`` event
+    and parse its ``result`` field as JSON. If that fails, fall back to any
+    line whose parsed JSON looks like ``{"entities": [...]}``.
+
+    TODO(2026): pin the exact stream-json schema once the CLI stabilizes.
+    For now we're defensive about shape drift.
+    """
+    result_payload: str | None = None
+    entity_fallback: dict | None = None
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "result":
+            # Common shape: {"type":"result","result":"<json string>"}.
+            # Also tolerate {"result": {...}} or {"content": "..."}.
+            r = obj.get("result")
+            if isinstance(r, str):
+                result_payload = r
+            elif isinstance(r, dict):
+                return r
+            else:
+                c = obj.get("content")
+                if isinstance(c, str):
+                    result_payload = c
+        elif entity_fallback is None and "entities" in obj:
+            entity_fallback = obj
+
+    if result_payload is not None:
+        try:
+            return json.loads(result_payload)
+        except json.JSONDecodeError:
+            # Try to recover an embedded JSON object.
+            m = re.search(r"\{.*\}", result_payload, re.S)
+            if m:
+                try:
+                    return json.loads(m.group(0))
+                except json.JSONDecodeError:
+                    return None
+            return None
+
+    return entity_fallback
+
+
+def _candidates_from_payload(
+    payload: dict | None, source: Path
+) -> list[dict]:
+    """Flatten a model payload into a list of candidate dicts.
+
+    Each candidate carries ``kind`` ("entity" or "relationship"), the
+    fields from the model, and a ``source`` path for provenance.
+    """
+    if not payload:
+        return []
+
+    out: list[dict] = []
+    for ent in payload.get("entities", []) or []:
+        if not isinstance(ent, dict):
+            continue
+        out.append({"kind": "entity", "source": str(source), **ent})
+    for rel in payload.get("relationships", []) or []:
+        if not isinstance(rel, dict):
+            continue
+        out.append({"kind": "relationship", "source_transcript": str(source), **rel})
+    return out
+
+
+def extract_from_transcript(
+    transcript_path: Path,
+    model: str = "haiku-4-5",
+    chunk_tokens: int = 50_000,
+) -> list[dict]:
+    """Extract entity + relationship candidates from one transcript.
+
+    Args:
+        transcript_path: JSONL session transcript.
+        model: Claude model slug passed to ``claude -p --model``.
+        chunk_tokens: Maximum tokens per prompt. Transcripts longer than
+            this are split into multiple chunks and called sequentially.
+
+    Returns:
+        Flat list of candidate dicts. Empty list is a valid result
+        (model declined to extract anything).
+    """
+    text = _load_transcript_text(transcript_path)
+    if not text:
+        return []
+
+    chunks = _chunk_text(text, chunk_tokens)
+    candidates: list[dict] = []
+
+    for chunk in chunks:
+        prompt = _EXTRACTION_PROMPT_TEMPLATE.format(chunk=chunk)
+        try:
+            stdout = _run_claude(prompt, model)
+        except RuntimeError as exc:
+            print(
+                f"[agam.bootstrap] extract: _run_claude failed for "
+                f"{transcript_path}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        payload = _parse_stream_json(stdout)
+        chunk_candidates = _candidates_from_payload(payload, transcript_path)
+        if not chunk_candidates:
+            print(
+                f"[agam.bootstrap] extract: zero candidates from chunk of "
+                f"{transcript_path}",
+                file=sys.stderr,
+            )
+        candidates.extend(chunk_candidates)
+
+    return candidates
+
+
+def extract_all(
+    transcripts: list[Path],
+    model: str = "haiku-4-5",
+    max_workers: int = 4,
+) -> list[dict]:
+    """Run ``extract_from_transcript`` across many files in parallel.
+
+    Uses a thread pool because the bottleneck is the model server, not local
+    CPU; ``docker exec`` tolerates concurrent sessions fine.
+    """
+    if not transcripts:
+        return []
+
+    all_candidates: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(extract_from_transcript, t, model): t for t in transcripts
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            t = futures[fut]
+            try:
+                all_candidates.extend(fut.result())
+            except Exception as exc:  # noqa: BLE001 -- surface + continue
+                print(
+                    f"[agam.bootstrap] extract_all: {t} raised: {exc}",
+                    file=sys.stderr,
+                )
+    return all_candidates
