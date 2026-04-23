@@ -1,0 +1,39 @@
+# THISAI -- Direction
+<!-- Thisai (Tamil) means direction, bearing, compass point. This file holds where you are heading right now: active goals, projects in motion, what is stalled, what shipped, what was abandoned. -->
+
+Last updated: YYYY-MM-DD
+
+
+## Active Goals
+<!-- Concrete goals you are actively pursuing. One subsection per goal with status, progress, blockers. -->
+
+### Goal Name
+<!-- Short framing. Current status in a few sentences. Recent progress as dated bullets. -->
+
+
+## Other Active Projects (no explicit goal)
+<!-- Projects you are working on that do not ladder up to a named goal. One subsection per project. -->
+
+### Project Name
+<!-- One paragraph: what it is, why it exists, current state. -->
+
+
+## Stalled
+<!-- Goals or projects that have not moved in a while. Be honest about the stall date. -->
+
+### Project Name -- stalled since YYYY-MM-DD (N days)
+<!-- One line on what is blocking movement. -->
+
+
+## Completed
+<!-- Goals or projects you finished. Date them. -->
+
+### Project Name -- YYYY-MM-DD
+<!-- One line on the outcome. -->
+
+
+## Abandoned
+<!-- Things you deliberately stopped. Write the reason so you do not restart by accident. -->
+
+### Project Name
+<!-- One paragraph: why you stopped, what you learned. -->

@@ -1,0 +1,14 @@
+## Agam Integration
+
+This machine runs Agam: a knowledge-graph-powered identity and context injection layer.
+
+**Identity files** at `~/.claude/agam/`:
+- AGAM.md -- core identity, operating principles, lessons
+- THISAI.md -- current direction, projects, goals
+- MUGAM.md -- public face, how you present to others
+
+**Knowledge graph** at `~/.claude/knowledge/graph.db` -- entities + relationships queryable via `agam kg`. Use for connections/patterns, not flat lookups.
+
+**Auto-injection:** A UserPromptSubmit hook (`graph-recall`) matches entities in your message and injects their context. When you see a "DIRECTIVE:" or "KG:" header in system-reminders, use that data first before searching.
+
+**Session end:** A Stop hook enqueues sessions for background processing by `agam-watchdog`. Work-log and Agam files stay in sync without blocking.
