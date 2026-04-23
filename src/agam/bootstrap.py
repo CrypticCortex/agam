@@ -181,25 +181,44 @@ def _discover_container() -> str | None:
 
 
 def _run_claude(prompt: str, model: str, *, timeout: int = 300) -> str:
-    """Run ``claude -p`` inside the devcontainer and return raw stdout.
+    """Run ``claude -p`` and return raw stdout.
 
     This is the single choke point for every LLM call Agam makes. Task 21
     reuses it for Sonnet reconciliation. Anthropic SDK is deliberately NOT
     imported; the user's existing ``~/.claude/.credentials.json`` OAuth is
     what authorizes the call.
 
+    Two execution modes, selected by ``AGAM_BOOTSTRAP_MODE``:
+      - ``container`` (default): ``docker exec`` into the user's running
+        claude-code devcontainer.
+      - ``host``: invoke ``claude`` directly on PATH. Used when bootstrap
+        itself already runs inside a container (E2E tests) or when the
+        user's host has the Claude Code CLI installed directly.
+
     Raises:
-        SystemExit: no claude-code container is running.
+        SystemExit: container mode and no claude-code container running,
+            or host mode and ``claude`` not on PATH.
         RuntimeError: ``claude -p`` exited non-zero.
     """
-    container = _discover_container()
-    if not container:
-        sys.exit(
-            "ERR: no claude-code container running. Start your devcontainer "
-            "and re-run `agam bootstrap`."
-        )
-    r = subprocess.run(
-        [
+    mode = os.environ.get("AGAM_BOOTSTRAP_MODE", "container")
+    if mode == "host":
+        argv = [
+            "claude",
+            "-p",
+            "--model",
+            model,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]
+    else:
+        container = _discover_container()
+        if not container:
+            sys.exit(
+                "ERR: no claude-code container running. Start your devcontainer "
+                "and re-run `agam bootstrap`."
+            )
+        argv = [
             "docker",
             "exec",
             "-i",
@@ -210,7 +229,10 @@ def _run_claude(prompt: str, model: str, *, timeout: int = 300) -> str:
             model,
             "--output-format",
             "stream-json",
-        ],
+            "--verbose",
+        ]
+    r = subprocess.run(
+        argv,
         input=prompt,
         capture_output=True,
         text=True,
@@ -376,7 +398,7 @@ def _candidates_from_payload(
 
 def extract_from_transcript(
     transcript_path: Path,
-    model: str = "haiku-4-5",
+    model: str = "haiku",
     chunk_tokens: int = 50_000,
 ) -> list[dict]:
     """Extract entity + relationship candidates from one transcript.
@@ -424,7 +446,7 @@ def extract_from_transcript(
 
 def extract_all(
     transcripts: list[Path],
-    model: str = "haiku-4-5",
+    model: str = "haiku",
     max_workers: int = 4,
 ) -> list[dict]:
     """Run ``extract_from_transcript`` across many files in parallel.
@@ -580,7 +602,7 @@ def _default_candidates_path() -> Path:
 
 def reconcile_candidates(
     candidates: list[dict],
-    model: str = "sonnet-4-6",
+    model: str = "sonnet",
     candidates_path: Path | None = None,
 ) -> dict:
     """Merge extracted candidates into a single reconciled KG payload.
@@ -770,8 +792,8 @@ def run_bootstrap(
     projects_dir: Path,
     days: int = 30,
     *,
-    model_haiku: str = "haiku-4-5",
-    model_sonnet: str = "sonnet-4-6",
+    model_haiku: str = "haiku",
+    model_sonnet: str = "sonnet",
     state_path: Path | None = None,
     candidates_path: Path | None = None,
     notify_fn: Callable[[str], None] | None = None,

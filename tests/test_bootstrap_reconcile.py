@@ -217,7 +217,7 @@ def test_reconcile_uses_sonnet_and_long_timeout(monkeypatch, tmp_path):
         [{"kind": "entity", "name": "X"}],
         candidates_path=tmp_path / "save.json",
     )
-    assert captured["model"] == "sonnet-4-6"
+    assert captured["model"] == "sonnet"
     assert captured["timeout"] == 600
 
 

@@ -102,19 +102,34 @@ JSONL
 # (6) Bootstrap -- LIVE or SKIPPED ----------------------------------------
 if [[ "$LIVE" == "1" ]]; then
     echo "[step 6] LIVE bootstrap -- this makes real claude -p API calls..."
+    # Symlink OAuth credentials from the bind-mount into the test HOME so
+    # ``claude -p`` can authenticate. This is the only resource the isolated
+    # test HOME shares with /home/node/.claude/; it mirrors exactly what a
+    # real user's containerized Claude Code already does.
+    ./scripts/test-container.sh exec bash -c "
+        set -eu
+        ln -sf /home/node/.claude/.credentials.json '$TEST_HOME/.claude/.credentials.json'
+        if [[ -f /home/node/.claude.json ]]; then
+            ln -sf /home/node/.claude.json '$TEST_HOME/.claude.json'
+        fi
+    "
     ./scripts/test-container.sh exec bash -c "
         set -eu
         cd /workspace/agam
         HOME='$TEST_HOME' \
         AGAM_HOME='$TEST_AGAM_DIR' \
         AGAM_KG_PATH='$TEST_KG_PATH' \
+        AGAM_BOOTSTRAP_MODE=host \
         uv run agam bootstrap --projects '$TEST_PROJECTS_DIR' --days 30 --yes
     "
 
     # (7) Verify KG populated
     echo "[step 7] verifying KG has at least one entity..."
-    COUNT=$(./scripts/test-container.sh exec sqlite3 "$TEST_KG_PATH" \
-        "SELECT COUNT(*) FROM entities" | tr -d '[:space:]')
+    COUNT=$(./scripts/test-container.sh exec python3 -c "
+import sqlite3, sys
+c = sqlite3.connect('$TEST_KG_PATH')
+print(c.execute('SELECT COUNT(*) FROM entities').fetchone()[0])
+" | tr -d '[:space:]')
     if [[ -z "$COUNT" || "$COUNT" -lt 1 ]]; then
         echo "FAIL: KG empty after bootstrap (count=$COUNT)"
         exit 1

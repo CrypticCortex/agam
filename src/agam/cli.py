@@ -177,11 +177,97 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
 
     entities = result.get("entities") or []
     relationships = result.get("relationships") or []
+
+    # ----- persist to KG -------------------------------------------------
+    ent_written, rel_written = _persist_to_kg(entities, relationships)
     print(
-        f"[agam bootstrap] done: {len(entities)} entities, "
-        f"{len(relationships)} relationships reconciled."
+        f"[agam bootstrap] done: {ent_written} entities, "
+        f"{rel_written} relationships persisted to KG."
     )
     return 0
+
+
+def _persist_to_kg(
+    entities: list[dict], relationships: list[dict]
+) -> tuple[int, int]:
+    """Write reconciled entities and relationships into the knowledge graph.
+
+    Uses ``agam.tools.knowledge_graph`` (which honours ``AGAM_KG_PATH``).
+    Missing endpoints are created as stub entities so relationships never
+    drop on the floor. Returns a ``(entities_written, relationships_written)``
+    tally for the CLI's summary line.
+    """
+    from agam.tools import knowledge_graph as kg
+
+    db = kg.get_db()
+    ts = kg.now()
+
+    ent_written = 0
+    for e in entities:
+        name = e.get("name")
+        if not name:
+            continue
+        etype = e.get("type") or "concept"
+        desc = e.get("description") or ""
+        normalized = kg.normalize_name(name)
+        existing = db.execute(
+            "SELECT id FROM entities WHERE name = ?", (normalized,)
+        ).fetchone()
+        if existing:
+            db.execute(
+                "UPDATE entities SET type=?, description=?, updated=? WHERE id=?",
+                (etype, desc, ts, existing[0]),
+            )
+        else:
+            db.execute(
+                "INSERT INTO entities (name, type, description, created, updated) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (normalized, etype, desc, ts, ts),
+            )
+            ent_written += 1
+
+    db.commit()
+
+    def _ensure_entity(name: str) -> int | None:
+        if not name:
+            return None
+        normalized = kg.normalize_name(name)
+        row = db.execute(
+            "SELECT id FROM entities WHERE name = ?", (normalized,)
+        ).fetchone()
+        if row:
+            return row[0]
+        cur = db.execute(
+            "INSERT INTO entities (name, type, description, created, updated) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (normalized, "concept", "", ts, ts),
+        )
+        return cur.lastrowid
+
+    rel_written = 0
+    for r in relationships:
+        src = r.get("source")
+        tgt = r.get("target")
+        rel = r.get("relation")
+        if not (src and tgt and rel):
+            continue
+        src_id = _ensure_entity(src)
+        tgt_id = _ensure_entity(tgt)
+        if src_id is None or tgt_id is None:
+            continue
+        try:
+            db.execute(
+                "INSERT INTO relationships (source_id, target_id, relation, "
+                "weight, created) VALUES (?, ?, ?, ?, ?)",
+                (src_id, tgt_id, rel, 1.0, ts),
+            )
+            rel_written += 1
+        except Exception:  # noqa: BLE001 -- dedup collision is fine
+            pass
+
+    db.commit()
+    db.close()
+    return ent_written, rel_written
 
 
 # ---------------------------------------------------------------------------
@@ -345,13 +431,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_boot.add_argument(
         "--model-haiku",
         type=str,
-        default="haiku-4-5",
+        default="haiku",
         help="Extraction model slug.",
     )
     p_boot.add_argument(
         "--model-sonnet",
         type=str,
-        default="sonnet-4-6",
+        default="sonnet",
         help="Reconciliation model slug.",
     )
     p_boot.set_defaults(func=_cmd_bootstrap)
