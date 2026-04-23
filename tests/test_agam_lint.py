@@ -1,7 +1,7 @@
 """Tests for agam_lint.py and session_patterns.py.
 
 These tests confirm the AGAM_HOME / AGAM_KG_PATH / AGAM_WORK_LOG /
-AGAM_PROJECTS_DIR / AGAM_MEMORY_DIR env overrides fully isolate both tools
+AGAM_SESSIONS_DIR / AGAM_MEMORY_DIR env overrides fully isolate both tools
 from the user's real ~/.claude/ directory.
 """
 
@@ -76,7 +76,7 @@ def lint_env(tmp_path):
         "AGAM_HOME": str(home),
         "AGAM_KG_PATH": str(kg),
         "AGAM_WORK_LOG": str(work_log),
-        "AGAM_PROJECTS_DIR": str(projects),
+        "AGAM_SESSIONS_DIR": str(projects),
         "AGAM_MEMORY_DIR": str(memory),
     }
     return env, home, kg, work_log
@@ -141,7 +141,7 @@ def test_lint_missing_kg_degrades_gracefully(tmp_path):
         "AGAM_HOME": str(home),
         "AGAM_KG_PATH": str(tmp_path / "missing.db"),
         "AGAM_WORK_LOG": str(tmp_path / "missing-wl.md"),
-        "AGAM_PROJECTS_DIR": str(tmp_path / "missing-projects"),
+        "AGAM_SESSIONS_DIR": str(tmp_path / "missing-projects"),
         "AGAM_MEMORY_DIR": str(tmp_path / "missing-memory"),
     }
     before = _mtimes()

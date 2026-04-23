@@ -19,7 +19,7 @@ Environment variables:
                        (default: ~/.claude/knowledge/graph.db)
     AGAM_WORK_LOG      Path to work-log markdown file
                        (default: ~/.claude/work-log.md)
-    AGAM_PROJECTS_DIR  Directory holding per-project memory
+    AGAM_SESSIONS_DIR  Directory holding Claude Code session jsonl files
                        (default: ~/.claude/projects)
     AGAM_MEMORY_DIR    Directory holding general memory markdown files
                        (default: ~/.claude/MEMORY)
@@ -43,8 +43,8 @@ AGAM_DIR = Path(
 WORKLOG = Path(
     os.environ.get("AGAM_WORK_LOG", os.path.expanduser("~/.claude/work-log.md"))
 )
-PROJECTS_DIR = Path(
-    os.environ.get("AGAM_PROJECTS_DIR", os.path.expanduser("~/.claude/projects"))
+SESSIONS_DIR = Path(
+    os.environ.get("AGAM_SESSIONS_DIR", os.path.expanduser("~/.claude/projects"))
 )
 MEMORY_DIR = Path(
     os.environ.get("AGAM_MEMORY_DIR", os.path.expanduser("~/.claude/MEMORY"))
@@ -527,7 +527,7 @@ def lint_memory_anchors(_db=None):
     print("9. MEMORY ANCHORS (dead path refs)")
 
     roots = [
-        PROJECTS_DIR,
+        SESSIONS_DIR,
         MEMORY_DIR,
         AGAM_DIR,
     ]
