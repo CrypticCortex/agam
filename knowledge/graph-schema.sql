@@ -35,10 +35,17 @@ CREATE INDEX idx_rel_source ON relationships(source_id);
 CREATE INDEX idx_rel_target ON relationships(target_id);
 CREATE INDEX idx_rel_relation ON relationships(relation);
 CREATE INDEX idx_prop_entity ON properties(entity_id);
+-- SQLite auto-creates the FTS5 shadow tables (entities_fts_data, _idx,
+-- _content, _config, _docsize) when this CREATE VIRTUAL TABLE runs; the
+-- raw dump's explicit CREATEs for those shadow tables were intentionally
+-- removed so this schema applies cleanly to a fresh DB.
 CREATE VIRTUAL TABLE entities_fts USING fts5(
                 name, type, description, content=entities, content_rowid=id
             )
 /* entities_fts(name,type,description) */;
+-- Same shadow-table note as entities_fts above. The tokenchars '-_' config
+-- is load-bearing: it keeps names like 'voice-fnol-poc' and 'voice_fnol_poc'
+-- as single tokens rather than splitting on '-' / '_'.
 CREATE VIRTUAL TABLE entities_fts_v2 USING fts5(
         name, type, description,
         content=entities, content_rowid=id,
