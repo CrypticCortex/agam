@@ -458,12 +458,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_reset.set_defaults(func=_cmd_reset)
 
+    # -- tui (and bare `agam` with no args)
+    p_tui = sub.add_parser(
+        "tui",
+        help="Launch the interactive dashboard (default when no subcommand).",
+    )
+    p_tui.set_defaults(func=_cmd_tui)
+
     return parser
+
+
+def _cmd_tui(_args: argparse.Namespace) -> int:
+    """Launch the interactive Textual dashboard."""
+    from agam.tui import main as tui_main
+    return tui_main()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        # Bare `agam` with no subcommand -> launch the TUI.
+        return _cmd_tui(args)
     return args.func(args)
 
 

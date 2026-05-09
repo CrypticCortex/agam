@@ -8,6 +8,8 @@ requires-python = ">=3.11"
 dependencies = [
     "questionary>=2",
     "pyyaml>=6",
+    "textual>=0.79",
+    "rich>=13",
 ]
 
 [project.scripts]
