@@ -81,6 +81,10 @@ def hook_env(tmp_path):
         **os.environ,
         "AGAM_SESSIONS_DIR": str(sessions),
         "AGAM_HOME": str(agam_home),
+        # Fix the host coding dir so container-path-to-host translation is
+        # deterministic regardless of the test runner's $HOME.
+        "AGAM_HOST_HOME": "/Users/test",
+        "AGAM_HOST_CODING_DIR": "/Users/test/coding",
     }
     return env, sessions, agam_home, _snapshot_real()
 
@@ -102,7 +106,7 @@ def _run_hook(env, payload, cwd):
 def test_short_session_does_not_enqueue(hook_env, tmp_path):
     env, sessions, agam_home, snapshots = hook_env
     _write_transcript(sessions / "p1", human_turns=3, has_edit=True, signal=True, name="s1")
-    r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/km"}, cwd=str(tmp_path))
+    r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert "Traceback" not in r.stderr, r.stderr
     assert not (agam_home / ".pending-closes.jsonl").exists()
@@ -112,7 +116,7 @@ def test_short_session_does_not_enqueue(hook_env, tmp_path):
 def test_no_edit_or_write_does_not_enqueue(hook_env, tmp_path):
     env, sessions, agam_home, snapshots = hook_env
     _write_transcript(sessions / "p1", human_turns=10, has_edit=False, signal=True, name="s1")
-    r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/km"}, cwd=str(tmp_path))
+    r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert not (agam_home / ".pending-closes.jsonl").exists()
     _assert_real_untouched(snapshots)
@@ -121,7 +125,7 @@ def test_no_edit_or_write_does_not_enqueue(hook_env, tmp_path):
 def test_no_signal_keyword_does_not_enqueue(hook_env, tmp_path):
     env, sessions, agam_home, snapshots = hook_env
     _write_transcript(sessions / "p1", human_turns=10, has_edit=True, signal=False, name="s1")
-    r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/km"}, cwd=str(tmp_path))
+    r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert not (agam_home / ".pending-closes.jsonl").exists()
     _assert_real_untouched(snapshots)
@@ -183,7 +187,7 @@ def test_picks_transcript_matching_session_id_not_latest_mtime(hook_env, tmp_pat
     )
     assert os.path.getmtime(other_jsonl) > os.path.getmtime(my_jsonl)
 
-    r = _run_hook(env, {"session_id": "my-sid", "cwd": "/Users/km"}, cwd=str(tmp_path))
+    r = _run_hook(env, {"session_id": "my-sid", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     queue = agam_home / ".pending-closes.jsonl"
     entries = [json.loads(line) for line in queue.read_text().strip().splitlines()]
@@ -199,7 +203,7 @@ def test_skips_enqueue_when_no_matching_transcript(hook_env, tmp_path):
     _write_transcript(
         sessions / "p1", human_turns=10, has_edit=True, signal=True, name="other-sid"
     )
-    r = _run_hook(env, {"session_id": "missing-sid", "cwd": "/Users/km"}, cwd=str(tmp_path))
+    r = _run_hook(env, {"session_id": "missing-sid", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert not (agam_home / ".pending-closes.jsonl").exists()
     _assert_real_untouched(snapshots)
@@ -230,7 +234,7 @@ def test_uses_agam_home_and_sessions_dir_env_vars(hook_env, tmp_path):
     for the queue location -- NOT the ~/.claude defaults."""
     env, sessions, agam_home, snapshots = hook_env
     _write_transcript(sessions / "p1", human_turns=10, has_edit=True, signal=True, name="s-env")
-    r = _run_hook(env, {"session_id": "s-env", "cwd": "/Users/km"}, cwd=str(tmp_path))
+    r = _run_hook(env, {"session_id": "s-env", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     # Queue must land under AGAM_HOME, not real ~/.claude/agam
     assert (agam_home / ".pending-closes.jsonl").exists()
@@ -248,6 +252,10 @@ def test_queue_path_independent_of_sessions_dir(tmp_path):
         **os.environ,
         "AGAM_SESSIONS_DIR": str(sessions),
         "AGAM_HOME": str(agam_home),
+        # Fix the host coding dir so container-path-to-host translation is
+        # deterministic regardless of the test runner's $HOME.
+        "AGAM_HOST_HOME": "/Users/test",
+        "AGAM_HOST_CODING_DIR": "/Users/test/coding",
     }
     _write_transcript(sessions / "p1", human_turns=10, has_edit=True, signal=True, name="s-sep")
     snapshots = _snapshot_real()
