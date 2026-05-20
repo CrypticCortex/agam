@@ -67,6 +67,7 @@ MEMORY: [one line per entry: "filename.md | type (user/feedback/project/referenc
 LESSON: [confidence: HIGH or MEDIUM. "[lesson] **Title.** Explanation (2-4 sentences). Source: DATE session." Or: none]
 CORRECTION: ["[correction] **Title** (DATE). 2-sentence summary. [Full narrative: docs/corrections/wrong-NAME.md]" + full narrative content for the file. Or: none]
 INSIGHT: ["[insight] **Title.** Explanation (2-4 sentences). Source: DATE session." Or: none]
+OBSOLETE: [one line per entity that is no longer current: "entity-name | reason fragment". Or: none]
 ---END PROPOSALS---
 
 Rules for each section:
@@ -75,4 +76,9 @@ Rules for each section:
   mtime-based, or staleness-based bullets. Propose only what is evidenced in THIS transcript.
 - LESSON: high bar -- must be specific to this person's work style, not textbook advice
 - INSIGHT: very high bar -- must be genuinely non-obvious and counterintuitive
+- OBSOLETE: very high bar. Propose an entity for obsoletion ONLY when the transcript
+  shows the underlying fact is no longer true (bug fixed, decision reversed, project
+  deleted, etc.). Do NOT propose obsoletion just because an entity isn't mentioned.
+  The graph_recall hook will hide obsoleted entities from future injections; this is
+  how Agam self-cleans over time. If unsure, prefer none.
 - CORRECTION: only if an actual held belief was proven incorrect this session

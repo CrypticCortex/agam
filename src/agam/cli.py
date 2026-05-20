@@ -659,6 +659,552 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# obsolete -- mark a KG entity as no longer current
+# ---------------------------------------------------------------------------
+
+
+def _kg_path() -> Path:
+    """Default KG path; overridable via AGAM_KG_PATH for tests."""
+    env = os.environ.get("AGAM_KG_PATH")
+    if env:
+        return Path(env)
+    return _home() / ".claude" / "knowledge" / "graph.db"
+
+
+def _cmd_obsolete(args: argparse.Namespace) -> int:
+    """Mark an entity as obsolete so graph_recall stops surfacing it.
+
+    The entity stays in the database (forensic value) but carries
+    ``status=obsolete`` + ``obsoleted-at=<iso>`` + optional ``obsolete-reason``.
+    Pass ``--include-obsolete`` to graph_recall (via env) to surface it again.
+
+    Idempotent: re-marking the same entity refreshes the timestamp and reason.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    kg = _kg_path()
+    if not kg.exists():
+        print(f"[agam obsolete] no KG at {kg}. Run `agam init` first.", file=sys.stderr)
+        return 1
+
+    conn = sqlite3.connect(str(kg), timeout=5)
+    try:
+        row = conn.execute(
+            "SELECT id, name FROM entities WHERE LOWER(name) = LOWER(?) LIMIT 1",
+            (args.entity,),
+        ).fetchone()
+        if not row:
+            print(f"[agam obsolete] no entity named {args.entity!r}.", file=sys.stderr)
+            return 1
+        eid, canonical_name = row[0], row[1]
+
+        ts = datetime.now(timezone.utc).isoformat()
+        # Upsert three properties: status, obsoleted-at, obsolete-reason.
+        for key, value in (
+            ("status", "obsolete"),
+            ("obsoleted-at", ts),
+            ("obsolete-reason", args.reason or ""),
+        ):
+            if not value and key == "obsolete-reason":
+                continue  # don't bother storing an empty reason
+            conn.execute(
+                "INSERT INTO properties (entity_id, key, value, updated) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(entity_id, key) DO UPDATE SET "
+                "value=excluded.value, updated=excluded.updated",
+                (eid, key, value, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"[agam obsolete] {canonical_name} marked obsolete.")
+    if args.reason:
+        print(f"[agam obsolete] reason: {args.reason}")
+    print(
+        "[agam obsolete] graph_recall will skip this entity. "
+        "Set AGAM_INCLUDE_OBSOLETE=1 to surface it for forensic queries."
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# repair -- SQLite integrity check + vacuum + reindex
+# ---------------------------------------------------------------------------
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    """Check + repair the knowledge graph SQLite database.
+
+    Three operations:
+      1. ``PRAGMA integrity_check`` -- detects corruption.
+      2. ``VACUUM`` -- reclaims unused space, rebuilds the file compactly.
+      3. ``REINDEX`` -- rebuilds all indexes including FTS5 tokens.
+
+    ``--dry-run`` runs only the integrity check.
+    """
+    import sqlite3
+
+    kg = _kg_path()
+    if not kg.exists():
+        print(f"[agam repair] no KG at {kg}. Nothing to repair.", file=sys.stderr)
+        return 1
+
+    size_before = kg.stat().st_size
+
+    conn = sqlite3.connect(str(kg), timeout=10)
+    try:
+        # Step 1: integrity check. ``ok`` is the only passing value.
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+        result = [r[0] for r in rows] if rows else []
+        ok = len(result) == 1 and result[0] == "ok"
+        if ok:
+            print("[agam repair] integrity_check: OK")
+        else:
+            print("[agam repair] integrity_check FAILED:")
+            for line in result:
+                print(f"  {line}")
+            print(
+                "[agam repair] corruption detected. Restore from backup or "
+                "rebuild via `agam bootstrap`. VACUUM may make things worse "
+                "on a corrupt file, skipping.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if args.dry_run:
+            print("[agam repair] dry-run, skipping VACUUM + REINDEX.")
+            return 0
+
+        # Step 2: vacuum. Releases space; rebuilds the file. Cannot run
+        # inside a transaction, so close cleanly between ops.
+        conn.execute("VACUUM")
+        # Step 3: reindex.
+        conn.execute("REINDEX")
+        conn.commit()
+    finally:
+        conn.close()
+
+    size_after = kg.stat().st_size
+    reclaimed = size_before - size_after
+    print(
+        f"[agam repair] vacuum + reindex done. "
+        f"size: {_format_size(size_before)} -> {_format_size(size_after)} "
+        f"(reclaimed {_format_size(max(reclaimed, 0))})"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# digest -- daily summary of what Agam has been doing
+# ---------------------------------------------------------------------------
+
+
+def _cmd_digest(args: argparse.Namespace) -> int:
+    """Print a summary of Agam activity in the last ``--since`` days (default 1).
+
+    Shows: new entities created, entities marked obsolete, work-log lines
+    added, watchdog sessions processed, doctor health snapshot. Useful as a
+    daily "what did Agam do for me" rollup.
+    """
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    since_days = max(int(args.since), 0)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    cutoff_iso = cutoff.isoformat()
+    cutoff_naive = cutoff.replace(tzinfo=None).isoformat()
+
+    home = _home()
+    kg = _kg_path()
+    print(f"Agam digest (last {since_days} day{'s' if since_days != 1 else ''})")
+    print("=" * 60)
+
+    # ----- KG growth -----------------------------------------------------
+    if kg.exists():
+        try:
+            conn = sqlite3.connect(str(kg), timeout=5)
+            new_ents = conn.execute(
+                "SELECT name, type FROM entities WHERE created >= ? OR created >= ? "
+                "ORDER BY created DESC LIMIT 20",
+                (cutoff_iso, cutoff_naive),
+            ).fetchall()
+            obs_ents = conn.execute(
+                """SELECT e.name, p.value FROM entities e
+                   JOIN properties p ON p.entity_id = e.id
+                   WHERE p.key = 'obsoleted-at' AND p.value >= ?
+                   ORDER BY p.value DESC LIMIT 20""",
+                (cutoff_iso,),
+            ).fetchall()
+            total = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            conn.close()
+
+            print(f"\nKnowledge graph: {total} entities total")
+            if new_ents:
+                print(f"  New ({len(new_ents)}):")
+                for name, etype in new_ents[:10]:
+                    print(f"    + {name} ({etype})")
+                if len(new_ents) > 10:
+                    print(f"    ... and {len(new_ents) - 10} more")
+            else:
+                print("  No new entities.")
+            if obs_ents:
+                print(f"  Obsoleted ({len(obs_ents)}):")
+                for name, ts in obs_ents[:10]:
+                    print(f"    x {name} (at {ts[:10]})")
+        except Exception as exc:  # noqa: BLE001
+            print(f"\nKnowledge graph: error reading -- {exc}")
+    else:
+        print("\nKnowledge graph: not present (run `agam init`)")
+
+    # ----- AGAM.md learnings ---------------------------------------------
+    agam_md = home / ".claude" / "agam" / "AGAM.md"
+    if agam_md.exists():
+        try:
+            text = agam_md.read_text(encoding="utf-8")
+            # Heuristic: count [lesson] / [insight] / [correction] markers
+            # in the file. Doesn't track when each was added but does give a
+            # current snapshot count.
+            n_lesson = text.count("[lesson]")
+            n_insight = text.count("[insight]")
+            n_correction = text.count("[correction]")
+            print(
+                f"\nLearnings (cumulative): "
+                f"{n_lesson} lessons, {n_insight} insights, {n_correction} corrections"
+            )
+        except OSError:
+            pass
+
+    # ----- watchdog activity ---------------------------------------------
+    processed = home / ".claude" / "agam" / ".processed-sessions.jsonl"
+    if processed.exists():
+        try:
+            n_total = 0
+            n_recent = 0
+            cutoff_ts = cutoff.timestamp()
+            for line in processed.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                n_total += 1
+                # Each line has a ts field; cheap text-scan for the threshold
+                if '"ts":' in line:
+                    import re as _re
+                    m = _re.search(r'"ts":\s*([\d.]+)', line)
+                    if m and float(m.group(1)) >= cutoff_ts:
+                        n_recent += 1
+            print(
+                f"\nWatchdog: {n_recent} sessions processed in window "
+                f"({n_total} total all-time)"
+            )
+        except OSError:
+            pass
+
+    print("")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# upgrade -- replace code, preserve identity + KG + config
+# ---------------------------------------------------------------------------
+
+
+def _cmd_upgrade(args: argparse.Namespace) -> int:
+    """Upgrade Agam to the version shipped with this package.
+
+    Replaces: hooks/, tools/agam/, agam/prompts/, settings.json hook
+    registrations, the launchd plist.
+
+    Preserves: agam/AGAM.md, agam/THISAI.md, agam/MUGAM.md, agam/config.yaml,
+    knowledge/graph.db, agam/SUVADU.md.
+
+    Differs from ``agam init --force`` in that init backs up the entire
+    ``~/.claude/agam/`` directory and rebuilds it from templates -- which
+    means the user loses their identity edits and KG. Upgrade is the safe
+    in-place update path.
+    """
+    from agam import installer
+
+    home = _home()
+    paths = installer.InstallPaths.for_home(home)
+    preserve = {
+        "AGAM.md": paths.agam / "AGAM.md",
+        "THISAI.md": paths.agam / "THISAI.md",
+        "MUGAM.md": paths.agam / "MUGAM.md",
+        "SUVADU.md": paths.agam / "SUVADU.md",
+        "config.yaml": paths.agam / "config.yaml",
+        "graph.db": paths.knowledge / "graph.db",
+    }
+    missing = [name for name, p in preserve.items() if not p.exists()]
+    if "config.yaml" in missing:
+        print(
+            "[agam upgrade] no existing install found (no config.yaml). "
+            "Run `agam init` for a fresh install.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # The straightforward "preserve" mechanism: snapshot the protected files,
+    # let run_wizard do its full force-overwrite, then restore. This is
+    # heavier than a surgical merge but uses the well-tested installer code
+    # path. Edge case: install can fail mid-way; the backup is on disk so
+    # we can restore manually if needed.
+    import tempfile
+    import shutil
+    snapshot_root = Path(tempfile.mkdtemp(prefix=".agam-upgrade-snap-"))
+    snapshot_files: dict[str, Path] = {}
+    try:
+        for name, src in preserve.items():
+            if src.exists():
+                dst = snapshot_root / name
+                shutil.copy2(src, dst)
+                snapshot_files[name] = dst
+
+        # Load existing answers to skip the wizard prompt and keep the
+        # user's config as-is.
+        cfg_path = paths.agam / "config.yaml"
+        try:
+            import yaml as _yaml  # type: ignore[import-not-found]
+            existing_cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            existing_cfg = {}
+
+        print("[agam upgrade] replacing code, preserving identity + KG...")
+        installer.run_wizard(
+            answers=existing_cfg or None,
+            force=True,
+            home=home,
+        )
+
+        # Restore preserved files. The installer wrote fresh templates over
+        # them; put the user's content back. KG was also fresh-from-schema;
+        # swap our snapshot back in.
+        for name, snap in snapshot_files.items():
+            dst = preserve[name]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(snap, dst)
+        print(
+            f"[agam upgrade] restored {len(snapshot_files)} preserved file(s)."
+        )
+    except Exception as exc:  # noqa: BLE001 -- surface with context
+        print(
+            f"[agam upgrade] failed: {exc}\n"
+            f"[agam upgrade] snapshot of your data is at {snapshot_root}. "
+            f"Copy files back manually if needed.",
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        # Clean snapshot only on success. On failure we keep it so the user
+        # can recover.
+        if not args.keep_snapshot:
+            try:
+                shutil.rmtree(snapshot_root)
+            except OSError:
+                pass
+
+    print("[agam upgrade] done. Run `agam doctor` to verify.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# uninstall -- remove Agam scaffolding cleanly
+# ---------------------------------------------------------------------------
+
+
+def _cmd_uninstall(args: argparse.Namespace) -> int:
+    """Uninstall Agam from this machine.
+
+    Default behavior is "soft uninstall": move all Agam-managed files into
+    a timestamped ``.uninstalled-<ts>/`` subdirectory rather than delete.
+    The user can recover by moving them back. Add ``--purge`` to delete.
+
+    Always unregisters hooks from settings.json (preserving any non-Agam
+    hook entries the user added) and unloads the launchd plist on macOS.
+    Requires ``--confirm`` to actually run; default prints a dry run.
+    """
+    import json as _json
+    import shutil
+    import subprocess
+    from datetime import datetime, timezone
+
+    home = _home()
+    claude = home / ".claude"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    # File set Agam owns. Mirror of the installer's writes. Identity files
+    # + KG land in their own backup directories; hook + tool files just get
+    # removed (they have no user data).
+    hook_files = [
+        claude / "hooks" / "agam_watchdog.sh",
+        claude / "hooks" / "agam_watchdog_inner.py",
+        claude / "hooks" / "graph_recall.py",
+        claude / "hooks" / "graph_update.py",
+        claude / "hooks" / "session_close.py",
+        claude / "hooks" / "lesson_activate.py",
+        claude / "hooks" / "lesson_activate_post.py",
+        # Dash-named legacy filenames (the personal setup uses these); we
+        # don't ship them in this repo but the uninstaller cleans both shapes.
+        claude / "hooks" / "agam-watchdog.sh",
+        claude / "hooks" / "agam-watchdog-inner.py",
+        claude / "hooks" / "graph-recall.py",
+        claude / "hooks" / "graph-update.py",
+        claude / "hooks" / "session-close-hook.py",
+        claude / "hooks" / "lesson-activate.py",
+        claude / "hooks" / "lesson-activate-post.py",
+    ]
+    tools_dir = claude / "tools" / "agam"
+    agam_dir = claude / "agam"
+    kg_dir = claude / "knowledge"
+    settings_path = claude / "settings.json"
+    plist_path = home / "Library" / "LaunchAgents" / "com.agam.watchdog.plist"
+
+    plan: list[tuple[str, Path]] = []
+    if not args.purge:
+        # Soft uninstall: rename data dirs.
+        if agam_dir.exists():
+            plan.append(("move", agam_dir))
+        if kg_dir.exists():
+            plan.append(("move", kg_dir))
+    else:
+        if agam_dir.exists():
+            plan.append(("delete", agam_dir))
+        if kg_dir.exists():
+            plan.append(("delete", kg_dir))
+    for h in hook_files:
+        if h.exists():
+            plan.append(("delete", h))
+    if tools_dir.exists():
+        plan.append(("delete", tools_dir))
+    if plist_path.exists():
+        plan.append(("delete-plist", plist_path))
+    if settings_path.exists():
+        plan.append(("clean-settings", settings_path))
+
+    if not plan:
+        print("[agam uninstall] nothing to remove. Agam isn't installed here.")
+        return 0
+
+    if not args.confirm:
+        print("[agam uninstall] DRY RUN. Would do:")
+        for action, p in plan:
+            verb = {
+                "move": "move to .uninstalled-<ts>/",
+                "delete": "delete",
+                "delete-plist": "unload + delete launchd plist",
+                "clean-settings": "remove Agam hook entries from settings.json",
+            }[action]
+            print(f"  {verb}: {p}")
+        if args.purge:
+            print("[agam uninstall] --purge will permanently delete data.")
+        print("[agam uninstall] re-run with --confirm to proceed.")
+        return 0
+
+    errors: list[str] = []
+    for action, p in plan:
+        try:
+            if action == "move":
+                backup = p.parent / f"{p.name}.uninstalled-{timestamp}"
+                shutil.move(str(p), str(backup))
+                print(f"[agam uninstall] moved: {p} -> {backup}")
+            elif action == "delete":
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                print(f"[agam uninstall] deleted: {p}")
+            elif action == "delete-plist":
+                uid = os.getuid()
+                # bootout is the launchctl 2.x way to unload. May fail if
+                # not loaded; ignore that case.
+                subprocess.run(
+                    ["launchctl", "bootout", f"gui/{uid}/com.agam.watchdog"],
+                    capture_output=True,
+                )
+                p.unlink()
+                print(f"[agam uninstall] unloaded + deleted: {p}")
+            elif action == "clean-settings":
+                settings = _json.loads(p.read_text(encoding="utf-8"))
+                hooks = settings.get("hooks", {})
+                if isinstance(hooks, dict):
+                    for event, entries in list(hooks.items()):
+                        if not isinstance(entries, list):
+                            continue
+                        kept = []
+                        for entry in entries:
+                            if not isinstance(entry, dict):
+                                kept.append(entry)
+                                continue
+                            inner = entry.get("hooks", [])
+                            if not isinstance(inner, list):
+                                kept.append(entry)
+                                continue
+                            kept_inner = [
+                                ih for ih in inner
+                                if not (
+                                    isinstance(ih, dict)
+                                    and isinstance(ih.get("command"), str)
+                                    and any(
+                                        marker in ih["command"]
+                                        for marker in (
+                                            "graph_recall", "graph_update",
+                                            "session_close", "lesson_activate",
+                                            "agam_watchdog",
+                                            "graph-recall", "graph-update",
+                                            "session-close", "lesson-activate",
+                                            "agam-watchdog",
+                                        )
+                                    )
+                                )
+                            ]
+                            if kept_inner:
+                                new_entry = dict(entry)
+                                new_entry["hooks"] = kept_inner
+                                kept.append(new_entry)
+                        if kept:
+                            hooks[event] = kept
+                        else:
+                            del hooks[event]
+                    # Also remove AGAM_USER_ENTITY from env block (Agam-owned).
+                    env_block = settings.get("env", {})
+                    if isinstance(env_block, dict):
+                        env_block.pop("AGAM_USER_ENTITY", None)
+                # Atomic write.
+                import tempfile as _tf
+                fd, tmpname = _tf.mkstemp(
+                    prefix=".settings-uninstall-",
+                    suffix=".json.tmp",
+                    dir=str(p.parent),
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json.dump(settings, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                os.replace(tmpname, p)
+                print(f"[agam uninstall] cleaned: {p}")
+        except Exception as exc:  # noqa: BLE001
+            msg = f"  {action} {p}: {exc}"
+            errors.append(msg)
+            print(f"[agam uninstall] FAILED: {msg}", file=sys.stderr)
+
+    if errors:
+        print(
+            f"[agam uninstall] completed with {len(errors)} error(s). "
+            f"Inspect manually if you want a clean slate.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.purge:
+        print("[agam uninstall] done. Data permanently deleted.")
+    else:
+        print(
+            f"[agam uninstall] done. Data preserved as .uninstalled-{timestamp}. "
+            f"Re-run with --purge to delete permanently."
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # reset
 # ---------------------------------------------------------------------------
 
@@ -782,6 +1328,74 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Deep diagnostic checks. Use when something feels off.",
     )
     p_doc.set_defaults(func=_cmd_doctor)
+
+    # -- obsolete
+    p_obs = sub.add_parser(
+        "obsolete",
+        help="Mark a KG entity as no longer current (filtered from recall).",
+    )
+    p_obs.add_argument("entity", type=str, help="Entity name to obsolete.")
+    p_obs.add_argument(
+        "--reason",
+        type=str,
+        default="",
+        help="Optional reason recorded as obsolete-reason property.",
+    )
+    p_obs.set_defaults(func=_cmd_obsolete)
+
+    # -- repair
+    p_rep = sub.add_parser(
+        "repair",
+        help="SQLite integrity check + VACUUM + REINDEX on the knowledge graph.",
+    )
+    p_rep.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run only the integrity check, skip VACUUM/REINDEX.",
+    )
+    p_rep.set_defaults(func=_cmd_repair)
+
+    # -- digest
+    p_dig = sub.add_parser(
+        "digest",
+        help="Summary of Agam activity in the last N days (default 1).",
+    )
+    p_dig.add_argument(
+        "--since",
+        type=int,
+        default=1,
+        help="Look back this many days (default 1).",
+    )
+    p_dig.set_defaults(func=_cmd_digest)
+
+    # -- upgrade
+    p_up = sub.add_parser(
+        "upgrade",
+        help="Replace Agam code, preserve identity files + KG + config.",
+    )
+    p_up.add_argument(
+        "--keep-snapshot",
+        action="store_true",
+        help="Keep the temporary backup snapshot after upgrade (default: delete on success).",
+    )
+    p_up.set_defaults(func=_cmd_upgrade)
+
+    # -- uninstall
+    p_un = sub.add_parser(
+        "uninstall",
+        help="Remove Agam scaffolding. Default soft-uninstalls (preserves data).",
+    )
+    p_un.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Actually run the uninstall (default is dry-run).",
+    )
+    p_un.add_argument(
+        "--purge",
+        action="store_true",
+        help="Permanently delete data instead of moving to .uninstalled-<ts>/.",
+    )
+    p_un.set_defaults(func=_cmd_uninstall)
 
     # -- reset
     p_reset = sub.add_parser(

@@ -308,6 +308,207 @@ def test_cli_status_with_container(monkeypatch, tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
+def test_cli_obsolete_sets_status_property(monkeypatch, tmp_path):
+    """`agam obsolete <name>` sets status=obsolete and obsoleted-at on the entity."""
+    import sqlite3
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # Spin up a fresh KG (using the schema from installer).
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    kg = tmp_path / ".claude" / "knowledge" / "graph.db"
+    conn = sqlite3.connect(str(kg))
+    conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES ('stale-feature-bug', 'bug', 'Dropped from output schema.', "
+        "datetime('now'), datetime('now'))"
+    )
+    conn.commit()
+    conn.close()
+
+    rc = cli.main(["obsolete", "stale-feature-bug", "--reason", "removed entirely"])
+    assert rc == 0
+
+    conn = sqlite3.connect(str(kg))
+    rows = dict(conn.execute(
+        "SELECT p.key, p.value FROM properties p "
+        "JOIN entities e ON p.entity_id = e.id "
+        "WHERE LOWER(e.name) = 'stale-feature-bug'"
+    ).fetchall())
+    conn.close()
+    assert rows.get("status") == "obsolete"
+    assert "obsoleted-at" in rows
+    assert rows.get("obsolete-reason") == "removed entirely"
+
+
+def test_cli_obsolete_missing_entity_returns_1(monkeypatch, tmp_path):
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    rc = cli.main(["obsolete", "nonexistent-entity"])
+    assert rc == 1
+
+
+def test_cli_repair_ok_on_healthy_kg(monkeypatch, tmp_path, capsys):
+    """A freshly initialized KG should pass integrity_check + repair clean."""
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    rc = cli.main(["repair"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "integrity_check: OK" in out
+
+
+def test_cli_digest_runs_on_fresh_install(monkeypatch, tmp_path, capsys):
+    """Digest on a fresh install: 0 new entities is a valid state, exit 0."""
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    rc = cli.main(["digest", "--since", "7"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Knowledge graph:" in out
+
+
+def test_cli_uninstall_dry_run_is_default(monkeypatch, tmp_path, capsys):
+    """Default `agam uninstall` (no --confirm) must be a dry run."""
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    rc = cli.main(["uninstall"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DRY RUN" in out
+    # Files must still exist after dry-run.
+    assert (tmp_path / ".claude" / "agam" / "AGAM.md").exists()
+
+
+def test_cli_uninstall_confirm_moves_data_dirs(monkeypatch, tmp_path, capsys):
+    """`agam uninstall --confirm` moves agam/ + knowledge/ to .uninstalled-<ts>/."""
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    agam_dir = tmp_path / ".claude" / "agam"
+    assert agam_dir.exists()
+
+    rc = cli.main(["uninstall", "--confirm"])
+    assert rc == 0
+    # Original gone, .uninstalled-<ts>/ sibling appears.
+    assert not agam_dir.exists()
+    backups = list((tmp_path / ".claude").glob("agam.uninstalled-*"))
+    assert len(backups) == 1, f"expected one backup dir, got {backups}"
+
+
+def test_cli_upgrade_preserves_identity_and_kg(monkeypatch, tmp_path):
+    """`agam upgrade` must not blow away the user's AGAM.md edits or KG data."""
+    import sqlite3
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+
+    # Simulate user edits to identity + KG.
+    agam_md = tmp_path / ".claude" / "agam" / "AGAM.md"
+    agam_md.write_text("MY CUSTOM IDENTITY EDIT\n")
+    kg = tmp_path / ".claude" / "knowledge" / "graph.db"
+    conn = sqlite3.connect(str(kg))
+    conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES ('my-custom-entity', 'note', 'user-added', datetime('now'), datetime('now'))"
+    )
+    conn.commit()
+    conn.close()
+
+    rc = cli.main(["upgrade"])
+    assert rc == 0
+    assert agam_md.read_text() == "MY CUSTOM IDENTITY EDIT\n", (
+        "upgrade clobbered the user's AGAM.md edits"
+    )
+    conn = sqlite3.connect(str(kg))
+    n = conn.execute(
+        "SELECT COUNT(*) FROM entities WHERE name = 'my-custom-entity'"
+    ).fetchone()[0]
+    conn.close()
+    assert n == 1, "upgrade wiped the user's KG entities"
+
+
 def test_cli_doctor_fails_on_fresh_home(monkeypatch, tmp_path, capsys):
     """Empty HOME -> doctor flags every missing thing, returns 1."""
     from agam import cli

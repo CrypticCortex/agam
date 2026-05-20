@@ -202,11 +202,17 @@ After completing analysis, write a JSON file to {proposals_path} with this exact
   "memory": [{"filename": "x.md", "type": "user|feedback|project|reference", "description": "hook", "content": "body"}],
   "lesson": [{"title": "Short title", "body": "[lesson] **Title.** Explanation. Source: DATE session."}],
   "insight": [{"title": "Short title", "body": "[insight] **Title.** Explanation. Source: DATE session."}],
-  "correction": [{"title": "Short title", "body": "[correction] **Title** (DATE). Summary."}]
+  "correction": [{"title": "Short title", "body": "[correction] **Title** (DATE). Summary."}],
+  "obsolete": [{"name": "entity-name", "reason": "why no longer current"}]
 }
 ```
 
 Include only keys with actual content. Omit empty arrays. Write the JSON file and then exit.
+
+The ``obsolete`` key marks entities whose underlying fact is no longer true
+(bug fixed, decision reversed, project removed). High bar: only emit when the
+transcript shows the change explicitly. The graph_recall hook will skip
+obsoleted entities so the model stops reasoning about stale state.
 """
 
 

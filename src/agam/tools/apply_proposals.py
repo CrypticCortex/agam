@@ -121,10 +121,54 @@ def _append_suvadu(suvadu_path: pathlib.Path, lines: list[str]) -> None:
             f.write(line.rstrip() + "\n")
 
 
+def _apply_obsolete(kg_path: pathlib.Path, name: str, reason: str = "") -> bool:
+    """Mark a KG entity ``status=obsolete`` if it exists.
+
+    Returns True when the entity was found + updated, False otherwise.
+    Idempotent; safe to call multiple times on the same entity.
+    """
+    if not kg_path.exists():
+        return False
+    import sqlite3
+    from datetime import datetime, timezone
+
+    conn = sqlite3.connect(str(kg_path), timeout=5)
+    try:
+        row = conn.execute(
+            "SELECT id FROM entities WHERE LOWER(name) = LOWER(?) LIMIT 1",
+            (name,),
+        ).fetchone()
+        if not row:
+            return False
+        eid = row[0]
+        ts = datetime.now(timezone.utc).isoformat()
+        for key, value in (
+            ("status", "obsolete"),
+            ("obsoleted-at", ts),
+            ("obsolete-reason", reason or ""),
+        ):
+            if not value and key == "obsolete-reason":
+                continue
+            conn.execute(
+                "INSERT INTO properties (entity_id, key, value, updated) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(entity_id, key) DO UPDATE SET "
+                "value=excluded.value, updated=excluded.updated",
+                (eid, key, value, ts),
+            )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 def apply_proposals(proposals: dict, *, agam_md: pathlib.Path, thisai_md: pathlib.Path,
-                    suvadu_md: pathlib.Path, memory_dir: pathlib.Path, today: str | None = None) -> dict:
+                    suvadu_md: pathlib.Path, memory_dir: pathlib.Path,
+                    kg_path: pathlib.Path | None = None,
+                    today: str | None = None) -> dict:
     today = today or _today_iso()
-    applied = {"projects": 0, "goals": 0, "memory": 0, "lessons": 0, "corrections": 0, "insights": 0}
+    applied = {"projects": 0, "goals": 0, "memory": 0, "lessons": 0,
+               "corrections": 0, "insights": 0, "obsoleted": 0}
     suvadu_lines: list[str] = []
 
     needs_agam = bool(proposals.get("lesson") or proposals.get("insight") or proposals.get("correction"))
@@ -197,6 +241,28 @@ def apply_proposals(proposals: dict, *, agam_md: pathlib.Path, thisai_md: pathli
                 except ApplyError as e:
                     errors.append(f"correction '{c.get('title')}': {e}")
             agam_md.write_text(text)
+
+        # Obsoletion proposals operate on the KG, not on markdown files. The
+        # ``obsolete`` proposal list is a flat list of ``{"name": ..., "reason": ...}``
+        # dicts. Each entry that matches an existing entity gets ``status=obsolete``
+        # written as a property. Missing entities are silently skipped (the
+        # transcript may have referenced a name we never stored).
+        for ob in proposals.get("obsolete", []):
+            if not isinstance(ob, dict):
+                continue
+            name = ob.get("name")
+            if not name:
+                continue
+            reason = ob.get("reason", "")
+            target_kg = kg_path or (agam_md.parent.parent / "knowledge" / "graph.db")
+            try:
+                if _apply_obsolete(target_kg, name, reason):
+                    applied["obsoleted"] += 1
+                    suvadu_lines.append(
+                        f"{today} | KG | Obsoleted entity: {name}" + (f" -- {reason}" if reason else "")
+                    )
+            except Exception as e:  # noqa: BLE001 -- KG ops are best-effort here
+                errors.append(f"obsolete '{name}': {e}")
 
         _append_suvadu(suvadu_md, suvadu_lines)
     except Exception:

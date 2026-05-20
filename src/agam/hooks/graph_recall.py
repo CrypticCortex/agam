@@ -450,8 +450,32 @@ def search_graph(matched_names, message_words):
 
         results = []
 
+        # Obsoletion filter. Entities can carry a ``status`` property whose
+        # value is "obsolete" (set by ``agam obsolete <entity>`` or by Sonnet
+        # via apply-proposals when a session indicates the entity is no longer
+        # current). Skip them in recall so the model isn't asked to reason
+        # about stale facts on every prompt that happens to mention them. The
+        # entities are preserved on disk for forensic queries; set
+        # ``AGAM_INCLUDE_OBSOLETE=1`` to surface them anyway.
+        obsolete_names: set[str] = set()
+        if os.environ.get("AGAM_INCLUDE_OBSOLETE", "").strip() != "1":
+            try:
+                _obs = conn.execute(
+                    """SELECT LOWER(e.name)
+                       FROM entities e
+                       JOIN properties p ON p.entity_id = e.id
+                       WHERE p.key = 'status' AND p.value = 'obsolete'"""
+                )
+                obsolete_names = {row[0] for row in _obs}
+            except Exception:
+                # Schema without properties table or other failure -- be
+                # permissive (no filtering) rather than block recall.
+                obsolete_names = set()
+
         # Get matched entities, sorted by recency (tiebreaker for equal-relevance matches)
         for name in matched_names:
+            if name.lower() in obsolete_names:
+                continue
             cursor = conn.execute(
                 "SELECT name, type, description FROM entities WHERE LOWER(name) = ? LIMIT 1",
                 (name,)
@@ -513,11 +537,22 @@ def search_graph(matched_names, message_words):
                 (name, name, *_hub_list)
             )
             for row in cursor:
+                # Skip relationships that touch obsolete entities entirely --
+                # otherwise the model sees "X --[depends-on]--> Y" where Y is
+                # an entity we'd never show on its own, which is misleading.
+                if row[0].lower() in obsolete_names or row[2].lower() in obsolete_names:
+                    continue
                 conf = f" [{row[3]}]" if row[3] != 1.0 else ""
                 rels.append(f"{row[0]} --[{row[1]}]--> {row[2]}{conf}")
                 other = row[2] if row[0] == name else row[0]
                 if other not in matched_set and other not in HUB_ENTITIES:
                     connected_names.add(other)
+
+        # Drop any obsolete-name pickups from the 1-hop expansion candidate
+        # set. Belt-and-suspenders -- the relationship loop above already
+        # filtered, but expansion runs against ``connected_names`` so we
+        # double-check before hitting the entities table.
+        connected_names = {n for n in connected_names if n.lower() not in obsolete_names}
 
         # 1-hop expansion: load connected entities as full entries
         # Prioritize high-signal types (incidents, decisions, lessons, bugs)

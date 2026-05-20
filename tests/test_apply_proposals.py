@@ -253,3 +253,117 @@ def test_one_bad_proposal_does_not_block_others(tmp_path):
     # Errors surfaced
     assert "errors" in applied
     assert any("NonexistentProject" in err for err in applied["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Obsolete proposal application
+# ---------------------------------------------------------------------------
+
+
+def test_apply_obsolete_marks_entity_in_kg(tmp_path):
+    """An OBSOLETE proposal must set status=obsolete on the named entity."""
+    import sqlite3
+    from agam.tools import apply_proposals as mod
+
+    # Identity scaffolding (apply_proposals expects these to exist)
+    paths = _seed_agam(tmp_path)
+    agam = paths["agam"]
+    thisai = paths["thisai"]
+    suvadu = paths["suvadu"]
+    memdir = paths["memdir"]
+
+    # Schema-less KG -- only need the tables apply_proposals touches.
+    kg = tmp_path / "graph.db"
+    conn = sqlite3.connect(str(kg))
+    conn.executescript("""
+        CREATE TABLE entities (
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL COLLATE NOCASE,
+            type TEXT,
+            description TEXT,
+            created TEXT,
+            updated TEXT
+        );
+        CREATE TABLE properties (
+            entity_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            updated TEXT,
+            UNIQUE(entity_id, key),
+            FOREIGN KEY (entity_id) REFERENCES entities(id)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES ('stale-feature-bug', 'bug', 'Dropped from output schema.', "
+        "datetime('now'), datetime('now'))"
+    )
+    conn.commit()
+    conn.close()
+
+    proposals = {
+        "obsolete": [
+            {"name": "stale-feature-bug", "reason": "fully removed from agent"}
+        ]
+    }
+    applied = mod.apply_proposals(
+        proposals,
+        agam_md=agam,
+        thisai_md=thisai,
+        suvadu_md=suvadu,
+        memory_dir=memdir,
+        kg_path=kg,
+        today="2026-05-20",
+    )
+    assert applied["obsoleted"] == 1
+
+    conn = sqlite3.connect(str(kg))
+    rows = dict(conn.execute(
+        "SELECT p.key, p.value FROM properties p "
+        "JOIN entities e ON p.entity_id = e.id "
+        "WHERE LOWER(e.name) = 'stale-feature-bug'"
+    ).fetchall())
+    conn.close()
+    assert rows.get("status") == "obsolete"
+    assert rows.get("obsolete-reason") == "fully removed from agent"
+    assert "obsoleted-at" in rows
+
+
+def test_apply_obsolete_silently_skips_missing_entity(tmp_path):
+    """OBSOLETE for an entity not in KG -> counter stays 0, no error raised."""
+    import sqlite3
+    from agam.tools import apply_proposals as mod
+
+    paths = _seed_agam(tmp_path)
+    kg = tmp_path / "graph.db"
+    conn = sqlite3.connect(str(kg))
+    conn.executescript("""
+        CREATE TABLE entities (
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL COLLATE NOCASE,
+            type TEXT,
+            description TEXT,
+            created TEXT,
+            updated TEXT
+        );
+        CREATE TABLE properties (
+            entity_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            updated TEXT,
+            UNIQUE(entity_id, key)
+        );
+    """)
+    conn.close()
+
+    proposals = {"obsolete": [{"name": "never-existed", "reason": "n/a"}]}
+    applied = mod.apply_proposals(
+        proposals,
+        agam_md=paths["agam"],
+        thisai_md=paths["thisai"],
+        suvadu_md=paths["suvadu"],
+        memory_dir=paths["memdir"],
+        kg_path=kg,
+        today="2026-05-20",
+    )
+    assert applied["obsoleted"] == 0

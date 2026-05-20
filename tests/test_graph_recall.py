@@ -218,3 +218,123 @@ def test_graph_recall_respects_agam_kg_dir(kg_env, tmp_path):
     ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
     assert "agam-sentinel" in ctx
     _assert_real_files_untouched(snapshots)
+
+
+# ---------------------------------------------------------------------------
+# Obsoletion filter (Category 1 -- temporal drift)
+# ---------------------------------------------------------------------------
+
+
+def test_graph_recall_filters_obsolete_entity(kg_env, tmp_path):
+    """An entity marked status=obsolete must NOT appear in recall injection.
+
+    This is what stops `stale-feature-bug` from polluting future prompts
+    after the bug was actually fixed.
+    """
+    env, kg, sidecar, snapshots = kg_env
+
+    conn = sqlite3.connect(kg)
+    cur = conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+        ("stale-feature-bug", "bug", "Dropped from output schema."),
+    )
+    eid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO properties (entity_id, key, value, updated) "
+        "VALUES (?, 'status', 'obsolete', datetime('now'))",
+        (eid,),
+    )
+    conn.commit()
+    conn.close()
+    (sidecar / "entity-names.txt").write_text("stale-feature-bug\n")
+
+    r = _run_hook(
+        env,
+        {"prompt": "tell me about stale-feature-bug behavior", "session_id": "s-obs"},
+        cwd=str(tmp_path),
+    )
+    assert r.returncode == 0, r.stderr
+    # The entity exists in the KG but was obsoleted -- recall should be silent
+    # OR emit something that does NOT name the obsolete entity.
+    ctx = ""
+    if r.stdout.strip():
+        parsed = json.loads(r.stdout)
+        ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "stale-feature-bug" not in ctx, (
+        f"obsolete entity leaked into recall injection: {ctx}"
+    )
+    _assert_real_files_untouched(snapshots)
+
+
+def test_graph_recall_include_obsolete_env_overrides(kg_env, tmp_path):
+    """``AGAM_INCLUDE_OBSOLETE=1`` surfaces obsolete entities for forensics."""
+    env, kg, sidecar, snapshots = kg_env
+
+    conn = sqlite3.connect(kg)
+    cur = conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+        ("old-bug-x", "bug", "Used to be a bug, now historical."),
+    )
+    eid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO properties (entity_id, key, value, updated) "
+        "VALUES (?, 'status', 'obsolete', datetime('now'))",
+        (eid,),
+    )
+    conn.commit()
+    conn.close()
+    (sidecar / "entity-names.txt").write_text("old-bug-x\n")
+
+    env = {**env, "AGAM_INCLUDE_OBSOLETE": "1"}
+    r = _run_hook(
+        env,
+        {"prompt": "what about old-bug-x history please", "session_id": "s-obs-on"},
+        cwd=str(tmp_path),
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip(), "expected recall output when AGAM_INCLUDE_OBSOLETE=1"
+    parsed = json.loads(r.stdout)
+    ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "old-bug-x" in ctx
+    _assert_real_files_untouched(snapshots)
+
+
+def test_graph_recall_active_entity_unaffected_by_obsolete_sibling(kg_env, tmp_path):
+    """Marking entity A obsolete must not affect entity B's recall."""
+    env, kg, sidecar, snapshots = kg_env
+
+    conn = sqlite3.connect(kg)
+    # Active entity
+    conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES ('active-foo', 'project', 'Active project.', datetime('now'), datetime('now'))",
+    )
+    # Obsolete sibling
+    cur = conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES ('obsolete-foo', 'bug', 'Old.', datetime('now'), datetime('now'))",
+    )
+    eid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO properties (entity_id, key, value, updated) "
+        "VALUES (?, 'status', 'obsolete', datetime('now'))",
+        (eid,),
+    )
+    conn.commit()
+    conn.close()
+    (sidecar / "entity-names.txt").write_text("active-foo\nobsolete-foo\n")
+
+    r = _run_hook(
+        env,
+        {"prompt": "discuss active-foo plans here", "session_id": "s-sibling"},
+        cwd=str(tmp_path),
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip()
+    parsed = json.loads(r.stdout)
+    ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "active-foo" in ctx
+    assert "obsolete-foo" not in ctx
+    _assert_real_files_untouched(snapshots)
