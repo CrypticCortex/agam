@@ -1,13 +1,19 @@
 #!/bin/bash
 # Usage: test-container.sh {up|down|exec <cmd>|reset}
 # Creates/tears down agam-oss-test isolated from user's running container.
+#
+# Environment overrides (defaults work for the common case):
+#   AGAM_TEST_IMAGE       Container image to run (default: claude-code base image)
+#   AGAM_TEST_REPO_HOST   Host path to this repo (default: derived from script location)
+#   AGAM_TEST_CREDS_HOST  Host path to Claude Code OAuth credentials (default: ~/.claude/.credentials.json)
 
 set -u
 CONTAINER="agam-oss-test"
-IMAGE="artifactory.example.com/claude-code/claude-code:latest"
-REPO_HOST="/Users/test/coding/agam"
+IMAGE="${AGAM_TEST_IMAGE:-artifactory.example.com/claude-code/claude-code:latest}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_HOST="${AGAM_TEST_REPO_HOST:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 REPO_CONTAINER="/workspace/agam"
-CREDS_HOST="/Users/test/.claude/.credentials.json"
+CREDS_HOST="${AGAM_TEST_CREDS_HOST:-$HOME/.claude/.credentials.json}"
 CREDS_CONTAINER="/home/node/.claude/.credentials.json"
 
 up() {

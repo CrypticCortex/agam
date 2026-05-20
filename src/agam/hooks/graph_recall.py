@@ -478,26 +478,39 @@ def search_graph(matched_names, message_words):
         # here was the source of false positives (e.g., "what about now" matching
         # entities whose descriptions contain "what" or "about").
 
-        # Get relationships for matched entities
-        # Skip hub entities (Kalyan, Example) as sources -- they fan out to everything
+        # Get relationships for matched entities.
+        # Skip hub entities (the user themselves, plus any high-degree nodes the
+        # operator wants suppressed) as sources -- they fan out to everything.
         matched_set = set(r["name"] for r in results)
         entity_names = list(matched_set)[:5]
         rels = []
         connected_names = set()  # track 1-hop neighbors for expansion
 
-        # Hub entities: high-degree nodes that add noise as relationship sources
-        HUB_ENTITIES = {"Kalyan", "Example", "Claude-Code"}
+        # Hub entities: high-degree nodes that add noise as relationship sources.
+        # Configurable via AGAM_HUB_ENTITIES (comma-separated). Default includes the
+        # active user entity (AGAM_USER_ENTITY, defaults to "User") so a fresh 
+        # install has a sensible suppression list out of the box.
+        _user_entity = os.environ.get("AGAM_USER_ENTITY", "User").strip()
+        _hub_env = os.environ.get("AGAM_HUB_ENTITIES", "").strip()
+        if _hub_env:
+            HUB_ENTITIES = {e.strip() for e in _hub_env.split(",") if e.strip()}
+        else:
+            HUB_ENTITIES = {_user_entity, "Claude-Code"}
+
+        # Build SQL placeholder string and parameter list for hub suppression.
+        _hub_list = sorted(HUB_ENTITIES)
+        _hub_placeholders = ",".join("?" for _ in _hub_list)
 
         for name in entity_names:
             cursor = conn.execute(
-                """SELECT src.name, r.relation, tgt.name, r.weight
+                f"""SELECT src.name, r.relation, tgt.name, r.weight
                    FROM relationships r
                    JOIN entities src ON r.source_id = src.id
                    JOIN entities tgt ON r.target_id = tgt.id
                    WHERE (src.name = ? OR tgt.name = ?)
-                   AND src.name NOT IN ('Kalyan', 'Example', 'Claude-Code')
+                   AND src.name NOT IN ({_hub_placeholders})
                    LIMIT 6""",
-                (name, name)
+                (name, name, *_hub_list)
             )
             for row in cursor:
                 conf = f" [{row[3]}]" if row[3] != 1.0 else ""

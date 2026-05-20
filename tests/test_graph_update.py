@@ -115,6 +115,7 @@ def hook_env(tmp_path):
         "AGAM_SESSIONS_DIR": str(sessions),
         "AGAM_KG_TOOL": str(stub_tool),
         "AGAM_VAULT_DIR": str(vault),
+        "AGAM_USER_ENTITY": "Kalyan",
         "TMPDIR": str(fake_tmp),
     }
     return env, kg, kg_dir, sessions, _snapshot_real()

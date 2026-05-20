@@ -147,8 +147,11 @@ def extract_projects_from_paths(transcript):
     """Extract project names from file paths in tool calls."""
     projects = set()
 
-    # Match paths like /Users/test/coding/<project>/ or /workspaces/coding/<project>/
-    for match in re.finditer(r"(?:/Users/test/coding|/workspaces/coding)/([a-zA-Z0-9_-]+)", transcript):
+    # Match paths under the user's coding directory (host or in-container).
+    # Host coding dir is env-configurable for v0 releaseability; defaults to ~/coding.
+    host_coding = os.environ.get("AGAM_HOST_CODING_DIR", os.path.expanduser("~/coding"))
+    host_pattern = re.escape(host_coding)
+    for match in re.finditer(rf"(?:{host_pattern}|/workspaces/coding)/([a-zA-Z0-9_-]+)", transcript):
         name = match.group(1)
         if name not in {"node_modules", ".git", "dist", "build", "__pycache__", ".next"}:
             projects.add(name)
@@ -277,11 +280,12 @@ def main():
     projects = extract_projects_from_paths(transcript)
     today = datetime.now().strftime("%Y-%m-%d")
 
+    user_entity = os.environ.get("AGAM_USER_ENTITY", "User").strip() or "User"
     for proj in projects:
         eid = ensure_entity(db, proj, "project")
         if eid:
             set_prop(db, proj, "last-worked", today)
-            ensure_relation(db, "Kalyan", "works-on", proj)
+            ensure_relation(db, user_entity, "works-on", proj)
             changes += 1
 
     # Extract npm packages (new dependencies = new relationships)
@@ -305,7 +309,7 @@ def main():
                 set_prop(db, rp['slug'], "framework", rp['framework'])
             if rp.get('depth'):
                 set_prop(db, rp['slug'], "depth", rp['depth'])
-            ensure_relation(db, "Kalyan", "researched", rp['slug'])
+            ensure_relation(db, user_entity, "researched", rp['slug'])
             changes += 1
 
     # Error extraction removed -- errors are transient, they pollute the graph

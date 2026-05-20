@@ -40,13 +40,18 @@ def detect_context(cwd: str) -> str:
     return "devcontainer" if cwd.startswith("/workspaces/") else "host"
 
 
+_HOST_HOME = os.environ.get("AGAM_HOST_HOME", os.path.expanduser("~"))
+_HOST_CODING_DIR = os.environ.get("AGAM_HOST_CODING_DIR", os.path.join(_HOST_HOME, "coding"))
+
+
 def _host_path(p: str) -> str:
     """Translate container-view paths to host-view.
-    Keeps the queue in host-view regardless of whether the hook ran inside the coding container."""
+    Keeps the queue in host-view regardless of whether the hook ran inside the coding container.
+    Host home + coding dir are env-configurable so this works for any  user."""
     if p.startswith("/home/node/.claude/"):
-        return "/Users/test/.claude/" + p[len("/home/node/.claude/"):]
+        return os.path.join(_HOST_HOME, ".claude") + "/" + p[len("/home/node/.claude/"):]
     if p.startswith("/workspaces/coding/"):
-        return "/Users/test/coding/" + p[len("/workspaces/coding/"):]
+        return _HOST_CODING_DIR + "/" + p[len("/workspaces/coding/"):]
     return p
 
 

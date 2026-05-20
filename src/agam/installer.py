@@ -32,6 +32,7 @@ proceed unless ``force=True``, in which case the old directory is moved to
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -395,11 +396,12 @@ def _write_launchd_plist(
     )
 
 
-def _register_hooks(paths: InstallPaths) -> None:
-    """Hand off to Task 17's settings_merger when it ships.
+def _register_hooks(paths: InstallPaths, answers: Answers) -> None:
+    """Merge Agam hook registrations into settings.json and set AGAM_USER_ENTITY
+    in the env block so the user's chosen name becomes their graph entity name.
 
-    Wrapped in try/except ImportError so this installer works now; the
-    actual settings.json merge lands in the next task.
+    Wrapped in try/except ImportError so this installer remains importable
+    even if settings_merger is unavailable in a stripped-down test env.
     """
     try:
         from agam.settings_merger import (  # type: ignore[import-not-found]
@@ -415,6 +417,60 @@ def _register_hooks(paths: InstallPaths) -> None:
             f"You will need to register hooks manually.",
             file=sys.stderr,
         )
+        return
+
+    # Ensure AGAM_USER_ENTITY is set in the settings.json env block so hooks
+    # tag the user's projects/research relations with the right entity name.
+    # The hook also accepts the env var from the shell or the parent process,
+    # but writing it here means "works out of the box" without shell config.
+    user_entity = (answers.name or "User").strip() or "User"
+    try:
+        _set_settings_env(paths.claude / "settings.json", "AGAM_USER_ENTITY", user_entity)
+    except Exception as exc:  # pragma: no cover - best effort
+        print(
+            f"[installer] could not set AGAM_USER_ENTITY in settings.json: {exc}. "
+            f"Hooks will fall back to the literal 'User' entity name.",
+            file=sys.stderr,
+        )
+
+
+def _set_settings_env(settings_path: Path, key: str, value: str) -> None:
+    """Set a single key in the top-level 'env' object of settings.json.
+
+    Reads, mutates, writes atomically. Creates 'env' if missing. Preserves
+    all other settings verbatim. Skips the write if the key is already set
+    to the same value (idempotent).
+    """
+    if settings_path.exists():
+        raw = settings_path.read_text(encoding="utf-8").strip()
+        data = json.loads(raw) if raw else {}
+    else:
+        data = {}
+    if not isinstance(data, dict):
+        raise TypeError(f"{settings_path} root must be a JSON object")
+    env = data.setdefault("env", {})
+    if not isinstance(env, dict):
+        raise TypeError(f"{settings_path} 'env' must be an object")
+    if env.get(key) == value:
+        return
+    env[key] = value
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".settings-",
+        suffix=".json.tmp",
+        dir=str(settings_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(tmp_name, settings_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +598,7 @@ def run_wizard(
 
     # After the filesystem is in place, try to register hooks in
     # settings.json. Failure is logged but non-fatal.
-    _register_hooks(paths)
+    _register_hooks(paths, resolved)
 
     return InstallResult(
         paths=paths,

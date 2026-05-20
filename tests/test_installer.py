@@ -341,3 +341,31 @@ def test_installer_does_not_touch_real_home(tmp_path):
     assert before == after, (
         "installer mutated the real ~/.claude/agam/AGAM.md despite home= override"
     )
+
+
+def test_installer_writes_user_entity_into_settings_env(tmp_path):
+    """The user's chosen name must land in settings.json env so hooks tag
+    relations with the right entity. users typing 'Alice' should not
+    end up with 'Kalyan -- works-on -- foo' relations in their KG."""
+    import json
+    from agam.installer import run_wizard
+
+    answers = _default_answers(tmp_path)
+    answers["name"] = "Alice"
+    run_wizard(answers=answers, home=tmp_path)
+
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert settings.get("env", {}).get("AGAM_USER_ENTITY") == "Alice"
+
+
+def test_installer_user_entity_falls_back_to_user_for_empty_name(tmp_path):
+    """If name is blank, hook default 'User' is used (no empty entity)."""
+    import json
+    from agam.installer import run_wizard
+
+    answers = _default_answers(tmp_path)
+    answers["name"] = "   "  # whitespace-only -> treat as missing
+    run_wizard(answers=answers, home=tmp_path)
+
+    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
+    assert settings.get("env", {}).get("AGAM_USER_ENTITY") == "User"
