@@ -104,17 +104,17 @@ def test_prompt_is_ascii(path: pathlib.Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-PERSONAL_SENTINELS = (
-    "/Users/km",
-    "Kalyan",
-    "kalyanguru18@gmail",
-    "Example",
-    "kalyanguru18",
+import re as _re
+
+PERSONAL_PATTERNS = (
+    ("email address",     _re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("home path /Users",  _re.compile(r"/Users/[a-z][a-z0-9_-]*/")),
+    ("home path /home",   _re.compile(r"/home/[a-z][a-z0-9_-]*/")),
 )
 
 
 @pytest.mark.parametrize("path", ALL_PROMPTS, ids=lambda p: p.name)
 def test_no_personal_content(path: pathlib.Path) -> None:
     text = path.read_text(encoding="utf-8")
-    leaks = [s for s in PERSONAL_SENTINELS if s in text]
-    assert not leaks, f"{path.name} contains personal content (count={len(leaks)})"
+    hits = [label for label, rx in PERSONAL_PATTERNS if rx.search(text)]
+    assert not hits, f"{path.name} contains personal patterns: {hits}"

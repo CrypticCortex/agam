@@ -139,7 +139,7 @@ def count_tokens_in_file(path: Path) -> int:
 # ---- LLM plumbing --------------------------------------------------------
 
 
-_DEFAULT_CONTAINER_PATTERN = "claude-code|claude-code"
+_DEFAULT_CONTAINER_PATTERN = "claude-code"
 
 
 def _discover_container() -> str | None:
@@ -150,7 +150,7 @@ def _discover_container() -> str | None:
     1. ``AGAM_CONTAINER_NAME`` -- explicit override. We only verify the
        named container is actually running; no pattern matching.
     2. Otherwise match ``docker ps`` rows against ``AGAM_CONTAINER_PATTERN``
-       (default: ``claude-code|claude-code``) on ``"<name> <image>"``.
+       (default: ``claude-code``) on ``"<name> <image>"``.
 
     Any ``subprocess`` failure (``docker`` not installed, daemon down)
     surfaces as ``None`` so callers can emit a single clean error.

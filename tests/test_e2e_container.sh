@@ -49,7 +49,7 @@ if ! ./scripts/test-container.sh reset; then
 fi
 
 # (2) Confirm the user's devcontainer (if any) was not disturbed ----------
-if docker ps --format '{{.Names}}' | grep -qE 'claude-code-dev|claude-code'; then
+if docker ps --format '{{.Names}}' | grep -qi 'claude-code'; then
     echo "[ok] user devcontainer still running alongside test container"
 fi
 

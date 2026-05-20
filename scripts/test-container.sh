@@ -9,7 +9,7 @@
 
 set -u
 CONTAINER="agam-oss-test"
-IMAGE="${AGAM_TEST_IMAGE:-artifactory.example.com/claude-code/claude-code:latest}"
+IMAGE="${AGAM_TEST_IMAGE:-python:3.11-slim}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_HOST="${AGAM_TEST_REPO_HOST:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 REPO_CONTAINER="/workspace/agam"

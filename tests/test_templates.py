@@ -95,36 +95,25 @@ def test_claude_md_template_has_no_emdash() -> None:
 # ---------------------------------------------------------------------------
 
 
-# Sentinel strings we know appear in any AGAM.md / THISAI.md
-# / MUGAM.md. None of these should leak into the public templates. We never
-# print the strings on failure -- just assert absence.
-PERSONAL_SENTINELS = (
-    "Kalyan",
-    "(km)",
-    "Example",
-    "city",
-    "university",
-    "example-tool",
-    "past-employer",
-    "personal-goal",
-    "example-project",
-    "example-research",
-    "example-project",
-    "example-project",
-    "example-project",
-    "Project-C",
-    "Project-A",
-    "Project-B",
-    "example-mcp",
-    "collaborator",
+# Class-based PII guards. Each entry is (label, regex). We assert templates
+# match NONE of these. The regex is shown on failure but the matched value
+# is intentionally suppressed so a broken test on someone else's fork never
+# echoes their personal data.
+import re as _re
+
+PERSONAL_PATTERNS = (
+    ("email address", _re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("home path",     _re.compile(r"/Users/[a-z][a-z0-9_-]*/")),
+    ("home path",     _re.compile(r"/home/[a-z][a-z0-9_-]*/")),
+    ("phone number",  _re.compile(r"\b\+?\d{1,3}[\s-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}\b")),
 )
 
 
 @pytest.mark.parametrize("path", IDENTITY_TEMPLATES, ids=lambda p: p.name)
 def test_no_personal_content(path: pathlib.Path) -> None:
     text = path.read_text(encoding="utf-8")
-    leaks = [s for s in PERSONAL_SENTINELS if s in text]
-    assert not leaks, f"{path.name} contains personal content (count={len(leaks)})"
+    hits = [label for label, rx in PERSONAL_PATTERNS if rx.search(text)]
+    assert not hits, f"{path.name} contains personal patterns: {hits}"
 
 
 @pytest.mark.parametrize("path", IDENTITY_TEMPLATES, ids=lambda p: p.name)

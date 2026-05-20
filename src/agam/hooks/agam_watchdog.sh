@@ -11,13 +11,13 @@
 # Env:
 #   AGAM_HOME                  default $HOME/.claude/agam
 #   AGAM_WATCHDOG_MODE         container (default) | host
-#   AGAM_CONTAINER_PATTERN     default claude-code|claude-code
+#   AGAM_CONTAINER_PATTERN     default claude-code
 #   AGAM_CONTAINER_NAME        optional exact-name override
 set -u
 
 AGAM_HOME="${AGAM_HOME:-$HOME/.claude/agam}"
 MODE="${AGAM_WATCHDOG_MODE:-container}"
-CONTAINER_PATTERN="${AGAM_CONTAINER_PATTERN:-claude-code|claude-code}"
+CONTAINER_PATTERN="${AGAM_CONTAINER_PATTERN:-claude-code}"
 CONTAINER_NAME_OVERRIDE="${AGAM_CONTAINER_NAME:-}"
 LOG="$AGAM_HOME/logs/watchdog.log"
 LOCK="$AGAM_HOME/.watchdog.lock"

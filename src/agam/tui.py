@@ -171,7 +171,7 @@ def _container_name() -> str | None:
     except Exception:
         _CONTAINER_CACHE.update(name=None, ts=now)
         return None
-    pat = re.compile(r"claude-code|claude-code", re.IGNORECASE)
+    pat = re.compile(r"claude-code", re.IGNORECASE)
     for line in r.stdout.splitlines():
         if pat.search(line):
             _CONTAINER_CACHE.update(name=line.split()[0], ts=now)
@@ -592,7 +592,7 @@ class AgamApp(App):
             self.notify(f"drain failed: {e}", severity="error")
 
     def action_start_container(self) -> None:
-        # Start any stopped container with claude-code|claude-code image
+        # Start any stopped container with claude-code image
         try:
             r = subprocess.run(
                 ["docker", "ps", "-a", "--format", "{{.Names}} {{.Image}} {{.Status}}"],
@@ -601,7 +601,7 @@ class AgamApp(App):
         except Exception as e:
             self.notify(f"docker ps failed: {e}", severity="error")
             return
-        pat = re.compile(r"claude-code|claude-code", re.IGNORECASE)
+        pat = re.compile(r"claude-code", re.IGNORECASE)
         target = None
         for line in r.stdout.splitlines():
             if pat.search(line) and "Exited" in line:

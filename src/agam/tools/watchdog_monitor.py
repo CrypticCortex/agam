@@ -32,7 +32,7 @@ Environment variables:
     AGAM_HOOKS_DIR          Directory for inner.py inside the container
                             (default: ~/.claude/hooks/)
     AGAM_CONTAINER_PATTERN  Regex-alternation pattern matched against
-                            "docker ps" output (default: claude-code|claude-code)
+                            "docker ps" output (default: claude-code)
     AGAM_CONTAINER_NAME     Exact container name override (skips discovery)
     AGAM_HOST_CLAUDE_DIR    Host prefix mapped to container /home/node/.claude/
                             (default: ~/.claude/)
@@ -74,7 +74,7 @@ CONTAINER_CODING_DIR = os.environ.get(
     "AGAM_CONTAINER_CODING_DIR", "/workspaces/coding/"
 )
 CONTAINER_PATTERN = os.environ.get(
-    "AGAM_CONTAINER_PATTERN", "claude-code|claude-code"
+    "AGAM_CONTAINER_PATTERN", "claude-code"
 )
 CONTAINER_NAME_OVERRIDE = os.environ.get("AGAM_CONTAINER_NAME", "")
 

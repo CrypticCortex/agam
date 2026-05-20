@@ -303,7 +303,7 @@ def test_apply_obsolete_marks_entity_in_kg(tmp_path):
 
     proposals = {
         "obsolete": [
-            {"name": "stale-feature-bug", "reason": "fully removed from agent"}
+            {"name": "stale-feature-bug", "reason": "fully removed from output"}
         ]
     }
     applied = mod.apply_proposals(
@@ -325,7 +325,7 @@ def test_apply_obsolete_marks_entity_in_kg(tmp_path):
     ).fetchall())
     conn.close()
     assert rows.get("status") == "obsolete"
-    assert rows.get("obsolete-reason") == "fully removed from agent"
+    assert rows.get("obsolete-reason") == "fully removed from output"
     assert "obsoleted-at" in rows
 
 

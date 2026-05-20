@@ -119,7 +119,7 @@ Edit this file directly and the next session picks up the changes. Re-run `agam 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGAM_CONTAINER_PATTERN` | `claude-code\|claude-code` | Regex matched against `docker ps` rows to discover your claude-code container. |
+| `AGAM_CONTAINER_PATTERN` | `claude-code` | Regex matched against `docker ps` rows to discover your claude-code container. |
 | `AGAM_CONTAINER_NAME` | unset | Exact container name. Overrides the regex above. |
 | `AGAM_WATCHDOG_MODE` | `container` | `container` runs LLM calls via `docker exec`. `host` runs them directly on macOS. See below. |
 | `AGAM_HOME` | `~/.claude/agam` | Root of identity + log directories. |

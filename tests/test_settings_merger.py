@@ -288,7 +288,7 @@ def test_unicode_non_hook_keys_survive_roundtrip(tmp_path: Path):
     settings_path = tmp_path / "settings.json"
     hooks_dir = tmp_path / "hooks"
     user_settings = {
-        "displayName": "Kalyan -- full name: Kalyan",
+        "displayName": "Kalyan",
         "greeting": "Namaste",
         "hooks": {},
     }
@@ -300,5 +300,5 @@ def test_unicode_non_hook_keys_survive_roundtrip(tmp_path: Path):
     merge_hooks_into_settings(settings_path, hooks_dir)
 
     disk = json.loads(settings_path.read_text(encoding="utf-8"))
-    assert disk["displayName"] == "Kalyan -- full name: Kalyan"
+    assert disk["displayName"] == "Kalyan"
     assert disk["greeting"] == "Namaste"
