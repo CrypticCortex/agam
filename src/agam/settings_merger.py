@@ -229,9 +229,16 @@ def _agam_hook_entries(hooks_dir: Path) -> dict[str, list[dict[str, Any]]]:
             {"command": str(hooks_dir / "session_close.py"), "matcher": ""},
         ],
         "PreToolUse": [
+            # Bash trigger -> command-pattern lessons (e.g. "pip install in conda").
             {
                 "command": str(hooks_dir / "lesson_activate.py"),
                 "matcher": "Bash",
+            },
+            # Edit/Write/MultiEdit trigger -> file-path lessons (e.g. "mirror
+            # this change into the repo"). Same script, different matcher.
+            {
+                "command": str(hooks_dir / "lesson_activate.py"),
+                "matcher": "Edit|Write|MultiEdit",
             },
         ],
         "PostToolUse": [

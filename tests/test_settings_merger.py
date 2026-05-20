@@ -197,6 +197,14 @@ def test_merge_hooks_into_settings_creates_file_when_missing(tmp_path: Path):
     ]
     assert any("graph_update.py" in c for c in stop_cmds)
     assert any("session_close.py" in c for c in stop_cmds)
+    # PreToolUse must carry both the Bash matcher AND the Edit|Write|MultiEdit
+    # matcher for the lesson hook. Without the second matcher, file-path
+    # lessons never fire.
+    pre_matchers = [block.get("matcher", "") for block in on_disk["hooks"]["PreToolUse"]]
+    assert "Bash" in pre_matchers
+    assert any("Edit" in m and "Write" in m and "MultiEdit" in m for m in pre_matchers), (
+        f"PreToolUse missing Edit|Write|MultiEdit matcher; got: {pre_matchers}"
+    )
 
 
 def test_merge_hooks_into_settings_is_idempotent(tmp_path: Path):

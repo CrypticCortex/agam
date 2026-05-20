@@ -28,15 +28,26 @@ class _MockPaths:
 
 
 @dataclass
+class _MockAnswers:
+    """Minimal stand-in for installer.Answers used by CLI auto-chain logic."""
+    name: str = "Alice"
+    bootstrap_now: bool = False
+    projects_dir: str = "/tmp/projects"
+
+
+@dataclass
 class MockResult:
     success: bool = True
     paths: _MockPaths = None  # type: ignore[assignment]
     backup: Path | None = None
     wrote_plist: bool = False
+    answers: _MockAnswers = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.paths is None:
             self.paths = _MockPaths()
+        if self.answers is None:
+            self.answers = _MockAnswers()
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +108,58 @@ def test_cli_init_with_answers_yaml(monkeypatch, tmp_path):
     assert rc == 0
     assert called[0]["answers"]["name"] == "Alice"
     assert called[0]["answers"]["projects-dir"] == "/tmp"
+
+
+def test_cli_init_chains_bootstrap_when_bootstrap_now_true(monkeypatch, tmp_path):
+    """If the wizard captures bootstrap_now=True, init must auto-invoke
+    the bootstrap command. Without this wire-up the wizard question is
+    cosmetic and users have to run a second command anyway."""
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    answers = _MockAnswers(name="Alice", bootstrap_now=True, projects_dir=str(tmp_path))
+    monkeypatch.setattr(
+        "agam.installer.run_wizard",
+        lambda **kw: MockResult(answers=answers),
+    )
+
+    bootstrap_calls: list[object] = []
+    monkeypatch.setattr("agam.cli._cmd_bootstrap", lambda ns: bootstrap_calls.append(ns) or 0)
+    monkeypatch.setattr("agam.cli._launchctl_bootstrap", lambda paths: None)
+
+    rc = cli.main(["init"])
+    assert rc == 0
+    assert bootstrap_calls, "bootstrap_now=True must trigger _cmd_bootstrap"
+    ns = bootstrap_calls[0]
+    assert getattr(ns, "projects") == str(tmp_path)
+    assert getattr(ns, "days") == 30
+    assert getattr(ns, "yes") is False, "must still show the cost preview to user"
+
+
+def test_cli_init_does_not_chain_bootstrap_when_bootstrap_now_false(
+    monkeypatch, tmp_path
+):
+    """The default (bootstrap_now=False) must NOT trigger bootstrap.
+
+    Otherwise users who decline during the wizard would still get billed
+    for an unwanted scan.
+    """
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    answers = _MockAnswers(name="Alice", bootstrap_now=False)
+    monkeypatch.setattr(
+        "agam.installer.run_wizard",
+        lambda **kw: MockResult(answers=answers),
+    )
+
+    bootstrap_calls: list[object] = []
+    monkeypatch.setattr("agam.cli._cmd_bootstrap", lambda ns: bootstrap_calls.append(ns) or 0)
+    monkeypatch.setattr("agam.cli._launchctl_bootstrap", lambda paths: None)
+
+    rc = cli.main(["init"])
+    assert rc == 0
+    assert not bootstrap_calls, "bootstrap must NOT fire when user declined"
 
 
 def test_cli_init_returns_1_on_systemexit(monkeypatch):
@@ -238,6 +301,78 @@ def test_cli_status_with_container(monkeypatch, tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "claude-code-abc" in out
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+
+def test_cli_doctor_fails_on_fresh_home(monkeypatch, tmp_path, capsys):
+    """Empty HOME -> doctor flags every missing thing, returns 1."""
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("agam.bootstrap._discover_container", lambda: None)
+
+    rc = cli.main(["doctor"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "[FAIL]" in out, "doctor must flag missing identity files on fresh HOME"
+    assert "fix:" in out, "doctor must suggest a fix for each failure"
+    assert "agam init" in out, "the recommended fix should be agam init"
+
+
+def test_cli_doctor_passes_after_init(monkeypatch, tmp_path, capsys):
+    """After a successful init the critical checks should pass.
+
+    Container + credentials may still WARN (they depend on user env), but
+    no FAIL should appear and the exit code should be 0.
+    """
+    import platform
+
+    if platform.system() != "Darwin":
+        pytest.skip("doctor's launchd check is mac-specific; skip elsewhere")
+
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("agam.bootstrap._discover_container", lambda: None)
+
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path / "projects"),
+            "platform": "mac",
+            "container_mode": "none",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+
+    # Stub out launchctl print so the doctor doesn't shell out to the host
+    # launchd. Returning rc=0 simulates "plist loaded".
+    import subprocess as _sp
+    orig_run = _sp.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd and cmd[0] == "launchctl":
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
+        return orig_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    # Identity + KG + hooks must pass.
+    assert "[FAIL]" not in out, f"doctor should not FAIL on a fresh install:\n{out}"
+    assert "All checks passed" in out
+    assert rc == 0
 
 
 # ---------------------------------------------------------------------------

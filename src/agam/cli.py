@@ -108,7 +108,115 @@ def _cmd_init(args: argparse.Namespace) -> int:
     backup = getattr(result, "backup", None)
     if backup is not None:
         print(f"[agam init] previous install backed up to {backup}")
+
+    # Load the launchd plist on macOS so the watchdog actually starts running.
+    # Without this step the plist file sits in ~/Library/LaunchAgents/ unloaded
+    # and the watchdog never fires, which is a silent failure mode.
+    if getattr(result, "wrote_plist", False):
+        _launchctl_bootstrap(paths)
+
+    answers = getattr(result, "answers", None)
+
+    # Auto-chain bootstrap if the user opted in during the wizard. The wizard's
+    # ``bootstrap_now?`` question used to be cosmetic (recorded but never
+    # actuated). For "just works" we honour it here: scaffolding lands, then
+    # bootstrap fires with sane defaults. The user still gets the cost preview
+    # + confirmation inside _cmd_bootstrap, so they can bail if the scan
+    # surfaces a surprisingly large number of transcripts.
+    bootstrap_now = bool(getattr(answers, "bootstrap_now", False)) if answers else False
+    if bootstrap_now:
+        print("[agam init] you opted in to bootstrap. Running it now...")
+        projects_dir = getattr(answers, "projects_dir", "~/.claude/projects")
+        bootstrap_args = argparse.Namespace(
+            projects=str(projects_dir),
+            days=30,
+            all=False,
+            yes=False,  # still show cost preview + confirm -- bills can sting
+            resume=False,
+            model_haiku="claude-haiku-4-5",
+            model_sonnet="claude-sonnet-4-6",
+        )
+        rc = _cmd_bootstrap(bootstrap_args)
+        if rc != 0:
+            print(
+                "[agam init] bootstrap did not complete. You can re-run it any "
+                "time with: agam bootstrap --projects <dir>",
+                file=sys.stderr,
+            )
+        # Either way init itself succeeded -- the scaffolding is in place.
+
+    _print_install_banner(result)
     return 0
+
+
+def _launchctl_bootstrap(paths: Any) -> None:
+    """``launchctl bootstrap`` the agam-watchdog plist for the current GUI user.
+
+    No-op on non-mac platforms (the launchd plist isn't written there). On
+    Mac, idempotent: if the plist is already loaded, ``launchctl bootstrap``
+    returns non-zero and we silently move on. Surface other failures so the
+    user knows the watchdog isn't running.
+    """
+    import platform
+    import subprocess
+
+    if platform.system() != "Darwin":
+        return
+    launch_agents = getattr(paths, "launch_agents", None)
+    if launch_agents is None:
+        return
+    plist_path = Path(launch_agents) / "com.agam.watchdog.plist"
+    if not plist_path.exists():
+        return
+    uid = os.getuid()
+    domain = f"gui/{uid}"
+    # First call: ``bootstrap``. If already loaded this prints to stderr and
+    # exits non-zero. We swallow that case but surface any other error.
+    proc = subprocess.run(
+        ["launchctl", "bootstrap", domain, str(plist_path)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        print(f"[agam init] launchd watchdog loaded ({plist_path.name})")
+        return
+    err = (proc.stderr or proc.stdout or "").strip()
+    if "already" in err.lower() or "service already" in err.lower():
+        print(f"[agam init] launchd watchdog already loaded ({plist_path.name})")
+        return
+    # Other failures -- usually the user lacks Full Disk Access for launchctl
+    # or the plist references a stale path. Print enough to debug without
+    # blocking install completion.
+    print(
+        f"[agam init] launchctl bootstrap failed (exit {proc.returncode}): {err}. "
+        f"To load the watchdog manually: "
+        f"launchctl bootstrap {domain} {plist_path}",
+        file=sys.stderr,
+    )
+
+
+def _print_install_banner(result: Any) -> None:
+    """End-of-install summary so users know what to do next.
+
+    Three pointers: verify, populate, observe. Tight on purpose -- a wall of
+    text after install is friction. Skip the banner entirely if ``result``
+    doesn't carry the expected attrs (test mocks).
+    """
+    paths = getattr(result, "paths", None)
+    if paths is None:
+        return
+    print("")
+    print("Agam is installed.")
+    print("")
+    print("  Verify:    agam doctor")
+    print("  Populate:  agam bootstrap --projects ~/.claude/projects")
+    print("  TUI:       agam tui")
+    print("")
+    print("Identity files live at:", getattr(paths, "agam", "~/.claude/agam/"))
+    print("KG lives at:", getattr(paths, "knowledge", "~/.claude/knowledge/") )
+    print("")
+    print("Next Claude Code session will start using Agam automatically.")
+    print("")
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +437,228 @@ def _cmd_status(_args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# doctor -- deep health check, designed for "did my install work?"
+# ---------------------------------------------------------------------------
+
+
+_OK = "[OK]"
+_WARN = "[WARN]"
+_FAIL = "[FAIL]"
+
+
+def _check(label: str, ok: bool | None, detail: str = "", fix: str = "") -> bool:
+    """Print a doctor-style check line. Returns True if the check passed.
+
+    ``ok=None`` -> warn (not an outright failure, but worth surfacing).
+    The ``fix`` string is shown on the next line when ok is False/None
+    so users have an actionable command to copy.
+    """
+    if ok is True:
+        tag = _OK
+    elif ok is None:
+        tag = _WARN
+    else:
+        tag = _FAIL
+    line = f"{tag:6} {label}"
+    if detail:
+        line += f" -- {detail}"
+    print(line)
+    if ok is not True and fix:
+        print(f"       fix: {fix}")
+    return ok is True
+
+
+def _cmd_doctor(_args: argparse.Namespace) -> int:
+    """Run a battery of checks that diagnose common install failures.
+
+    Returns 0 if every check passes, 1 if any FAIL is hit. WARNs do not
+    fail the exit code -- they exist for things like "no claude-code
+    container running" which is fine for users on host-mode Claude Code.
+    """
+    import json as _json
+    import platform
+    import subprocess
+
+    home = _home()
+    fails = 0
+
+    # 1. Identity files
+    agam_dir = home / ".claude" / "agam"
+    for f in ("AGAM.md", "THISAI.md", "MUGAM.md", "config.yaml"):
+        if not _check(
+            f"identity file: {f}",
+            (agam_dir / f).exists(),
+            detail=str(agam_dir / f),
+            fix="agam init",
+        ):
+            fails += 1
+
+    # 2. KG present + readable
+    kg_path = home / ".claude" / "knowledge" / "graph.db"
+    kg_ok = False
+    kg_count = 0
+    if kg_path.exists():
+        try:
+            import sqlite3 as _sql
+            conn = _sql.connect(str(kg_path), timeout=2)
+            kg_count = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            conn.close()
+            kg_ok = True
+        except Exception as exc:  # noqa: BLE001
+            _check("KG readable", False, str(exc), "agam init --force")
+            fails += 1
+    if kg_ok:
+        _check(
+            "KG readable",
+            True,
+            detail=f"{kg_count} entities at {kg_path}",
+        )
+        if kg_count == 0:
+            _check(
+                "KG populated",
+                None,
+                "graph is empty -- recall hook will have nothing to inject",
+                fix=f"agam bootstrap --projects {home / '.claude' / 'projects'}",
+            )
+    elif not kg_path.exists():
+        _check("KG file present", False, str(kg_path), "agam init")
+        fails += 1
+
+    # 3. Hooks registered in settings.json
+    settings_path = home / ".claude" / "settings.json"
+    if settings_path.exists():
+        try:
+            settings = _json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            _check(
+                "settings.json parseable",
+                False,
+                str(exc),
+                "inspect ~/.claude/settings.json manually",
+            )
+            fails += 1
+            settings = {}
+        # Walk every hook entry and look for any command path containing the
+        # canonical agam hook filenames. Substring match handles installer
+        # path variations (~/.claude vs absolute).
+        hook_section = settings.get("hooks", {})
+        all_commands: list[str] = []
+        if isinstance(hook_section, dict):
+            for entries in hook_section.values():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    for inner in entry.get("hooks", []):
+                        if isinstance(inner, dict):
+                            cmd = inner.get("command", "")
+                            if isinstance(cmd, str):
+                                all_commands.append(cmd)
+        required_markers = ("graph_recall", "graph_update", "session_close")
+        missing = [m for m in required_markers if not any(m in c for c in all_commands)]
+        if missing:
+            _check(
+                "Agam hooks registered in settings.json",
+                False,
+                detail=f"missing: {', '.join(missing)}",
+                fix="agam init --force",
+            )
+            fails += 1
+        else:
+            _check(
+                "Agam hooks registered in settings.json",
+                True,
+                detail=f"{len(all_commands)} hook commands found",
+            )
+        # AGAM_USER_ENTITY env var present
+        user_entity = settings.get("env", {}).get("AGAM_USER_ENTITY") if isinstance(settings.get("env"), dict) else None
+        if user_entity:
+            _check("AGAM_USER_ENTITY set", True, detail=user_entity)
+        else:
+            _check(
+                "AGAM_USER_ENTITY set",
+                None,
+                detail="hooks will tag relations with the literal 'User'",
+                fix="agam init --force (re-runs the wizard with name capture)",
+            )
+    else:
+        _check(
+            "settings.json present",
+            False,
+            str(settings_path),
+            fix="agam init (will create settings.json with Agam hooks merged in)",
+        )
+        fails += 1
+
+    # 4. OAuth credentials (required for bootstrap + watchdog)
+    creds = home / ".claude" / ".credentials.json"
+    if creds.exists():
+        _check("Claude Code OAuth credentials", True, detail=str(creds))
+    else:
+        _check(
+            "Claude Code OAuth credentials",
+            None,
+            detail=str(creds),
+            fix="run `claude` interactively once to authenticate",
+        )
+
+    # 5. Container discovery (informational -- container is needed only for
+    # bootstrap + watchdog, not for graph_recall / graph_update).
+    try:
+        from agam import bootstrap as _bs
+        container = _bs._discover_container()
+    except Exception:  # noqa: BLE001
+        container = None
+    if container:
+        _check("Claude Code container running", True, detail=container)
+    else:
+        _check(
+            "Claude Code container running",
+            None,
+            "bootstrap + watchdog require it; recall hook does not",
+            fix="start your devcontainer (or set AGAM_BOOTSTRAP_MODE=host)",
+        )
+
+    # 6. macOS launchd plist loaded
+    if platform.system() == "Darwin":
+        plist_name = "com.agam.watchdog"
+        plist_path = home / "Library" / "LaunchAgents" / f"{plist_name}.plist"
+        if plist_path.exists():
+            uid = os.getuid()
+            proc = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{plist_name}"],
+                capture_output=True,
+                text=True,
+            )
+            loaded = proc.returncode == 0
+            if loaded:
+                _check("launchd watchdog loaded", True, detail=plist_name)
+            else:
+                _check(
+                    "launchd watchdog loaded",
+                    False,
+                    detail="plist exists but is not loaded",
+                    fix=f"launchctl bootstrap gui/{uid} {plist_path}",
+                )
+                fails += 1
+        else:
+            _check(
+                "launchd watchdog plist installed",
+                None,
+                detail="not installed (only relevant if you want background sync)",
+                fix="agam init (with platform=mac)",
+            )
+
+    print("")
+    if fails:
+        print(f"{fails} check(s) failed. Address the fix lines above.")
+        return 1
+    print("All checks passed.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # reset
 # ---------------------------------------------------------------------------
 
@@ -445,6 +775,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # -- status
     p_status = sub.add_parser("status", help="Print Agam install health.")
     p_status.set_defaults(func=_cmd_status)
+
+    # -- doctor
+    p_doc = sub.add_parser(
+        "doctor",
+        help="Deep diagnostic checks. Use when something feels off.",
+    )
+    p_doc.set_defaults(func=_cmd_doctor)
 
     # -- reset
     p_reset = sub.add_parser(

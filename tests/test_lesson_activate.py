@@ -68,7 +68,16 @@ def kg_env(tmp_path):
     return env, kg, snapshots
 
 
-def _insert_lesson(kg_path, name, description, severity, trigger_tool=None, trigger_error=None):
+def _insert_lesson(
+    kg_path,
+    name,
+    description,
+    severity,
+    trigger_tool=None,
+    trigger_error=None,
+    trigger_file=None,
+    reminder=None,
+):
     """Insert a lesson entity with trigger properties."""
     conn = sqlite3.connect(kg_path)
     cur = conn.execute(
@@ -93,6 +102,18 @@ def _insert_lesson(kg_path, name, description, severity, trigger_tool=None, trig
             "INSERT INTO properties (entity_id, key, value, updated) "
             "VALUES (?, 'trigger-error', ?, datetime('now'))",
             (eid, json.dumps(trigger_error)),
+        )
+    if trigger_file is not None:
+        conn.execute(
+            "INSERT INTO properties (entity_id, key, value, updated) "
+            "VALUES (?, 'trigger-file', ?, datetime('now'))",
+            (eid, json.dumps(trigger_file)),
+        )
+    if reminder is not None:
+        conn.execute(
+            "INSERT INTO properties (entity_id, key, value, updated) "
+            "VALUES (?, 'reminder', ?, datetime('now'))",
+            (eid, reminder),
         )
     conn.commit()
     conn.close()
@@ -345,4 +366,168 @@ def test_post_empty_output_skipped(kg_env, tmp_path):
     r = _run(HOOK_POST, env, payload, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert "hookSpecificOutput" not in r.stdout
+    _assert_real_files_untouched(snapshots)
+
+
+# ---------------------------------------------------------------------------
+# File-path trigger tests (Edit / Write / MultiEdit)
+# ---------------------------------------------------------------------------
+
+
+def test_pre_edit_with_matching_file_trigger_injects(kg_env, tmp_path):
+    """Edit on a file whose path matches a trigger-file pattern -> injection."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg,
+        "lesson-mirror-config",
+        "Mirror config edits to the staging repo before merge.",
+        "high",
+        trigger_file=["/configs/prod.yaml"],
+        reminder="Update ../staging/configs/prod.yaml to match.",
+    )
+    payload = {
+        "session_id": "s-file-match",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "/Users/test/project/configs/prod.yaml",
+            "old_string": "x",
+            "new_string": "y",
+        },
+    }
+    r = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip(), "Expected injection for file-path match"
+    parsed = json.loads(r.stdout)
+    ctx = parsed["hookSpecificOutput"]["additionalContext"]
+    assert "lesson-mirror-config" in ctx
+    assert "ACTION:" in ctx, "reminder should appear as ACTION line"
+    assert "Mirror config edits" in ctx
+    assert "file path" in ctx
+    _assert_real_files_untouched(snapshots)
+
+
+def test_pre_write_with_matching_file_trigger_injects(kg_env, tmp_path):
+    """Write tool uses the same trigger-file path as Edit."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg, "lesson-w", "Write hits same path matcher.", "medium",
+        trigger_file=["/special/"],
+    )
+    payload = {
+        "session_id": "s-write-match",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "/path/to/special/thing.txt",
+            "content": "x",
+        },
+    }
+    r = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "lesson-w" in r.stdout
+    _assert_real_files_untouched(snapshots)
+
+
+def test_pre_multiedit_with_matching_file_trigger_injects(kg_env, tmp_path):
+    """MultiEdit also routes through the file-path matcher."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg, "lesson-multi", "MultiEdit triggers same path lesson.", "medium",
+        trigger_file=["/critical/"],
+    )
+    payload = {
+        "session_id": "s-multi-match",
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": "/srv/critical/db.sql",
+            "edits": [],
+        },
+    }
+    r = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "lesson-multi" in r.stdout
+    _assert_real_files_untouched(snapshots)
+
+
+def test_pre_edit_no_file_trigger_match_silent(kg_env, tmp_path):
+    """Edit on a path NOT matching any trigger-file pattern -> silent."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg, "lesson-mirror", "Mirror reminder.", "high",
+        trigger_file=["/configs/prod.yaml"],
+    )
+    payload = {
+        "session_id": "s-file-nomatch",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "/Users/test/project/README.md",
+            "old_string": "x",
+            "new_string": "y",
+        },
+    }
+    r = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "hookSpecificOutput" not in r.stdout
+    _assert_real_files_untouched(snapshots)
+
+
+def test_pre_edit_with_only_tool_triggers_in_kg_silent(kg_env, tmp_path):
+    """KG has only trigger-tool lessons; Edit tool path -> exit 0 silent."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg, "lesson-bash-only", "Bash-only lesson.", "high",
+        trigger_tool=["pip install"],
+    )
+    payload = {
+        "session_id": "s-edit-no-file-triggers",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/tmp/anything.txt", "old_string": "a", "new_string": "b"},
+    }
+    r = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "hookSpecificOutput" not in r.stdout
+    _assert_real_files_untouched(snapshots)
+
+
+def test_pre_bash_still_works_with_file_triggers_present(kg_env, tmp_path):
+    """Adding file-path triggers must not regress the Bash code path."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg, "lesson-bash", "Bash trigger.", "high",
+        trigger_tool=["pip install"],
+    )
+    _insert_lesson(
+        kg, "lesson-file", "File trigger.", "high",
+        trigger_file=["/foo/"],
+    )
+    payload = {
+        "session_id": "s-bash-coexist",
+        "tool_name": "Bash",
+        "tool_input": {"command": "pip install requests"},
+    }
+    r = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "lesson-bash" in r.stdout
+    assert "lesson-file" not in r.stdout, "file lesson should NOT fire on Bash tool"
+    _assert_real_files_untouched(snapshots)
+
+
+def test_pre_edit_dedups_within_session(kg_env, tmp_path):
+    """Second Edit on a matching path in the same session -> silent."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg, "lesson-once", "Fires once per session.", "high",
+        trigger_file=["/once/"],
+    )
+    sid = "s-dedup-edit"
+    payload = {
+        "session_id": sid,
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/once/foo.txt", "old_string": "a", "new_string": "b"},
+    }
+    r1 = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert "lesson-once" in r1.stdout
+    payload["tool_input"]["file_path"] = "/once/bar.txt"
+    r2 = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r2.returncode == 0, r2.stderr
+    assert "hookSpecificOutput" not in r2.stdout, "second hit should be deduped"
     _assert_real_files_untouched(snapshots)
