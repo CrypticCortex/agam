@@ -692,20 +692,31 @@ def _cmd_obsolete(args: argparse.Namespace) -> int:
     """
     import sqlite3
     from datetime import datetime, timezone
+    from agam.tools.knowledge_graph import normalize_name
 
     kg = _kg_path()
     if not kg.exists():
         print(f"[agam obsolete] no KG at {kg}. Run `agam init` first.", file=sys.stderr)
         return 1
 
+    # Entities are written through normalize_name() (PascalCase / camelCase /
+    # snake_case -> kebab-case). The user can pass any form -- "VoiceFNOL",
+    # "voice_fnol", "voice-fnol" -- so normalize before the lookup. Without
+    # this, ``agam obsolete VoiceFNOL`` looks up "voicefnol" and finds nothing.
+    normalized = normalize_name(args.entity)
+
     conn = sqlite3.connect(str(kg), timeout=5)
     try:
         row = conn.execute(
-            "SELECT id, name FROM entities WHERE LOWER(name) = LOWER(?) LIMIT 1",
-            (args.entity,),
+            "SELECT id, name FROM entities WHERE name = ? LIMIT 1",
+            (normalized,),
         ).fetchone()
         if not row:
-            print(f"[agam obsolete] no entity named {args.entity!r}.", file=sys.stderr)
+            print(
+                f"[agam obsolete] no entity named {args.entity!r} "
+                f"(normalized: {normalized!r}).",
+                file=sys.stderr,
+            )
             return 1
         eid, canonical_name = row[0], row[1]
 
@@ -963,6 +974,7 @@ def _cmd_upgrade(args: argparse.Namespace) -> int:
     import shutil
     snapshot_root = Path(tempfile.mkdtemp(prefix=".agam-upgrade-snap-"))
     snapshot_files: dict[str, Path] = {}
+    succeeded = False
     try:
         for name, src in preserve.items():
             if src.exists():
@@ -996,6 +1008,7 @@ def _cmd_upgrade(args: argparse.Namespace) -> int:
         print(
             f"[agam upgrade] restored {len(snapshot_files)} preserved file(s)."
         )
+        succeeded = True
     except Exception as exc:  # noqa: BLE001 -- surface with context
         print(
             f"[agam upgrade] failed: {exc}\n"
@@ -1005,9 +1018,11 @@ def _cmd_upgrade(args: argparse.Namespace) -> int:
         )
         return 1
     finally:
-        # Clean snapshot only on success. On failure we keep it so the user
-        # can recover.
-        if not args.keep_snapshot:
+        # Only clean the snapshot when the upgrade succeeded AND the user
+        # did not pass --keep-snapshot. On failure we keep it so the user
+        # can recover (the previous finally always ran rmtree, deleting the
+        # snapshot the user was just told to recover from).
+        if succeeded and not args.keep_snapshot:
             try:
                 shutil.rmtree(snapshot_root)
             except OSError:

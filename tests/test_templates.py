@@ -153,6 +153,8 @@ def _substitute_plist(raw: bytes) -> bytes:
         raw.replace(b"{{HOME}}", b"/tmp/home")
         .replace(b"{{AGAM_HOME}}", b"/tmp/home/.claude/agam")
         .replace(b"{{AGAM_HOOKS_DIR}}", b"/tmp/home/.claude/hooks")
+        .replace(b"{{AGAM_TOOLS_DIR}}", b"/tmp/home/.claude/tools/agam")
+        .replace(b"{{AGAM_KG_PATH}}", b"/tmp/home/.claude/knowledge/graph.db")
     )
 
 

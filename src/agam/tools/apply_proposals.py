@@ -17,10 +17,15 @@ from datetime import date
 AGAM_HOME = pathlib.Path(
     os.environ.get("AGAM_HOME", os.path.expanduser("~/.claude/agam"))
 )
+# Memory dir lives under the projects directory's per-CWD slug, e.g.
+# ``~/.claude/projects/-home-alice-coding-foo/memory/``. Claude Code creates
+# the slug itself per active CWD; if not yet present we fall back to a
+# generic ``$AGAM_HOME/memory`` so apply-proposals never tries to write into
+# a path that hard-codes the username.
 AGAM_MEMORY_DIR = pathlib.Path(
     os.environ.get(
         "AGAM_MEMORY_DIR",
-        os.path.expanduser("~/.claude/projects/-Users-km/memory"),
+        str(AGAM_HOME / "memory"),
     )
 )
 
@@ -132,11 +137,20 @@ def _apply_obsolete(kg_path: pathlib.Path, name: str, reason: str = "") -> bool:
     import sqlite3
     from datetime import datetime, timezone
 
+    # Entities are written through normalize_name (PascalCase -> kebab-case),
+    # so any input form (Camel, snake, kebab) must be normalized before lookup.
+    # We re-implement the normalization inline to avoid a hard dep from this
+    # PEP 723 script on the agam.tools.knowledge_graph module.
+    s = re.sub(r"([a-z])([A-Z])", r"\1-\2", name)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1-\2", s)
+    s = s.replace("_", "-").lower()
+    normalized = re.sub(r"-+", "-", s).strip("-")
+
     conn = sqlite3.connect(str(kg_path), timeout=5)
     try:
         row = conn.execute(
-            "SELECT id FROM entities WHERE LOWER(name) = LOWER(?) LIMIT 1",
-            (name,),
+            "SELECT id FROM entities WHERE name = ? LIMIT 1",
+            (normalized,),
         ).fetchone()
         if not row:
             return False

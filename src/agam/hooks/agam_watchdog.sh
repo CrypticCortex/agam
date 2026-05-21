@@ -171,10 +171,31 @@ run_entry() {
     local entry_file="$1"
     case "$INVOKER_KIND" in
         host)
-            env AGAM_HOME="$AGAM_HOME" "$HOME/.claude/hooks/agam_watchdog_inner.py" < "$entry_file"
+            # Inner script needs AGAM_TOOLS_DIR + AGAM_HOOKS_DIR or it falls
+            # back to defaults that don't match where the installer actually
+            # writes them (installer puts tools at ~/.claude/tools/agam/,
+            # NOT ~/.claude/tools/). Without these the inner script raises
+            # FileNotFoundError calling apply_proposals.py and every queued
+            # session ends up in queue-errors/.
+            env AGAM_HOME="$AGAM_HOME" \
+                AGAM_TOOLS_DIR="${AGAM_TOOLS_DIR:-$HOME/.claude/tools/agam}" \
+                AGAM_HOOKS_DIR="${AGAM_HOOKS_DIR:-$HOME/.claude/hooks}" \
+                AGAM_PROMPTS_DIR="${AGAM_PROMPTS_DIR:-$AGAM_HOME/prompts}" \
+                AGAM_KG_PATH="${AGAM_KG_PATH:-$HOME/.claude/knowledge/graph.db}" \
+                AGAM_USER_ENTITY="${AGAM_USER_ENTITY:-User}" \
+                "$HOME/.claude/hooks/agam_watchdog_inner.py" < "$entry_file"
             ;;
         container|named-container)
-            docker exec -i "$INVOKER_DETAIL" env AGAM_HOME=/home/node/.claude/agam \
+            # Inside the container, ~/.claude is bind-mounted at
+            # /home/node/.claude/. Inner-script-side env vars must use the
+            # container-internal paths.
+            docker exec -i "$INVOKER_DETAIL" env \
+                AGAM_HOME=/home/node/.claude/agam \
+                AGAM_TOOLS_DIR=/home/node/.claude/tools/agam \
+                AGAM_HOOKS_DIR=/home/node/.claude/hooks \
+                AGAM_PROMPTS_DIR=/home/node/.claude/agam/prompts \
+                AGAM_KG_PATH=/home/node/.claude/knowledge/graph.db \
+                AGAM_USER_ENTITY="${AGAM_USER_ENTITY:-User}" \
                 /home/node/.claude/hooks/agam_watchdog_inner.py < "$entry_file"
             ;;
     esac

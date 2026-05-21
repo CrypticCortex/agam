@@ -415,6 +415,8 @@ def _write_launchd_plist(
         text.replace("{{HOME}}", str(paths.home))
         .replace("{{AGAM_HOME}}", str(paths.agam))
         .replace("{{AGAM_HOOKS_DIR}}", str(paths.hooks))
+        .replace("{{AGAM_TOOLS_DIR}}", str(paths.tools))
+        .replace("{{AGAM_KG_PATH}}", str(paths.knowledge / "graph.db"))
     )
     (staging_launch_agents / "com.agam.watchdog.plist").write_text(
         text, encoding="utf-8"

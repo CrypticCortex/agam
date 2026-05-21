@@ -657,3 +657,147 @@ def test_cli_no_args_exits():
     # No subcommand at all -- argparse should exit nonzero.
     with pytest.raises(SystemExit):
         cli.main([])
+
+
+# ---------------------------------------------------------------------------
+# Round-trip + recovery tests covering bugs the original suite missed
+# ---------------------------------------------------------------------------
+
+
+def test_cli_obsolete_matches_camelcase_input(monkeypatch, tmp_path):
+    """`agam obsolete VoiceFNOL` must match the kebab-case `voice-fnol`
+    entity that the normal write path stores. Without input normalization
+    the old `LOWER(name) = LOWER(?)` SQL turned "VoiceFNOL" into "voicefnol"
+    and missed the actual row -- silent failure for every camelCase input."""
+    import sqlite3
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice",
+            "primary_goal": "test",
+            "projects_dir": str(tmp_path),
+            "platform": "linux",
+            "container_mode": "auto",
+            "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    kg = tmp_path / ".claude" / "knowledge" / "graph.db"
+    # Mimic the write path: store as kebab-case.
+    conn = sqlite3.connect(str(kg))
+    conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES ('voice-fnol', 'project', 'Voice FNOL.', datetime('now'), datetime('now'))"
+    )
+    conn.commit()
+    conn.close()
+
+    rc = cli.main(["obsolete", "VoiceFNOL", "--reason", "merged"])
+    assert rc == 0, "camelCase input must resolve to the kebab-case entity"
+
+    conn = sqlite3.connect(str(kg))
+    rows = dict(conn.execute(
+        "SELECT p.key, p.value FROM properties p "
+        "JOIN entities e ON p.entity_id = e.id WHERE e.name = 'voice-fnol'"
+    ).fetchall())
+    conn.close()
+    assert rows.get("status") == "obsolete"
+
+
+def test_cli_obsolete_matches_snake_case_input(monkeypatch, tmp_path):
+    """snake_case input must also normalize to kebab-case before lookup."""
+    import sqlite3
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice", "primary_goal": "test",
+            "projects_dir": str(tmp_path), "platform": "linux",
+            "container_mode": "auto", "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+    kg = tmp_path / ".claude" / "knowledge" / "graph.db"
+    conn = sqlite3.connect(str(kg))
+    conn.execute(
+        "INSERT INTO entities (name, type, description, created, updated) "
+        "VALUES ('my-feature', 'feature', '', datetime('now'), datetime('now'))"
+    )
+    conn.commit()
+    conn.close()
+    rc = cli.main(["obsolete", "my_feature"])
+    assert rc == 0
+
+
+def test_cli_upgrade_keeps_snapshot_on_failure(monkeypatch, tmp_path, capsys):
+    """If upgrade raises mid-way, the snapshot directory MUST survive so the
+    user can recover. The original finally-block deleted it unconditionally,
+    so users following the printed recovery instructions found nothing."""
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice", "primary_goal": "test",
+            "projects_dir": str(tmp_path), "platform": "linux",
+            "container_mode": "auto", "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated upgrade failure mid-install")
+
+    monkeypatch.setattr("agam.installer.run_wizard", boom)
+
+    rc = cli.main(["upgrade"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    # The error message points the user at the snapshot path. Parse it.
+    import re
+    m = re.search(r"snapshot of your data is at (\S+?)\.\s", err)
+    assert m, f"expected snapshot path in stderr, got: {err}"
+    snapshot_dir = Path(m.group(1))
+    assert snapshot_dir.exists(), (
+        f"snapshot was deleted by the finally block: {snapshot_dir}"
+    )
+    # And it should contain the user's preserved files.
+    assert (snapshot_dir / "AGAM.md").exists()
+
+
+def test_cli_upgrade_cleans_snapshot_on_success(monkeypatch, tmp_path):
+    """Happy-path upgrade: snapshot is cleaned up so we don't leak tmp dirs."""
+    import re
+    import sys as _sys
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    installer.run_wizard(
+        answers={
+            "name": "Alice", "primary_goal": "test",
+            "projects_dir": str(tmp_path), "platform": "linux",
+            "container_mode": "auto", "bootstrap_now": False,
+        },
+        home=tmp_path,
+    )
+
+    snapshot_seen: list[Path] = []
+    orig_mkdtemp = __import__("tempfile").mkdtemp
+
+    def tracked_mkdtemp(*args, **kwargs):
+        d = orig_mkdtemp(*args, **kwargs)
+        snapshot_seen.append(Path(d))
+        return d
+
+    monkeypatch.setattr("tempfile.mkdtemp", tracked_mkdtemp)
+
+    rc = cli.main(["upgrade"])
+    assert rc == 0
+    assert snapshot_seen, "tempfile.mkdtemp was never called"
+    # On success the snapshot MUST be cleaned up.
+    for s in snapshot_seen:
+        if s.name.startswith(".agam-upgrade-snap-"):
+            assert not s.exists(), f"snapshot survived a successful upgrade: {s}"

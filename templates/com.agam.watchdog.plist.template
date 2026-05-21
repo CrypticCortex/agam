@@ -21,5 +21,22 @@
   <string>{{AGAM_HOME}}/logs/watchdog.stderr.log</string>
   <key>WorkingDirectory</key>
   <string>{{HOME}}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>{{HOME}}</string>
+    <key>AGAM_HOME</key>
+    <string>{{AGAM_HOME}}</string>
+    <key>AGAM_TOOLS_DIR</key>
+    <string>{{AGAM_TOOLS_DIR}}</string>
+    <key>AGAM_HOOKS_DIR</key>
+    <string>{{AGAM_HOOKS_DIR}}</string>
+    <key>AGAM_PROMPTS_DIR</key>
+    <string>{{AGAM_HOME}}/prompts</string>
+    <key>AGAM_KG_PATH</key>
+    <string>{{AGAM_KG_PATH}}</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+  </dict>
 </dict>
 </plist>
