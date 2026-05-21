@@ -7,3 +7,7 @@ build/
 *.egg-info/
 .agam-bootstrap-state.json
 /tmp/
+
+# Local development artifacts (plans, scratch notes). Not shipped.
+docs/plans/
+docs/scratch/
