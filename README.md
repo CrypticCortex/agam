@@ -119,43 +119,44 @@ Edit this file directly and the next session picks up the changes. Re-run `agam 
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `AGAM_INVOKER` | unset | Pin the cascade to a single invoker: `host` or `container`. Skip if you want auto-detect. |
 | `AGAM_CONTAINER_PATTERN` | `claude-code` | Regex matched against `docker ps` rows to discover your claude-code container. |
-| `AGAM_CONTAINER_NAME` | unset | Exact container name. Overrides the regex above. |
-| `AGAM_WATCHDOG_MODE` | `container` | `container` runs LLM calls via `docker exec`. `host` runs them directly on macOS. See below. |
+| `AGAM_CONTAINER_NAME` | unset | Exact container name. Beats the regex above. |
+| `AGAM_WATCHDOG_MODE` | unset | Legacy alias for `AGAM_INVOKER`. Honored for back-compat. |
 | `AGAM_HOME` | `~/.claude/agam` | Root of identity + log directories. |
 | `AGAM_KG_PATH` | `~/.claude/knowledge/graph.db` | Path to the SQLite graph. |
 | `AGAM_PROMPTS_DIR` | bundled | Directory holding bootstrap prompt templates. |
 
 You will rarely need the last three. They exist for tests and for contributors running Agam out of a non-default layout.
 
-## Runtime model
+## How Agam talks to Claude
 
-Agam assumes you already run Claude Code inside a devcontainer that bind-mounts your host `~/.claude/` directory. That is how OAuth credentials reach the container, and how Agam's `docker exec claude -p` calls pick them up for free.
+Agam needs to call `claude -p` somewhere when it bootstraps the graph or processes a finished session. That `somewhere` is auto-detected at run time -- you do not pick a "mode" at install time.
 
-Concretely:
+The detection is a cascade. Agam walks the list in order and uses the first one that probes healthy:
 
-- The watchdog launchd agent runs on the macOS host.
-- When a session closes, the Stop hook writes an entry into `~/.claude/.agam-queue/`.
-- The watchdog picks up queued entries, launches `docker exec <container> claude -p ...` against the running claude-code container, and processes the session (work-log entry, Agam sync, graph update).
-- If no container is running, the job stays queued. `agam status` reports the situation and `~/.claude/agam/logs/watchdog.log` gets a `no-container` line.
-- When you start the container again, the next watchdog tick drains the queue.
+1. **Pinned via `AGAM_INVOKER`** (or the legacy `AGAM_WATCHDOG_MODE`) -- if set, that invoker is the only candidate.
+2. **Named container** -- if `AGAM_CONTAINER_NAME` points to a running container.
+3. **Discovered container** -- the first `docker ps` row whose image name matches `AGAM_CONTAINER_PATTERN` (default `claude-code`).
+4. **Host claude** -- `claude` on your `PATH` plus `~/.claude/.credentials.json` present.
 
-Agam never takes an Anthropic API key. If you need one, you are using the wrong tool; use the SDK directly.
+Both "container" and "host" are first-class. Container is preferred when both are available because Agam's background calls then run isolated from your interactive Claude Code session. If only one is available, the cascade picks it without asking.
 
-## Host-mode fallback
+Concretely, when a session closes:
 
-If you do not run Claude Code in a devcontainer, you can switch the watchdog to host mode:
+- The Stop hook writes a queue entry into `~/.claude/agam/queue/`.
+- The watchdog launchd agent ticks every few minutes, resolves the invoker, and drains the queue. Container: `docker exec <discovered-name> claude -p ...`. Host: `claude -p ...` directly.
+- No healthy invoker: the queue stays untouched and `~/.claude/agam/logs/watchdog.log` records a `no-invoker` line listing every probe failure. The next tick tries again.
+
+To see what Agam thinks is available right now:
 
 ```bash
-export AGAM_WATCHDOG_MODE=host
+agam doctor
 ```
 
-This runs `claude -p` directly on the macOS host instead of going through `docker exec`. It requires:
+That prints one line per candidate invoker with PASS/WARN/FAIL and the reason. Use it as the first stop when "auto-learning stopped happening" -- usually it tells you the answer (container stopped, OAuth token expired, claude not on PATH).
 
-- `claude` on your `PATH` at the user level (not just inside the container).
-- `~/.claude/.credentials.json` already set up on the host.
-
-Host mode is documented for debugging and for contributors who cannot run a devcontainer. The supported path is container mode. Expect host mode to move slower as Agam evolves.
+Agam never takes an Anthropic API key. Every `claude -p` invocation goes through your existing Claude Code OAuth (`~/.claude/.credentials.json`). If you need an API key, you are using the wrong tool.
 
 ## Troubleshooting
 

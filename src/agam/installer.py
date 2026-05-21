@@ -92,10 +92,19 @@ class Answers:
             raise ValueError(
                 f"platform must be one of {PLATFORMS}, got {platform!r}"
             )
-        container_mode = pick("container_mode", "container-mode")
-        if container_mode not in CONTAINER_MODES:
+        # container_mode is kept on the Answers dataclass for back-compat
+        # with existing config.yaml files but is no longer actuated -- the
+        # Invoker cascade in agam.invoker auto-detects host vs container
+        # at watchdog tick time. We still parse + validate the field so old
+        # config.yaml files don't break, but the wizard no longer prompts for
+        # it, and "auto" (the new default) means "let the cascade decide".
+        try:
+            container_mode = pick("container_mode", "container-mode")
+        except KeyError:
+            container_mode = "auto"
+        if container_mode not in CONTAINER_MODES and container_mode != "auto":
             raise ValueError(
-                f"container_mode must be one of {CONTAINER_MODES}, "
+                f"container_mode must be one of {CONTAINER_MODES} or 'auto', "
                 f"got {container_mode!r}"
             )
 
@@ -204,24 +213,40 @@ def _prompt_answers(home: Path) -> Answers:  # pragma: no cover - interactive
     platform = questionary.select(
         "Platform?", choices=list(PLATFORMS), default="mac"
     ).ask()
-    container_mode = questionary.select(
-        "Container mode?", choices=list(CONTAINER_MODES), default="none"
-    ).ask()
     bootstrap_now = questionary.confirm(
         "Bootstrap knowledge graph with starter entities now?",
         default=False,
     ).ask()
 
     if any(v is None for v in (name, primary_goal, projects_dir, platform,
-                                container_mode, bootstrap_now)):
+                                bootstrap_now)):
         raise SystemExit("installer cancelled")
+
+    # Container vs host is auto-detected by the Invoker cascade at run time.
+    # We probe here just to surface what was found so the user knows what to
+    # expect; the result is informational, not stored as a hard choice.
+    try:
+        from agam.invoker import probe_all
+        results = probe_all()
+        print("\n[installer] Detected claude invokers:")
+        for inv, res in results:
+            mark = "ok" if res.ok else "no"
+            print(f"  {mark:3} {inv.name:18} {res.detail}")
+        if not any(r.ok for _, r in results):
+            print(
+                "\n[installer] WARNING: no claude invoker is healthy. "
+                "Install Claude Code on host or start a claude-code container, "
+                "then run `agam doctor` to verify.\n"
+            )
+    except Exception:  # noqa: BLE001 -- probe is best-effort, not blocking
+        pass
 
     return Answers(
         name=name.strip(),
         primary_goal=primary_goal.strip(),
         projects_dir=projects_dir.strip(),
         platform=platform,
-        container_mode=container_mode,
+        container_mode="auto",
         bootstrap_now=bool(bootstrap_now),
     )
 

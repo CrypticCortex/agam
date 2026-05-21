@@ -245,24 +245,39 @@ def apply_proposals(proposals: dict, *, agam_md: pathlib.Path, thisai_md: pathli
         # Obsoletion proposals operate on the KG, not on markdown files. The
         # ``obsolete`` proposal list is a flat list of ``{"name": ..., "reason": ...}``
         # dicts. Each entry that matches an existing entity gets ``status=obsolete``
-        # written as a property. Missing entities are silently skipped (the
-        # transcript may have referenced a name we never stored).
-        for ob in proposals.get("obsolete", []):
-            if not isinstance(ob, dict):
-                continue
-            name = ob.get("name")
-            if not name:
-                continue
-            reason = ob.get("reason", "")
-            target_kg = kg_path or (agam_md.parent.parent / "knowledge" / "graph.db")
-            try:
-                if _apply_obsolete(target_kg, name, reason):
-                    applied["obsoleted"] += 1
-                    suvadu_lines.append(
-                        f"{today} | KG | Obsoleted entity: {name}" + (f" -- {reason}" if reason else "")
+        # written as a property. Missing entities are silently skipped.
+        #
+        # Resolving the KG path: caller can pass it explicitly. Otherwise we use
+        # AGAM_KG_PATH env (the canonical override) or the default $HOME location.
+        # No filesystem-relative derivation (e.g. agam_md.parent.parent) because
+        # that can accidentally land on a test fixture's parent dir and corrupt
+        # unrelated tempdirs.
+        obsoletes = proposals.get("obsolete", []) if isinstance(proposals.get("obsolete", []), list) else []
+        if obsoletes:
+            target_kg = kg_path
+            if target_kg is None:
+                target_kg = pathlib.Path(
+                    os.environ.get(
+                        "AGAM_KG_PATH",
+                        os.path.expanduser("~/.claude/knowledge/graph.db"),
                     )
-            except Exception as e:  # noqa: BLE001 -- KG ops are best-effort here
-                errors.append(f"obsolete '{name}': {e}")
+                )
+            for ob in obsoletes:
+                if not isinstance(ob, dict):
+                    continue
+                name = ob.get("name")
+                if not name:
+                    continue
+                reason = ob.get("reason", "")
+                try:
+                    if _apply_obsolete(target_kg, name, reason):
+                        applied["obsoleted"] += 1
+                        suvadu_lines.append(
+                            f"{today} | KG | Obsoleted entity: {name}"
+                            + (f" -- {reason}" if reason else "")
+                        )
+                except Exception as e:  # noqa: BLE001 -- KG ops are best-effort
+                    errors.append(f"obsolete '{name}': {e}")
 
         _append_suvadu(suvadu_md, suvadu_lines)
     except Exception:

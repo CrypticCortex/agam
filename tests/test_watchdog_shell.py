@@ -69,6 +69,24 @@ def _write_fake_docker(
     else:
         rc_script = f'{log_line}cat > /dev/null\nexit {exec_rc}\n'
 
+    # `docker inspect -f '{{.State.Running}}' <name>` returns "true" if the
+    # name appears as a token in ps_stdout (covers AGAM_CONTAINER_NAME probe).
+    inspect_script = (
+        '# parse name (last arg after -f format)\n'
+        'shift  # drop "inspect"\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        '    -f|--format) shift; shift ;;\n'
+        '    *) target="$1"; shift ;;\n'
+        '  esac\n'
+        'done\n'
+        'if echo "' + ps_stdout + '" | grep -qw "$target"; then\n'
+        '  echo true\n'
+        '  exit 0\n'
+        'fi\n'
+        'echo false\n'
+        'exit 1\n'
+    )
     fake.write_text(
         "#!/usr/bin/env bash\n"
         'if [ "$1" = "ps" ]; then\n'
@@ -76,6 +94,9 @@ def _write_fake_docker(
         f"{ps_stdout}\n"
         "DOCKEREOF\n"
         "exit 0\n"
+        "fi\n"
+        'if [ "$1" = "inspect" ]; then\n'
+        f"{inspect_script}"
         "fi\n"
         'if [ "$1" = "exec" ]; then\n'
         f"{rc_script}"
@@ -157,7 +178,7 @@ def test_container_mode_invokes_docker_exec(tmp_path):
     assert (home / "processed" / "abc.json").exists()
     # Log records ok
     tail = (home / "logs" / "watchdog.log").read_text()
-    assert "drain-start container=my-claude-abc" in tail
+    assert "drain-start invoker=container container=my-claude-abc" in tail
     assert "ok abc.json" in tail
     assert "drain-done" in tail
 
@@ -183,8 +204,18 @@ def test_host_mode_skips_docker_and_invokes_host_inner(tmp_path):
     )
     inner.chmod(inner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-    docker_log = tmp_path / "docker-exec.log"
+    # Host invoker probe requires ~/.claude/.credentials.json. Plant it.
+    creds = tmp_path / "home" / ".claude" / ".credentials.json"
+    creds.write_text("{}")
+
+    # Plant a fake `claude` binary on PATH so the host probe sees it.
     bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake_claude = bin_dir / "claude"
+    fake_claude.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    docker_log = tmp_path / "docker-exec.log"
     _write_fake_docker(bin_dir, ps_stdout="", exec_rc=0, log_path=docker_log)
 
     env = _env(
@@ -207,7 +238,7 @@ def test_host_mode_skips_docker_and_invokes_host_inner(tmp_path):
     assert '"sid":"host"' in body
     assert (home / "processed" / "h.json").exists()
     tail = (home / "logs" / "watchdog.log").read_text()
-    assert "drain-start mode=host" in tail
+    assert "drain-start invoker=host" in tail
     assert "ok h.json" in tail
 
 
@@ -240,7 +271,10 @@ def test_no_container_preserves_queue(tmp_path):
     assert not (home / "processed" / "keep.json").exists()
     assert not (home / "queue-errors" / "keep.json").exists()
     tail = (home / "logs" / "watchdog.log").read_text()
-    assert "no-container" in tail
+    # New shell cascade logs "no-invoker" when neither container nor host probe
+    # is healthy (host probe fails because the sandboxed $HOME has no
+    # ~/.claude/.credentials.json).
+    assert "no-invoker" in tail
     assert "queue-depth=1" in tail
 
 

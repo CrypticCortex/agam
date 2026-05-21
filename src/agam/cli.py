@@ -603,22 +603,32 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             fix="run `claude` interactively once to authenticate",
         )
 
-    # 5. Container discovery (informational -- container is needed only for
-    # bootstrap + watchdog, not for graph_recall / graph_update).
+    # 5. Invoker cascade -- which paths Agam can use to call claude -p.
+    # At least one must be ok for bootstrap + watchdog auto-learning.
+    # graph_recall / graph_update / lesson hooks work without any invoker.
     try:
-        from agam import bootstrap as _bs
-        container = _bs._discover_container()
-    except Exception:  # noqa: BLE001
-        container = None
-    if container:
-        _check("Claude Code container running", True, detail=container)
-    else:
+        from agam.invoker import probe_all
+        invoker_results = probe_all()
+    except Exception as exc:  # noqa: BLE001
+        invoker_results = []
+        _check("Invoker cascade", False, str(exc), "report this as a bug")
+        fails += 1
+    any_ok = any(r.ok for _, r in invoker_results)
+    for inv, r in invoker_results:
+        if r.ok:
+            _check(f"invoker: {inv.name}", True, detail=r.detail)
+        else:
+            # WARN per invoker -- only the absence of EVERY invoker is a FAIL.
+            _check(f"invoker: {inv.name}", None, detail=r.detail)
+    if invoker_results and not any_ok:
         _check(
-            "Claude Code container running",
-            None,
-            "bootstrap + watchdog require it; recall hook does not",
-            fix="start your devcontainer (or set AGAM_BOOTSTRAP_MODE=host)",
+            "at least one invoker healthy",
+            False,
+            detail="bootstrap + watchdog auto-learning will not work",
+            fix="install Claude Code on host (`claude` on PATH) or start a "
+                "claude-code container",
         )
+        fails += 1
 
     # 6. macOS launchd plist loaded
     if platform.system() == "Darwin":

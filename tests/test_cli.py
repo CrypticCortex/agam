@@ -568,6 +568,15 @@ def test_cli_doctor_passes_after_init(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
+    # Mock the invoker cascade so doctor sees at least one healthy invoker
+    # (otherwise it would correctly FAIL on the "no invokers" check; this
+    # test is about identity/KG/hooks scaffolding, not invoker health).
+    from agam.invoker import HostInvoker, ProbeResult
+    monkeypatch.setattr(
+        "agam.invoker.probe_all",
+        lambda: [(HostInvoker(), ProbeResult(True, "host claude ready", "fast"))],
+    )
+
     rc = cli.main(["doctor"])
     out = capsys.readouterr().out
     # Identity + KG + hooks must pass.

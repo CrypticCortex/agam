@@ -1,32 +1,37 @@
 #!/bin/bash
-# Host-side launchd-fired job. Discovers user's claude-code container,
-# docker-exec's the inner watchdog script inside it. Falls back to host-mode
-# only when AGAM_WATCHDOG_MODE=host is set.
+# Host-side launchd-fired job. Drains the watchdog queue using a cascade
+# that mirrors `agam.invoker.resolve_invoker()`:
 #
-# Queue preservation contract: if we're in container mode and no matching
-# container is running, the queue is LEFT INTACT for the next tick. There is
-# no backoff, no retry, and no failure state -- just "not now, try again in
-# a minute."
+#   1. AGAM_INVOKER=host or AGAM_WATCHDOG_MODE=host  -> force host invoker.
+#   2. AGAM_INVOKER=container or AGAM_WATCHDOG_MODE=container -> force container.
+#   3. AGAM_CONTAINER_NAME exact name running -> named container.
+#   4. Image matching AGAM_CONTAINER_PATTERN running -> discovered container.
+#   5. `claude` on PATH and ~/.claude/.credentials.json present -> host.
+#   6. None of the above -> log no-invoker and exit (queue preserved).
+#
+# The Python module ``agam.invoker`` is the source of truth for this cascade
+# (tested in tests/test_invoker.py). This script reimplements the same
+# decision logic in shell because launchd runs the watchdog without
+# guaranteed access to the agam Python environment. Keep the two in sync.
 #
 # Env:
-#   AGAM_HOME                  default $HOME/.claude/agam
-#   AGAM_WATCHDOG_MODE         container (default) | host
-#   AGAM_CONTAINER_PATTERN     default claude-code
-#   AGAM_CONTAINER_NAME        optional exact-name override
+#   AGAM_HOME              default $HOME/.claude/agam
+#   AGAM_INVOKER           host | container (overrides cascade)
+#   AGAM_WATCHDOG_MODE     host | container (legacy alias)
+#   AGAM_CONTAINER_PATTERN regex (default claude-code)
+#   AGAM_CONTAINER_NAME    exact name override
 set -u
 
 AGAM_HOME="${AGAM_HOME:-$HOME/.claude/agam}"
-MODE="${AGAM_WATCHDOG_MODE:-container}"
-CONTAINER_PATTERN="${AGAM_CONTAINER_PATTERN:-claude-code}"
-CONTAINER_NAME_OVERRIDE="${AGAM_CONTAINER_NAME:-}"
 LOG="$AGAM_HOME/logs/watchdog.log"
 LOCK="$AGAM_HOME/.watchdog.lock"
+CREDS="$HOME/.claude/.credentials.json"
 
 mkdir -p "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" "$AGAM_HOME/queue-errors"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
 
-# Single-flight: refuse if a prior tick is still draining.
+# Single-flight lock.
 if [[ -f "$LOCK" ]] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
     log "already-running pid=$(cat "$LOCK" 2>/dev/null)"
     exit 0
@@ -34,58 +39,151 @@ fi
 echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
-discover_container() {
-    if [[ -n "$CONTAINER_NAME_OVERRIDE" ]]; then
-        docker ps --format '{{.Names}}' | grep -x "$CONTAINER_NAME_OVERRIDE" | head -1
-    else
-        docker ps --format '{{.Names}} {{.Image}}' | grep -iE "$CONTAINER_PATTERN" | head -1 | awk '{print $1}'
+# --- Resolve invoker (shell cascade mirror of agam.invoker.resolve_invoker)
+PINNED=""
+EXPLICIT="${AGAM_INVOKER:-}"
+LEGACY="${AGAM_WATCHDOG_MODE:-}"
+if [[ -n "$EXPLICIT" ]]; then PINNED="$EXPLICIT"; elif [[ -n "$LEGACY" ]]; then PINNED="$LEGACY"; fi
+
+CONTAINER_PATTERN="${AGAM_CONTAINER_PATTERN:-claude-code}"
+CONTAINER_NAME_OVERRIDE="${AGAM_CONTAINER_NAME:-}"
+
+probe_host() {
+    # 0 = healthy, 1 = unhealthy. Writes detail to global PROBE_DETAIL.
+    if ! command -v claude >/dev/null 2>&1; then
+        PROBE_DETAIL="claude CLI not on PATH"
+        return 1
     fi
+    if [[ ! -f "$CREDS" ]]; then
+        PROBE_DETAIL="no ~/.claude/.credentials.json (run \`claude\` once to authenticate)"
+        return 1
+    fi
+    PROBE_DETAIL="host claude ready"
+    return 0
 }
 
-run_inner_container() {
-    local entry_file="$1"
-    local container="$2"
-    # Inner script path is stable inside the container because ~/.claude is
-    # bind-mounted to /home/node/.claude.
-    docker exec -i "$container" env AGAM_HOME=/home/node/.claude/agam \
-        /home/node/.claude/hooks/agam_watchdog_inner.py < "$entry_file"
+probe_named_container() {
+    local name="$1"
+    if ! command -v docker >/dev/null 2>&1; then
+        PROBE_DETAIL="docker not on PATH"
+        return 1
+    fi
+    local state
+    state=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)
+    if [[ "$state" != "true" ]]; then
+        PROBE_DETAIL="container '$name' not running"
+        return 1
+    fi
+    PROBE_DETAIL="named container '$name' running"
+    DISCOVERED="$name"
+    return 0
 }
 
-run_inner_host() {
-    local entry_file="$1"
-    env AGAM_HOME="$AGAM_HOME" "$HOME/.claude/hooks/agam_watchdog_inner.py" < "$entry_file"
+probe_pattern_container() {
+    local pattern="$1"
+    if ! command -v docker >/dev/null 2>&1; then
+        PROBE_DETAIL="docker not on PATH"
+        return 1
+    fi
+    local match
+    match=$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -iE "$pattern" | head -1 | awk '{print $1}')
+    if [[ -z "$match" ]]; then
+        PROBE_DETAIL="no running container matches /$pattern/"
+        return 1
+    fi
+    PROBE_DETAIL="container '$match' matches /$pattern/"
+    DISCOVERED="$match"
+    return 0
 }
 
-# Main drain loop.
+INVOKER_KIND=""
+INVOKER_DETAIL=""
+DISCOVERED=""
+declare -a FAILURES=()
+
+try_container_pin() {
+    if [[ -n "$CONTAINER_NAME_OVERRIDE" ]] && probe_named_container "$CONTAINER_NAME_OVERRIDE"; then
+        INVOKER_KIND="named-container"; INVOKER_DETAIL="$DISCOVERED"; return 0
+    fi
+    if probe_pattern_container "$CONTAINER_PATTERN"; then
+        INVOKER_KIND="container"; INVOKER_DETAIL="$DISCOVERED"; return 0
+    fi
+    return 1
+}
+
+try_host_pin() {
+    if probe_host; then
+        INVOKER_KIND="host"; INVOKER_DETAIL="$PROBE_DETAIL"; return 0
+    fi
+    return 1
+}
+
+if [[ "$PINNED" == "host" ]]; then
+    if ! try_host_pin; then FAILURES+=("host: $PROBE_DETAIL"); fi
+elif [[ "$PINNED" == "container" ]]; then
+    if ! try_container_pin; then FAILURES+=("container: $PROBE_DETAIL"); fi
+else
+    # Default cascade: named container -> discovered container -> host.
+    if [[ -n "$CONTAINER_NAME_OVERRIDE" ]]; then
+        if probe_named_container "$CONTAINER_NAME_OVERRIDE"; then
+            INVOKER_KIND="named-container"; INVOKER_DETAIL="$DISCOVERED"
+        else
+            FAILURES+=("named-container: $PROBE_DETAIL")
+        fi
+    fi
+    if [[ -z "$INVOKER_KIND" ]] && probe_pattern_container "$CONTAINER_PATTERN"; then
+        INVOKER_KIND="container"; INVOKER_DETAIL="$DISCOVERED"
+    elif [[ -z "$INVOKER_KIND" ]]; then
+        FAILURES+=("container: $PROBE_DETAIL")
+    fi
+    if [[ -z "$INVOKER_KIND" ]] && probe_host; then
+        INVOKER_KIND="host"; INVOKER_DETAIL="$PROBE_DETAIL"
+    elif [[ -z "$INVOKER_KIND" ]]; then
+        FAILURES+=("host: $PROBE_DETAIL")
+    fi
+fi
+
 shopt -s nullglob
 entries=("$AGAM_HOME"/queue/*.json)
-if [[ ${#entries[@]} -eq 0 ]]; then
-    log "queue-empty"
+
+if [[ -z "$INVOKER_KIND" ]]; then
+    if [[ ${#entries[@]} -gt 0 ]]; then
+        log "no-invoker queue-depth=${#entries[@]} failures=$(IFS='|'; echo "${FAILURES[*]}")"
+    fi
     exit 0
 fi
 
-container=""
-if [[ "$MODE" == "container" ]]; then
-    container=$(discover_container)
-    if [[ -z "$container" ]]; then
-        log "no-container pattern=$CONTAINER_PATTERN queue-depth=${#entries[@]}"
-        exit 0
-    fi
-    log "drain-start container=$container queue-depth=${#entries[@]}"
-else
-    log "drain-start mode=host queue-depth=${#entries[@]}"
+if [[ ${#entries[@]} -eq 0 ]]; then
+    log "queue-empty invoker=$INVOKER_KIND"
+    exit 0
 fi
+
+case "$INVOKER_KIND" in
+    host)
+        log "drain-start invoker=host queue-depth=${#entries[@]}"
+        ;;
+    container|named-container)
+        log "drain-start invoker=$INVOKER_KIND container=$INVOKER_DETAIL queue-depth=${#entries[@]}"
+        ;;
+esac
+
+run_entry() {
+    local entry_file="$1"
+    case "$INVOKER_KIND" in
+        host)
+            env AGAM_HOME="$AGAM_HOME" "$HOME/.claude/hooks/agam_watchdog_inner.py" < "$entry_file"
+            ;;
+        container|named-container)
+            docker exec -i "$INVOKER_DETAIL" env AGAM_HOME=/home/node/.claude/agam \
+                /home/node/.claude/hooks/agam_watchdog_inner.py < "$entry_file"
+            ;;
+    esac
+}
 
 for entry in "${entries[@]}"; do
     name=$(basename "$entry")
-    rc=0
-    if [[ "$MODE" == "container" ]]; then
-        run_inner_container "$entry" "$container"
-        rc=$?
-    else
-        run_inner_host "$entry"
-        rc=$?
-    fi
+    run_entry "$entry"
+    rc=$?
     if [[ $rc -eq 0 ]]; then
         mv "$entry" "$AGAM_HOME/processed/$name"
         log "ok $name"

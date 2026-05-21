@@ -143,106 +143,48 @@ _DEFAULT_CONTAINER_PATTERN = "claude-code"
 
 
 def _discover_container() -> str | None:
-    """Return the name of a running claude-code devcontainer, or ``None``.
+    """Legacy shim: return the discovered container name, or ``None``.
 
-    Two selection modes:
-
-    1. ``AGAM_CONTAINER_NAME`` -- explicit override. We only verify the
-       named container is actually running; no pattern matching.
-    2. Otherwise match ``docker ps`` rows against ``AGAM_CONTAINER_PATTERN``
-       (default: ``claude-code``) on ``"<name> <image>"``.
-
-    Any ``subprocess`` failure (``docker`` not installed, daemon down)
-    surfaces as ``None`` so callers can emit a single clean error.
+    Kept for back-compat with tests that monkeypatch this name. New code
+    should use ``agam.invoker.resolve_invoker()`` which handles host +
+    container + named-container in one cascade.
     """
+    from agam.invoker import ContainerInvoker, NamedContainerInvoker
+
+    override = os.environ.get("AGAM_CONTAINER_NAME", "").strip()
     pattern = os.environ.get("AGAM_CONTAINER_PATTERN", _DEFAULT_CONTAINER_PATTERN)
-    override = os.environ.get("AGAM_CONTAINER_NAME", "")
-
-    try:
-        if override:
-            r = subprocess.run(
-                ["docker", "ps", "--format", "{{.Names}}"],
-                capture_output=True,
-                text=True,
-            )
-            return override if override in r.stdout.split() else None
-
-        r = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}} {{.Image}}"],
-            capture_output=True,
-            text=True,
-        )
-        for line in r.stdout.splitlines():
-            if re.search(pattern, line, re.I):
-                return line.split()[0]
+    inv: ContainerInvoker
+    if override:
+        inv = NamedContainerInvoker(override)
+    else:
+        inv = ContainerInvoker(pattern=pattern)
+    res = inv.probe()
+    if not res.ok:
         return None
-    except (FileNotFoundError, OSError):
-        return None
+    return inv._discovered  # type: ignore[return-value]
 
 
 def _run_claude(prompt: str, model: str, *, timeout: int = 300) -> str:
-    """Run ``claude -p`` and return raw stdout.
+    """Run ``claude -p`` via the Invoker cascade.
 
-    This is the single choke point for every LLM call Agam makes. Task 21
-    reuses it for Sonnet reconciliation. Anthropic SDK is deliberately NOT
-    imported; the user's existing ``~/.claude/.credentials.json`` OAuth is
-    what authorizes the call.
-
-    Two execution modes, selected by ``AGAM_BOOTSTRAP_MODE``:
-      - ``container`` (default): ``docker exec`` into the user's running
-        claude-code devcontainer.
-      - ``host``: invoke ``claude`` directly on PATH. Used when bootstrap
-        itself already runs inside a container (E2E tests) or when the
-        user's host has the Claude Code CLI installed directly.
+    Delegates to ``agam.invoker.resolve_invoker()`` which probes the
+    cascade (host / container / named-container) and uses whichever path
+    is healthy. Replaces the older binary ``AGAM_BOOTSTRAP_MODE`` mode
+    switch -- the env var is still honored as a hard pin via
+    ``AGAM_WATCHDOG_MODE`` / ``AGAM_INVOKER`` (see invoker.py).
 
     Raises:
-        SystemExit: container mode and no claude-code container running,
-            or host mode and ``claude`` not on PATH.
-        RuntimeError: ``claude -p`` exited non-zero.
+        SystemExit: no invoker is healthy. Error message lists every
+            failed probe so the user knows exactly what to fix.
+        RuntimeError: claude -p exited non-zero.
     """
-    mode = os.environ.get("AGAM_BOOTSTRAP_MODE", "container")
-    if mode == "host":
-        argv = [
-            "claude",
-            "-p",
-            "--model",
-            model,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-        ]
-    else:
-        container = _discover_container()
-        if not container:
-            sys.exit(
-                "ERR: no claude-code container running. Start your devcontainer "
-                "and re-run `agam bootstrap`."
-            )
-        argv = [
-            "docker",
-            "exec",
-            "-i",
-            container,
-            "claude",
-            "-p",
-            "--model",
-            model,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-        ]
-    r = subprocess.run(
-        argv,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"claude -p failed (rc={r.returncode}): {r.stderr[:500]}"
-        )
-    return r.stdout
+    from agam.invoker import resolve_invoker, NoInvokerAvailable
+
+    try:
+        invoker = resolve_invoker()
+    except NoInvokerAvailable as exc:
+        sys.exit(f"ERR: {exc}")
+    return invoker.run(prompt, model, timeout=timeout)
 
 
 # ---- Extraction ----------------------------------------------------------

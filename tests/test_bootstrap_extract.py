@@ -22,130 +22,69 @@ from agam.bootstrap import (
 )
 
 
-# ---- _discover_container -------------------------------------------------
+# ---- bootstrap layer's invocation behavior ------------------------------
+# (Container discovery + raw subprocess.run shape are tested in
+#  tests/test_invoker.py against the Invoker cascade. Here we only assert
+#  the bootstrap-level contract: _run_claude delegates to the cascade and
+#  fails actionably when nothing's available.)
 
 
-def test_discover_container_matches_pattern(monkeypatch):
-    """A running container whose image matches the default pattern is found."""
-
-    def fake_run(cmd, capture_output, text):
-        assert cmd[0] == "docker"
-        return SimpleNamespace(
-            stdout="my-devbox claude-code:latest\nredis redis:7\n",
-            stderr="",
-            returncode=0,
-        )
-
+def test_run_claude_errors_when_no_invoker_available(monkeypatch):
+    """No host claude, no docker, no container -> SystemExit with detail."""
+    monkeypatch.delenv("AGAM_INVOKER", raising=False)
+    monkeypatch.delenv("AGAM_WATCHDOG_MODE", raising=False)
     monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
-    monkeypatch.delenv("AGAM_CONTAINER_PATTERN", raising=False)
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert bootstrap._discover_container() == "my-devbox"
-
-
-def test_discover_container_respects_name_override(monkeypatch):
-    """``AGAM_CONTAINER_NAME`` short-circuits pattern matching."""
-
-    def fake_run(cmd, capture_output, text):
-        # With override set, we should only be asked for names.
-        assert cmd == ["docker", "ps", "--format", "{{.Names}}"]
-        return SimpleNamespace(
-            stdout="explicit-box\nother-box\n",
-            stderr="",
-            returncode=0,
-        )
-
-    monkeypatch.setenv("AGAM_CONTAINER_NAME", "explicit-box")
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert bootstrap._discover_container() == "explicit-box"
-
-
-def test_discover_container_returns_none_when_no_match(monkeypatch):
-    """No matching image -> ``None``, so the caller can error out cleanly."""
-
-    def fake_run(cmd, capture_output, text):
-        return SimpleNamespace(
-            stdout="postgres postgres:16\nredis redis:7\n",
-            stderr="",
-            returncode=0,
-        )
-
-    monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
-    monkeypatch.delenv("AGAM_CONTAINER_PATTERN", raising=False)
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert bootstrap._discover_container() is None
-
-
-def test_discover_container_override_not_running(monkeypatch):
-    """Override set but not in ``docker ps`` output -> ``None``."""
-
-    def fake_run(cmd, capture_output, text):
-        return SimpleNamespace(stdout="other-box\n", stderr="", returncode=0)
-
-    monkeypatch.setenv("AGAM_CONTAINER_NAME", "explicit-box")
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    assert bootstrap._discover_container() is None
-
-
-# ---- _run_claude ---------------------------------------------------------
-
-
-def test_run_claude_errors_on_no_container(monkeypatch):
-    """Missing container -> ``SystemExit`` with an actionable message."""
-
-    monkeypatch.setattr(bootstrap, "_discover_container", lambda: None)
+    monkeypatch.setattr("shutil.which", lambda cmd: None)  # no claude, no docker
 
     with pytest.raises(SystemExit) as ei:
         _run_claude("hi", "haiku-4-5", timeout=30)
-
-    assert "no claude-code container" in str(ei.value).lower()
-
-
-def test_run_claude_invokes_docker_exec(monkeypatch):
-    """Happy path: shells out to ``docker exec <container> claude -p ...``."""
-
-    monkeypatch.setattr(bootstrap, "_discover_container", lambda: "devbox")
-
-    captured = {}
-
-    def fake_run(cmd, input, capture_output, text, timeout):
-        captured["cmd"] = cmd
-        captured["input"] = input
-        captured["timeout"] = timeout
-        return SimpleNamespace(stdout="OK-OUTPUT", stderr="", returncode=0)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    out = _run_claude("hello prompt", "haiku-4-5", timeout=42)
-
-    assert out == "OK-OUTPUT"
-    assert captured["cmd"][:5] == ["docker", "exec", "-i", "devbox", "claude"]
-    assert "--model" in captured["cmd"]
-    assert "haiku-4-5" in captured["cmd"]
-    assert "stream-json" in captured["cmd"]
-    assert captured["input"] == "hello prompt"
-    assert captured["timeout"] == 42
+    msg = str(ei.value).lower()
+    assert "no claude invoker" in msg
+    assert "host" in msg and "container" in msg
 
 
-def test_run_claude_raises_on_nonzero_exit(monkeypatch):
-    """Non-zero return code surfaces a ``RuntimeError`` with stderr context."""
+def test_run_claude_delegates_to_invoker_run(monkeypatch):
+    """When an invoker is healthy, _run_claude returns its stdout."""
 
-    monkeypatch.setattr(bootstrap, "_discover_container", lambda: "devbox")
+    class _StubInvoker:
+        name = "stub"
 
-    def fake_run(cmd, input, capture_output, text, timeout):
-        return SimpleNamespace(stdout="", stderr="boom", returncode=7)
+        def run(self, prompt, model, *, timeout):
+            assert prompt == "hello"
+            assert model == "haiku-4-5"
+            assert timeout == 42
+            return "STUB-OUTPUT"
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("agam.invoker.resolve_invoker", lambda: _StubInvoker())
+    out = _run_claude("hello", "haiku-4-5", timeout=42)
+    assert out == "STUB-OUTPUT"
 
-    with pytest.raises(RuntimeError) as ei:
-        _run_claude("p", "haiku-4-5", timeout=10)
 
-    msg = str(ei.value)
-    assert "rc=7" in msg
-    assert "boom" in msg
+def test_discover_container_shim_returns_name_via_cascade(monkeypatch):
+    """Legacy ``_discover_container`` shim still works for tests that
+    monkeypatch it, returning the container name picked by ContainerInvoker."""
+    monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
+    monkeypatch.setenv("AGAM_CONTAINER_PATTERN", "claude-code")
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/docker" if cmd == "docker" else None)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **kw: SimpleNamespace(
+            stdout="devbox claude-code:latest\n", stderr="", returncode=0
+        ),
+    )
+    assert bootstrap._discover_container() == "devbox"
+
+
+def test_discover_container_shim_returns_none_when_no_match(monkeypatch):
+    monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/docker" if cmd == "docker" else None)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **kw: SimpleNamespace(
+            stdout="nginx nginx:latest\n", stderr="", returncode=0
+        ),
+    )
+    assert bootstrap._discover_container() is None
 
 
 # ---- extract_from_transcript --------------------------------------------
