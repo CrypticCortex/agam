@@ -20,10 +20,23 @@ up() {
     # Refuse if name collision (not our container)
     EXISTING=$(docker ps -a --format '{{.Names}}' | grep -x "$CONTAINER" || true)
     [[ -n "$EXISTING" ]] && docker rm -f "$CONTAINER" >/dev/null
-    docker run -d --name "$CONTAINER" \
-        -v "$REPO_HOST:$REPO_CONTAINER" \
-        -v "$CREDS_HOST:$CREDS_CONTAINER:ro" \
-        "$IMAGE" sleep infinity
+
+    # Bind-mount credentials only if the host file actually exists. On macOS
+    # host installs, Claude Code stores OAuth in Keychain and the file may
+    # never be created -- mounting a non-existent path would have Docker
+    # silently auto-create a DIRECTORY at that location, corrupting the host
+    # path. Skip the mount when missing; the test container falls back to
+    # whatever auth its image ships with (which, for python:3.11-slim, is
+    # none -- LIVE bootstrap will fail loudly, non-LIVE tests pass).
+    MOUNTS=(-v "$REPO_HOST:$REPO_CONTAINER")
+    if [[ -f "$CREDS_HOST" ]]; then
+        MOUNTS+=(-v "$CREDS_HOST:$CREDS_CONTAINER:ro")
+    else
+        echo "[test-container] WARN: $CREDS_HOST not found; container starts without OAuth mount."
+        echo "[test-container]       LIVE bootstrap inside this container will fail; non-LIVE tests are unaffected."
+    fi
+
+    docker run -d --name "$CONTAINER" "${MOUNTS[@]}" "$IMAGE" sleep infinity
     # Sanity: confirm user's container still running
     docker ps --format '{{.Names}}' | grep -qv '^$' || { echo "FATAL: docker ps empty after up"; exit 1; }
 }

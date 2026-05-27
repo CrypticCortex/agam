@@ -16,7 +16,10 @@ Cascade ordering (default):
 2. Legacy ``AGAM_WATCHDOG_MODE=host|container`` (honored for back-compat).
 3. Named container (``AGAM_CONTAINER_NAME``).
 4. Discovered container (image pattern, default ``claude-code``).
-5. Host (``claude`` on PATH + ``~/.claude/.credentials.json`` present).
+5. Host (``claude`` on PATH). Auth lives wherever Claude Code put it
+   (Keychain on macOS host, file in a container, etc.) -- the probe
+   doesn't second-guess; a real auth failure surfaces at run() time
+   with claude's own error.
 
 Container is preferred over host when both are available so Agam's
 background claude calls don't lock-conflict with an interactive Claude
@@ -72,16 +75,14 @@ class HostInvoker(Invoker):
     name: str = "host"
 
     def probe(self) -> ProbeResult:
+        # Cheap probe: only require ``claude`` on PATH. Don't check for a
+        # credentials.json file -- on macOS host installs the OAuth lives
+        # in Keychain and the file may never exist even when auth works.
+        # The actual auth check happens at run() time when claude itself
+        # returns a meaningful error if it can't authenticate.
         if not shutil.which("claude"):
             return ProbeResult(False, "claude CLI not on PATH", "fast")
-        creds = Path(os.path.expanduser("~/.claude/.credentials.json"))
-        if not creds.exists():
-            return ProbeResult(
-                False,
-                "no ~/.claude/.credentials.json (run `claude` once to authenticate)",
-                "fast",
-            )
-        return ProbeResult(True, "host claude ready", "fast")
+        return ProbeResult(True, "host claude on PATH", "fast")
 
     def run(self, prompt: str, model: str, *, timeout: int = 300) -> str:
         r = subprocess.run(

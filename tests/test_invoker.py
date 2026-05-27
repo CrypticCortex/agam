@@ -38,13 +38,17 @@ def _patch_which(monkeypatch, available: dict[str, str | None]):
     )
 
 
-def _patch_creds(monkeypatch, tmp_path: Path, exists: bool = True):
+def _patch_home(monkeypatch, tmp_path: Path):
+    """Point ``$HOME`` at a tempdir so probes resolving ``~`` stay sandboxed.
+
+    The old helper also planted a placebo ``.credentials.json`` file because
+    HostInvoker.probe() used to check for it. That check is gone (macOS host
+    stores OAuth in Keychain so the file may never exist even with valid
+    auth); the helper now only handles HOME isolation. One regression test
+    below (``test_host_invoker_probe_ok_without_credentials_file``) asserts
+    the file-absence contract explicitly.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
-    creds = tmp_path / ".claude" / ".credentials.json"
-    if exists:
-        creds.parent.mkdir(parents=True, exist_ok=True)
-        creds.write_text("{}")
-    return creds
 
 
 def _patch_run(monkeypatch, responses: list[_Proc]):
@@ -87,7 +91,7 @@ def test_invoker_abc_cannot_instantiate():
 
 def test_host_invoker_probe_ok(monkeypatch, tmp_path):
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import HostInvoker
 
     r = HostInvoker().probe()
@@ -97,7 +101,7 @@ def test_host_invoker_probe_ok(monkeypatch, tmp_path):
 
 def test_host_invoker_probe_fails_when_claude_missing(monkeypatch, tmp_path):
     _patch_which(monkeypatch, {})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import HostInvoker
 
     r = HostInvoker().probe()
@@ -105,19 +109,22 @@ def test_host_invoker_probe_fails_when_claude_missing(monkeypatch, tmp_path):
     assert "claude" in r.detail.lower()
 
 
-def test_host_invoker_probe_fails_when_creds_missing(monkeypatch, tmp_path):
+def test_host_invoker_probe_ok_without_credentials_file(monkeypatch, tmp_path):
+    """Probe must NOT require ~/.claude/.credentials.json -- macOS host stores
+    OAuth in Keychain and that file may never exist even with valid auth.
+    Real auth failures surface at run() time with claude's own error.
+    """
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=False)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import HostInvoker
 
     r = HostInvoker().probe()
-    assert not r.ok
-    assert "credentials" in r.detail.lower()
+    assert r.ok, f"probe must pass when claude is on PATH, regardless of creds file: {r.detail}"
 
 
 def test_host_invoker_run_invokes_claude(monkeypatch, tmp_path):
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     calls = _patch_run(monkeypatch, [_Proc(stdout="ok")])
     from agam.invoker import HostInvoker
 
@@ -130,7 +137,7 @@ def test_host_invoker_run_invokes_claude(monkeypatch, tmp_path):
 
 def test_host_invoker_run_raises_on_non_zero(monkeypatch, tmp_path):
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     _patch_run(monkeypatch, [_Proc(stderr="auth failed", returncode=1)])
     from agam.invoker import HostInvoker
 
@@ -228,7 +235,7 @@ def test_resolve_returns_host_when_only_host_healthy(monkeypatch, tmp_path):
     monkeypatch.delenv("AGAM_WATCHDOG_MODE", raising=False)
     monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import resolve_invoker
 
     inv = resolve_invoker()
@@ -240,7 +247,7 @@ def test_resolve_prefers_container_over_host_when_both_available(monkeypatch, tm
     monkeypatch.delenv("AGAM_WATCHDOG_MODE", raising=False)
     monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
     _patch_which(monkeypatch, {"docker": "/usr/local/bin/docker", "claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     _patch_run(monkeypatch, [_Proc(stdout="dev1 claude-code:latest\n")])
     from agam.invoker import resolve_invoker
 
@@ -253,7 +260,7 @@ def test_resolve_honors_AGAM_INVOKER_host_override(monkeypatch, tmp_path):
     monkeypatch.setenv("AGAM_INVOKER", "host")
     monkeypatch.delenv("AGAM_WATCHDOG_MODE", raising=False)
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude", "docker": "/usr/local/bin/docker"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import resolve_invoker
 
     inv = resolve_invoker()
@@ -265,7 +272,7 @@ def test_resolve_honors_legacy_AGAM_WATCHDOG_MODE(monkeypatch, tmp_path):
     monkeypatch.delenv("AGAM_INVOKER", raising=False)
     monkeypatch.setenv("AGAM_WATCHDOG_MODE", "host")
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import resolve_invoker
 
     inv = resolve_invoker()
@@ -277,7 +284,7 @@ def test_resolve_AGAM_INVOKER_takes_precedence_over_legacy(monkeypatch, tmp_path
     monkeypatch.setenv("AGAM_INVOKER", "host")
     monkeypatch.setenv("AGAM_WATCHDOG_MODE", "container")  # opposing direction
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import resolve_invoker
 
     assert resolve_invoker().name == "host"
@@ -288,7 +295,7 @@ def test_resolve_raises_when_nothing_healthy(monkeypatch, tmp_path):
     monkeypatch.delenv("AGAM_WATCHDOG_MODE", raising=False)
     monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
     _patch_which(monkeypatch, {})  # no docker, no claude
-    _patch_creds(monkeypatch, tmp_path, exists=False)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import resolve_invoker, NoInvokerAvailable
 
     with pytest.raises(NoInvokerAvailable) as ei:
@@ -303,7 +310,7 @@ def test_resolve_named_container_first_when_AGAM_CONTAINER_NAME_set(monkeypatch,
     monkeypatch.delenv("AGAM_WATCHDOG_MODE", raising=False)
     monkeypatch.setenv("AGAM_CONTAINER_NAME", "specific-dev")
     _patch_which(monkeypatch, {"docker": "/usr/local/bin/docker", "claude": "/usr/local/bin/claude"})
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     _patch_run(monkeypatch, [_Proc(stdout="true\n")])
     from agam.invoker import resolve_invoker
 
@@ -321,7 +328,7 @@ def test_probe_all_returns_every_candidate(monkeypatch, tmp_path):
     monkeypatch.delenv("AGAM_WATCHDOG_MODE", raising=False)
     monkeypatch.delenv("AGAM_CONTAINER_NAME", raising=False)
     _patch_which(monkeypatch, {"claude": "/usr/local/bin/claude"})  # no docker
-    _patch_creds(monkeypatch, tmp_path, exists=True)
+    _patch_home(monkeypatch, tmp_path)
     from agam.invoker import probe_all
 
     results = probe_all()
