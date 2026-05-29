@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -591,17 +592,22 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         )
         fails += 1
 
-    # 4. OAuth credentials (required for bootstrap + watchdog)
-    creds = home / ".claude" / ".credentials.json"
-    if creds.exists():
-        _check("Claude Code OAuth credentials", True, detail=str(creds))
+    # 4. Claude CLI present on PATH. We don't check for a credentials.json
+    # file: on macOS host, Claude Code stores OAuth in Keychain and that
+    # file may never exist. Auth correctness is verified by the invoker
+    # cascade below when it actually calls ``claude -p``; this check just
+    # answers "is the binary reachable?"
+    claude_path = shutil.which("claude")
+    if claude_path:
+        _check("Claude Code CLI on PATH", True, detail=claude_path)
     else:
         _check(
-            "Claude Code OAuth credentials",
-            None,
-            detail=str(creds),
-            fix="run `claude` interactively once to authenticate",
+            "Claude Code CLI on PATH",
+            False,
+            detail="`claude` not found",
+            fix="install Claude Code: https://claude.ai/code",
         )
+        fails += 1
 
     # 5. Invoker cascade -- which paths Agam can use to call claude -p.
     # At least one must be ok for bootstrap + watchdog auto-learning.

@@ -22,9 +22,11 @@ Task 20 adds the Haiku extraction pass:
   for entities + relationships, parse the stream-json output.
 - ``extract_all`` -- thread-pool fan-out across many transcripts.
 
-LLM calls go through ``docker exec`` intentionally. Users already
-authenticate via ``~/.claude/.credentials.json`` (OAuth managed by the
-Claude Code CLI); we do NOT take an Anthropic API key.
+LLM calls reuse whatever auth Claude Code already has (Keychain on
+macOS host, ``~/.claude/.credentials.json`` in a devcontainer, etc.) --
+we do NOT take an Anthropic API key. The actual invocation goes through
+``agam.invoker.resolve_invoker()`` which picks host or container at
+runtime; see that module for the cascade contract.
 """
 
 from __future__ import annotations

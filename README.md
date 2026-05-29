@@ -15,7 +15,7 @@ No Anthropic API key is needed or supported. Every LLM call Agam makes runs insi
 ## Prerequisites
 
 - macOS. Only platform supported in v1.
-- [Claude Code](https://claude.ai/code) installed, and you have run `claude` interactively at least once so that `~/.claude/.credentials.json` exists.
+- [Claude Code](https://claude.ai/code) installed and authenticated (run `claude` interactively once). Agam reuses whatever auth Claude Code already has; you do not need to find where it lives.
 - [uv](https://docs.astral.sh/uv/) for Python execution.
 - Python 3.11 or newer (uv will fetch one if you do not have it).
 - Optional but strongly recommended: Docker Desktop with a running claude-code devcontainer. The bootstrap pipeline and the background watchdog both shell out to `docker exec`. The identity files and the `graph-recall` hook work without Docker, so you can install Agam on a machine where Docker is not ready yet.
@@ -32,7 +32,7 @@ cd ~/coding/agam
 
 `install.sh` does the minimum:
 
-1. Checks for `uv`, `claude`, Docker (warns if absent), macOS, and `~/.claude/.credentials.json`.
+1. Checks for `uv`, `claude`, Docker (warns if absent), and macOS. Auth is verified later by `agam doctor` and at the first real `claude -p` call, not by guessing where credentials are stored.
 2. Runs `uv sync` to materialize the Python environment.
 3. Delegates to `uv run agam init`, which is the real installer.
 
@@ -138,7 +138,7 @@ The detection is a cascade. Agam walks the list in order and uses the first one 
 1. **Pinned via `AGAM_INVOKER`** (or the legacy `AGAM_WATCHDOG_MODE`) -- if set, that invoker is the only candidate.
 2. **Named container** -- if `AGAM_CONTAINER_NAME` points to a running container.
 3. **Discovered container** -- the first `docker ps` row whose image name matches `AGAM_CONTAINER_PATTERN` (default `claude-code`).
-4. **Host claude** -- `claude` on your `PATH` plus `~/.claude/.credentials.json` present.
+4. **Host claude** -- `claude` on your `PATH`. (Auth lives wherever Claude Code put it -- Keychain on macOS host, a file in a container. The probe doesn't second-guess Claude Code; if the CLI is on PATH it's eligible, and a real auth failure surfaces at run time with claude's own error.)
 
 Both "container" and "host" are first-class. Container is preferred when both are available because Agam's background calls then run isolated from your interactive Claude Code session. If only one is available, the cascade picks it without asking.
 
@@ -156,7 +156,7 @@ agam doctor
 
 That prints one line per candidate invoker with PASS/WARN/FAIL and the reason. Use it as the first stop when "auto-learning stopped happening" -- usually it tells you the answer (container stopped, OAuth token expired, claude not on PATH).
 
-Agam never takes an Anthropic API key. Every `claude -p` invocation goes through your existing Claude Code OAuth (`~/.claude/.credentials.json`). If you need an API key, you are using the wrong tool.
+Agam never takes an Anthropic API key. Every `claude -p` invocation goes through your existing Claude Code OAuth -- wherever Claude Code chose to put it (Keychain, `~/.claude/.credentials.json`, etc.). If you need an API key, you are using the wrong tool.
 
 ## Troubleshooting
 

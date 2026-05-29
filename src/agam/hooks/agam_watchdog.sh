@@ -6,7 +6,8 @@
 #   2. AGAM_INVOKER=container or AGAM_WATCHDOG_MODE=container -> force container.
 #   3. AGAM_CONTAINER_NAME exact name running -> named container.
 #   4. Image matching AGAM_CONTAINER_PATTERN running -> discovered container.
-#   5. `claude` on PATH and ~/.claude/.credentials.json present -> host.
+#   5. `claude` on PATH -> host. (Auth lives in Keychain on macOS or in
+#      a file inside the container; we trust claude's own auth handling.)
 #   6. None of the above -> log no-invoker and exit (queue preserved).
 #
 # The Python module ``agam.invoker`` is the source of truth for this cascade
@@ -25,8 +26,6 @@ set -u
 AGAM_HOME="${AGAM_HOME:-$HOME/.claude/agam}"
 LOG="$AGAM_HOME/logs/watchdog.log"
 LOCK="$AGAM_HOME/.watchdog.lock"
-CREDS="$HOME/.claude/.credentials.json"
-
 mkdir -p "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" "$AGAM_HOME/queue-errors"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
@@ -50,15 +49,14 @@ CONTAINER_NAME_OVERRIDE="${AGAM_CONTAINER_NAME:-}"
 
 probe_host() {
     # 0 = healthy, 1 = unhealthy. Writes detail to global PROBE_DETAIL.
+    # Only requires ``claude`` on PATH. macOS host stores OAuth in Keychain,
+    # so a credentials.json file may not exist even when auth works. Real
+    # auth failures surface when claude -p actually runs.
     if ! command -v claude >/dev/null 2>&1; then
         PROBE_DETAIL="claude CLI not on PATH"
         return 1
     fi
-    if [[ ! -f "$CREDS" ]]; then
-        PROBE_DETAIL="no ~/.claude/.credentials.json (run \`claude\` once to authenticate)"
-        return 1
-    fi
-    PROBE_DETAIL="host claude ready"
+    PROBE_DETAIL="host claude on PATH"
     return 0
 }
 

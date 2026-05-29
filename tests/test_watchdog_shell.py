@@ -204,9 +204,9 @@ def test_host_mode_skips_docker_and_invokes_host_inner(tmp_path):
     )
     inner.chmod(inner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-    # Host invoker probe requires ~/.claude/.credentials.json. Plant it.
-    creds = tmp_path / "home" / ".claude" / ".credentials.json"
-    creds.write_text("{}")
+    # Host invoker probe only requires `claude` on PATH (credentials.json
+    # file is no longer checked; macOS host stores OAuth in Keychain so
+    # that file may never exist). The fake claude binary below is enough.
 
     # Plant a fake `claude` binary on PATH so the host probe sees it.
     bin_dir = tmp_path / "bin"
@@ -258,7 +258,12 @@ def test_no_container_preserves_queue(tmp_path):
         log_path=docker_log,
     )
 
+    # Restrict PATH so claude isn't visible. Keep /bin and /usr/bin so the
+    # script's own ``bash``/``mkdir``/``date`` etc. still resolve. Without
+    # the claude binary on PATH, the host probe fails and the watchdog
+    # logs "no-invoker" instead of falling back to host mode.
     env = _env(home, bin_dir)
+    env["PATH"] = f"{bin_dir}:/bin:/usr/bin"
     before = _real_file_mtimes()
     r = _run(env)
     after = _real_file_mtimes()
@@ -272,8 +277,7 @@ def test_no_container_preserves_queue(tmp_path):
     assert not (home / "queue-errors" / "keep.json").exists()
     tail = (home / "logs" / "watchdog.log").read_text()
     # New shell cascade logs "no-invoker" when neither container nor host probe
-    # is healthy (host probe fails because the sandboxed $HOME has no
-    # ~/.claude/.credentials.json).
+    # is healthy (host probe fails because claude isn't on the restricted PATH).
     assert "no-invoker" in tail
     assert "queue-depth=1" in tail
 
