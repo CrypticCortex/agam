@@ -30,6 +30,7 @@ import pathlib
 import subprocess
 import sys
 import time
+from collections import deque
 
 
 HOME = pathlib.Path(os.path.expanduser("~"))
@@ -55,6 +56,182 @@ TOOLS = pathlib.Path(
 LOG = AGAM_HOME / ".watchdog-log"
 PROCESSED = AGAM_HOME / ".processed-sessions.jsonl"
 WORK_LOG_WRITTEN = AGAM_HOME / ".work-log-written.jsonl"
+
+
+# Top-level event types that carry no proposal-relevant signal. They hold
+# attachments, git snapshots, queue bookkeeping, UI title management. Sonnet
+# does not need any of them to write proposals. Drop entirely.
+_DROP_TOPLEVEL_TYPES = {
+    "attachment", "file-history-snapshot", "queue-operation",
+    "last-prompt", "custom-title", "permission-mode", "agent-name",
+    "ai-title", "system",
+}
+
+# Top-level metadata keys to keep. Everything else is internal plumbing
+# (uuids, parentUuid, requestId, hook bookkeeping, snapshot data, etc.)
+# that adds bytes without aiding proposal generation.
+_KEEP_TOPLEVEL_KEYS = {"type", "timestamp", "message", "gitBranch", "cwd"}
+
+# message.* keys to keep. Everything else is API metadata (model, usage,
+# stop_reason, container, context_management).
+_KEEP_MESSAGE_KEYS = {"role", "content"}
+
+# Per-block content types within message.content[] -- drop entirely.
+_DROP_BLOCK_TYPES = {"image"}
+
+# Caps for content that can balloon. Sonnet needs to know WHAT a tool did,
+# not the entire payload it returned.
+_TOOL_RESULT_CAP = 600
+_TOOL_USE_INPUT_CAP = 800
+
+# Sliding-window size for pre-cutoff context. On continuation runs we keep
+# the last N events from BEFORE since_iso so sonnet can link new turns to
+# their immediate antecedents (the M1<->M14 lesson-linkage case). Pure
+# delta loses that context. Matches Mem0's m=10 default.
+_CONTEXT_WINDOW_SIZE = 10
+
+
+def _compact_block(block: dict) -> dict | None:
+    """Compact a single message.content[] block. Return None to drop it."""
+    btype = block.get("type", "")
+    if btype in _DROP_BLOCK_TYPES:
+        return None
+    if btype == "thinking":
+        return {"type": "thinking", "thinking": block.get("thinking", "")}
+    if btype == "tool_use":
+        inp = block.get("input")
+        if isinstance(inp, dict):
+            new_inp = {}
+            for k, v in inp.items():
+                if isinstance(v, str) and len(v) > _TOOL_USE_INPUT_CAP:
+                    new_inp[k] = v[:_TOOL_USE_INPUT_CAP] + f"...[+{len(v) - _TOOL_USE_INPUT_CAP}]"
+                else:
+                    new_inp[k] = v
+        else:
+            new_inp = inp
+        return {"type": "tool_use", "name": block.get("name"), "input": new_inp}
+    if btype == "tool_result":
+        c = block.get("content")
+        out = {"type": "tool_result"}
+        if block.get("is_error"):
+            out["is_error"] = True
+        if isinstance(c, str):
+            out["content"] = (c[:_TOOL_RESULT_CAP] + f"...[+{len(c) - _TOOL_RESULT_CAP}]") if len(c) > _TOOL_RESULT_CAP else c
+        elif isinstance(c, list):
+            new_c = []
+            for sub in c:
+                if isinstance(sub, dict) and sub.get("type") == "text":
+                    t = sub.get("text", "")
+                    if len(t) > _TOOL_RESULT_CAP:
+                        new_c.append({"type": "text", "text": t[:_TOOL_RESULT_CAP] + f"...[+{len(t) - _TOOL_RESULT_CAP}]"})
+                    else:
+                        new_c.append({"type": "text", "text": t})
+                elif isinstance(sub, dict) and sub.get("type") == "image":
+                    continue
+            out["content"] = new_c
+        else:
+            out["content"] = c
+        return out
+    if btype == "text":
+        return {"type": "text", "text": block.get("text", "")}
+    return block
+
+
+def _compact_event(event: dict) -> dict | None:
+    """Return a compacted event, or None if the entire event should be dropped."""
+    t = event.get("type", "")
+    if t in _DROP_TOPLEVEL_TYPES:
+        return None
+
+    out = {k: event[k] for k in _KEEP_TOPLEVEL_KEYS if k in event}
+
+    msg = event.get("message")
+    if isinstance(msg, dict):
+        new_msg = {k: msg[k] for k in _KEEP_MESSAGE_KEYS if k in msg}
+        content = msg.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for block in content:
+                if not isinstance(block, dict):
+                    new_content.append(block)
+                    continue
+                compacted = _compact_block(block)
+                if compacted is not None:
+                    new_content.append(compacted)
+            new_msg["content"] = new_content
+        elif isinstance(content, str):
+            new_msg["content"] = content
+        out["message"] = new_msg
+
+    return out
+
+
+def _slice_transcript_for_sonnet(
+    jsonl_path: str,
+    since_iso: str,
+    sid: str,
+    *,
+    max_bytes: int = 4 * 1024 * 1024,
+) -> tuple[str, int, int]:
+    """Return (path, window_count, delta_count) for sonnet.
+
+    Strategy: field-level compaction + sliding-window cutoff. On continuation
+    runs we drop events that fall below `since_iso` EXCEPT for the last
+    _CONTEXT_WINDOW_SIZE pre-cutoff events, which are preserved so sonnet
+    can link new turns to their immediate antecedents. On fresh runs the
+    window is empty and every event passes through.
+
+    Compaction drops (regardless of cutoff):
+      - top-level event types with no proposal signal (attachment,
+        file-history-snapshot, queue-operation, custom-title, last-prompt,
+        permission-mode, agent-name, ai-title, system)
+      - top-level metadata noise (uuid, parentUuid, sessionId, requestId,
+        hookCount, hookInfos, etc.)
+      - message-level API metadata (model, usage, stop_reason, container)
+      - image blocks; thinking-block signature; tool_use id+caller;
+        tool_result tool_use_id
+      - tool_result content capped to 600 chars + tool_use input strings
+        capped to 800 chars
+
+    Returns the compacted file path (or the original if no work was needed),
+    plus counts of how many events fell in the window vs the delta. Counts
+    are 0 when the original is returned unchanged.
+    """
+    try:
+        size = os.path.getsize(jsonl_path)
+    except OSError:
+        return jsonl_path, 0, 0
+
+    cutoff_str = since_iso if since_iso and since_iso != "SESSION-START" else None
+    if size <= max_bytes and cutoff_str is None:
+        return jsonl_path, 0, 0
+
+    out_path = pathlib.Path(f"/tmp/agam-sync-slice-{sid}.jsonl")
+    window: deque[str] = deque(maxlen=_CONTEXT_WINDOW_SIZE)
+    delta_lines: list[str] = []
+    try:
+        with open(jsonl_path, errors="replace") as f:
+            for raw in f:
+                if not raw.strip():
+                    continue
+                try:
+                    e = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                compacted = _compact_event(e)
+                if compacted is None:
+                    continue
+                line = json.dumps(compacted) + "\n"
+                ts = compacted.get("timestamp", "")
+                if cutoff_str and ts and ts < cutoff_str:
+                    window.append(line)
+                else:
+                    delta_lines.append(line)
+
+        out_path.write_text("".join(window) + "".join(delta_lines))
+        return str(out_path), len(window), len(delta_lines)
+    except OSError:
+        return jsonl_path, 0, 0
 
 
 def log(session_id: str, event: str, **kw) -> None:
@@ -289,11 +466,29 @@ def main() -> int:
         log(sid, "work-log-timeout")
 
     # Step c: agam-sync (sonnet) -> proposals JSON
+    # Slice the transcript first. Big transcripts exceed sonnet's context and
+    # burn the timeout budget on tool reads. Continuation runs preserve a
+    # sliding window of pre-cutoff context alongside the delta so cross-turn
+    # lesson linkage survives.
+    sliced_path, window_n, delta_n = _slice_transcript_for_sonnet(transcript, since_iso, sid)
+    if sliced_path != transcript:
+        try:
+            orig_size = os.path.getsize(transcript)
+            new_size = os.path.getsize(sliced_path)
+            log(sid, "transcript-sliced",
+                orig_mb=round(orig_size / 1024 / 1024, 2),
+                sliced_mb=round(new_size / 1024 / 1024, 2),
+                window_events=window_n,
+                delta_events=delta_n,
+                cutoff_mode=cutoff_mode)
+        except OSError:
+            pass
+
     proposals_path = pathlib.Path(f"/tmp/proposals-{sid}.json")
     schema_block = JSON_SCHEMA_HINT.replace("{proposals_path}", str(proposals_path))
     sync_prompt = fill(
         PROMPTS / "agam-sync.txt",
-        JSONL_PATH=transcript,
+        JSONL_PATH=sliced_path,
         SESSION_SIGNALS="AUTO",
         CONTEXT_SUMMARY="(watchdog: derive context from transcript)",
     ) + schema_block
@@ -304,6 +499,13 @@ def main() -> int:
         sync_ok = (r.returncode == 0)
     except subprocess.TimeoutExpired:
         log(sid, "agam-sync-timeout")
+
+    # Clean up the sliced temp now that all sonnet calls are done.
+    if sliced_path != transcript:
+        try:
+            pathlib.Path(sliced_path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # Step d: apply
     if proposals_path.exists():
