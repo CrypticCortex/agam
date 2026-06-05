@@ -458,6 +458,54 @@ def test_slice_preserves_last_n_pre_cutoff_events_as_window(tmp_path):
     _assert_real_untouched(snapshots)
 
 
+def test_compact_block_caps_tool_use_string_input():
+    """tool_use blocks where `input` is a bare string (not a dict) must be
+    truncated to _TOOL_USE_INPUT_CAP and carry the "[+N]" suffix, matching
+    the behavior already applied to string values nested in a dict input."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+
+    big = "x" * (inner._TOOL_USE_INPUT_CAP + 500)
+    block = {"type": "tool_use", "name": "Bash", "input": big}
+    out = inner._compact_block(block)
+
+    assert out is not None
+    assert out["type"] == "tool_use"
+    assert out["name"] == "Bash"
+    assert isinstance(out["input"], str)
+    assert len(out["input"]) < len(big), "string input should have been capped"
+    assert out["input"].startswith("x" * inner._TOOL_USE_INPUT_CAP)
+    assert out["input"].endswith("...[+500]")
+    _assert_real_untouched(snapshots)
+
+
+def test_slice_uses_secure_tempfile_path(tmp_path):
+    """The sliced temp file must come from tempfile.mkstemp -- random suffix
+    in the filename so a local attacker who guesses the sid cannot pre-place
+    a symlink at the path."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+    t = tmp_path / "src.jsonl"
+    _write_transcript(t, [_user_event("2026-06-04T10:00:00", "hi")])
+
+    path, _, _ = inner._slice_transcript_for_sonnet(
+        str(t), "2026-06-04T09:00:00", "predictable-sid"
+    )
+
+    # mkstemp inserts a random component between prefix and suffix, so the
+    # full path is NOT the literal /tmp/agam-sync-slice-<sid>.jsonl pattern.
+    assert path != f"/tmp/agam-sync-slice-predictable-sid.jsonl"
+    name = pathlib.Path(path).name
+    assert name.startswith("agam-sync-slice-predictable-sid-")
+    assert name.endswith(".jsonl")
+    # Random middle segment must be non-empty -- that is what closes the race.
+    middle = name[len("agam-sync-slice-predictable-sid-"):-len(".jsonl")]
+    assert len(middle) > 0
+
+    pathlib.Path(path).unlink(missing_ok=True)
+    _assert_real_untouched(snapshots)
+
+
 def test_slice_drops_attachment_events_via_compaction(tmp_path):
     """Compaction layer must drop events whose top-level type is in
     _DROP_TOPLEVEL_TYPES (attachment, queue-operation, etc.) regardless

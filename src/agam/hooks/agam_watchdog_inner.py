@@ -29,6 +29,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 
@@ -107,6 +108,8 @@ def _compact_block(block: dict) -> dict | None:
                     new_inp[k] = v[:_TOOL_USE_INPUT_CAP] + f"...[+{len(v) - _TOOL_USE_INPUT_CAP}]"
                 else:
                     new_inp[k] = v
+        elif isinstance(inp, str) and len(inp) > _TOOL_USE_INPUT_CAP:
+            new_inp = inp[:_TOOL_USE_INPUT_CAP] + f"...[+{len(inp) - _TOOL_USE_INPUT_CAP}]"
         else:
             new_inp = inp
         return {"type": "tool_use", "name": block.get("name"), "input": new_inp}
@@ -206,7 +209,12 @@ def _slice_transcript_for_sonnet(
     if size <= max_bytes and cutoff_str is None:
         return jsonl_path, 0, 0
 
-    out_path = pathlib.Path(f"/tmp/agam-sync-slice-{sid}.jsonl")
+    # mkstemp gives a 0600 file at an unguessable path under $TMPDIR, closing
+    # the symlink-clobber race that a predictable /tmp/<sid> name would carry.
+    # The sid is kept in the prefix purely for human debugging of /tmp.
+    fd, tmp_name = tempfile.mkstemp(prefix=f"agam-sync-slice-{sid}-", suffix=".jsonl")
+    os.close(fd)
+    out_path = pathlib.Path(tmp_name)
     window: deque[str] = deque(maxlen=_CONTEXT_WINDOW_SIZE)
     delta_lines: list[str] = []
     try:
@@ -231,6 +239,8 @@ def _slice_transcript_for_sonnet(
         out_path.write_text("".join(window) + "".join(delta_lines))
         return str(out_path), len(window), len(delta_lines)
     except OSError:
+        # mkstemp already created the file -- don't leak it on early exit.
+        out_path.unlink(missing_ok=True)
         return jsonl_path, 0, 0
 
 
