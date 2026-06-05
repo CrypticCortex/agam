@@ -372,3 +372,167 @@ def test_prompts_dir_defaults_to_agam_home_prompts(monkeypatch, tmp_path):
     # Must NOT have fallen back to the host's ~/.claude/skills path.
     assert "skills/session-close" not in str(inner.PROMPTS)
     _assert_real_untouched(snapshots)
+
+
+# ---- _slice_transcript_for_sonnet sliding window --------------------------
+
+def _write_transcript(path: pathlib.Path, events: list[dict]) -> None:
+    with open(path, "w") as f:
+        for e in events:
+            f.write(json.dumps(e) + "\n")
+
+
+def _read_jsonl(path: str) -> list[dict]:
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _user_event(ts: str, text: str) -> dict:
+    return {
+        "type": "user",
+        "timestamp": ts,
+        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def test_slice_returns_original_on_fresh_run_under_threshold(tmp_path):
+    """Fresh runs (since_iso == SESSION-START) on small transcripts should
+    return the path unchanged with zero window/delta counts."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+    t = tmp_path / "tiny.jsonl"
+    _write_transcript(t, [_user_event("2026-06-04T10:00:00", "hello")])
+
+    path, win_n, delta_n = inner._slice_transcript_for_sonnet(
+        str(t), "SESSION-START", "sid-fresh"
+    )
+    assert path == str(t)
+    assert win_n == 0
+    assert delta_n == 0
+    _assert_real_untouched(snapshots)
+
+
+def test_slice_preserves_last_n_pre_cutoff_events_as_window(tmp_path):
+    """The sliding window must keep exactly _CONTEXT_WINDOW_SIZE events from
+    BEFORE the cutoff, plus everything at-or-after the cutoff. M1<->M14
+    linkage relies on this -- pure delta would lose pre-cutoff context."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+
+    # 15 pre-cutoff + 3 post-cutoff. Window size is 10 so window keeps
+    # events 5..14 (last 10 pre-cutoff). Delta keeps the 3 post-cutoff.
+    events = []
+    for i in range(15):
+        events.append(_user_event(f"2026-06-04T10:{i:02d}:00", f"pre-{i}"))
+    events.append(_user_event("2026-06-04T11:00:00", "post-A"))
+    events.append(_user_event("2026-06-04T11:01:00", "post-B"))
+    events.append(_user_event("2026-06-04T11:02:00", "post-C"))
+
+    t = tmp_path / "with-cutoff.jsonl"
+    _write_transcript(t, events)
+
+    # Force slicing path even though file is tiny: any non-SESSION-START
+    # cutoff makes the function compact + slice.
+    cutoff = "2026-06-04T10:30:00"
+    path, win_n, delta_n = inner._slice_transcript_for_sonnet(
+        str(t), cutoff, "sid-window"
+    )
+    assert path != str(t), "slicing must produce a temp file when cutoff is set"
+    assert win_n == inner._CONTEXT_WINDOW_SIZE
+    assert delta_n == 3
+
+    sliced = _read_jsonl(path)
+    # Window first, then delta. The earliest pre-cutoff events (0..4) are
+    # dropped; events 5..14 survive in window order; then the three post.
+    texts = [r["message"]["content"][0]["text"] for r in sliced]
+    assert texts == [f"pre-{i}" for i in range(5, 15)] + ["post-A", "post-B", "post-C"]
+
+    # Clean up the temp slice.
+    pathlib.Path(path).unlink(missing_ok=True)
+    _assert_real_untouched(snapshots)
+
+
+def test_compact_block_caps_tool_use_string_input():
+    """tool_use blocks where `input` is a bare string (not a dict) must be
+    truncated to _TOOL_USE_INPUT_CAP and carry the "[+N]" suffix, matching
+    the behavior already applied to string values nested in a dict input."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+
+    big = "x" * (inner._TOOL_USE_INPUT_CAP + 500)
+    block = {"type": "tool_use", "name": "Bash", "input": big}
+    out = inner._compact_block(block)
+
+    assert out is not None
+    assert out["type"] == "tool_use"
+    assert out["name"] == "Bash"
+    assert isinstance(out["input"], str)
+    assert len(out["input"]) < len(big), "string input should have been capped"
+    assert out["input"].startswith("x" * inner._TOOL_USE_INPUT_CAP)
+    assert out["input"].endswith("...[+500]")
+    _assert_real_untouched(snapshots)
+
+
+def test_slice_uses_secure_tempfile_path(tmp_path):
+    """The sliced temp file must come from tempfile.mkstemp -- random suffix
+    in the filename so a local attacker who guesses the sid cannot pre-place
+    a symlink at the path."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+    t = tmp_path / "src.jsonl"
+    _write_transcript(t, [_user_event("2026-06-04T10:00:00", "hi")])
+
+    path, _, _ = inner._slice_transcript_for_sonnet(
+        str(t), "2026-06-04T09:00:00", "predictable-sid"
+    )
+
+    # mkstemp inserts a random component between prefix and suffix, so the
+    # full path is NOT the literal /tmp/agam-sync-slice-<sid>.jsonl pattern.
+    assert path != f"/tmp/agam-sync-slice-predictable-sid.jsonl"
+    name = pathlib.Path(path).name
+    assert name.startswith("agam-sync-slice-predictable-sid-")
+    assert name.endswith(".jsonl")
+    # Random middle segment must be non-empty -- that is what closes the race.
+    middle = name[len("agam-sync-slice-predictable-sid-"):-len(".jsonl")]
+    assert len(middle) > 0
+
+    pathlib.Path(path).unlink(missing_ok=True)
+    _assert_real_untouched(snapshots)
+
+
+def test_slice_drops_attachment_events_via_compaction(tmp_path):
+    """Compaction layer must drop events whose top-level type is in
+    _DROP_TOPLEVEL_TYPES (attachment, queue-operation, etc.) regardless
+    of where they fall vs the cutoff."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+
+    events = [
+        _user_event("2026-06-04T10:00:00", "keep-me"),
+        {"type": "attachment", "timestamp": "2026-06-04T10:01:00", "content": "x" * 5000},
+        {"type": "queue-operation", "timestamp": "2026-06-04T10:02:00", "op": "drain"},
+        _user_event("2026-06-04T10:03:00", "also-keep"),
+    ]
+    t = tmp_path / "noisy.jsonl"
+    _write_transcript(t, events)
+
+    path, win_n, delta_n = inner._slice_transcript_for_sonnet(
+        str(t), "2026-06-04T09:59:00", "sid-drop"
+    )
+    sliced = _read_jsonl(path)
+    types = [r.get("type") for r in sliced]
+    assert "attachment" not in types
+    assert "queue-operation" not in types
+    assert types == ["user", "user"]
+    # Both kept events are post-cutoff so they land in delta, not window.
+    assert win_n == 0
+    assert delta_n == 2
+
+    pathlib.Path(path).unlink(missing_ok=True)
+    _assert_real_untouched(snapshots)
