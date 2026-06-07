@@ -136,11 +136,20 @@ def lint_stale(db):
     findings = []
 
     if db:
+        # Suppress entities the user has already marked paused or archived --
+        # the recommendation "if paused: status paused" is a no-op for them
+        # and the noise drowns out genuinely active-but-stale entities.
         rows = db.execute("""
             SELECT e.name, e.type, p.value as last_worked
             FROM entities e
             JOIN properties p ON e.id = p.entity_id AND p.key = 'last-worked'
             WHERE julianday('now') - julianday(p.value) > 30
+              AND NOT EXISTS (
+                  SELECT 1 FROM properties s
+                  WHERE s.entity_id = e.id
+                    AND s.key = 'status'
+                    AND s.value IN ('paused', 'archived')
+              )
             ORDER BY p.value ASC
             LIMIT 15
         """).fetchall()
