@@ -25,9 +25,17 @@ import pathlib
 
 # The hook runs as a standalone PEP 723 script via `uv run --script`, so it
 # cannot rely on package-style imports. Vendor the pending_queue helpers by
-# adding the sibling tools/ directory to sys.path.
+# adding the right tools dir to sys.path. There are two valid layouts:
+#   installed:  ~/.claude/hooks/  <->  ~/.claude/tools/agam/
+#   source:     src/agam/hooks/   <->  src/agam/tools/
+# Probe both -- the first one carrying pending_queue.py wins. Without the
+# installed-first probe, a first OSS user hit ``ModuleNotFoundError`` because
+# the original hook only pointed at the flat tools/ root.
 _HOOK_DIR = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(_HOOK_DIR.parent / "tools"))
+for _candidate in (_HOOK_DIR.parent / "tools" / "agam", _HOOK_DIR.parent / "tools"):
+    if (_candidate / "pending_queue.py").exists():
+        sys.path.insert(0, str(_candidate))
+        break
 import pending_queue as pq  # noqa: E402
 
 SIGNAL_RE = re.compile(
