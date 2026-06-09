@@ -137,6 +137,45 @@ def test_installer_writes_tools(tmp_path):
     assert (tools / "knowledge_graph.py").stat().st_mode & stat.S_IXUSR
 
 
+def test_installed_session_close_hook_can_import_pending_queue(tmp_path):
+    """Regression: session_close.py uses sys.path.insert to find pending_queue
+    as a sibling vendored module. The installer namespaces tools under
+    tools/agam/, so the hook's sys.path must point at that subdir, not the
+    flat tools/ root. A first OSS user hit ``ModuleNotFoundError: No module
+    named 'pending_queue'`` when the hook's path was one segment off.
+
+    Verifying file existence (test_installer_writes_tools above) is not
+    sufficient -- the hook's *resolution path* has to match the installed
+    layout. This test imports pending_queue using the same sys.path
+    construction the hook does, against the installed-tree, so any future
+    drift between installer destination and hook import path fails here.
+    """
+    import importlib
+    import subprocess
+
+    from agam.installer import run_wizard
+
+    run_wizard(answers=_default_answers(tmp_path), home=tmp_path)
+    hooks = tmp_path / ".claude" / "hooks"
+    hook_path = hooks / "session_close.py"
+    assert hook_path.is_file()
+
+    # Run the hook in a subprocess with a no-op stdin payload, capture stderr.
+    # If the import path is broken, this returns a ModuleNotFoundError.
+    # We pass empty JSON so the hook exits cleanly past the imports.
+    result = subprocess.run(
+        ["python3", str(hook_path)],
+        input='{"session_id": "", "transcript_path": "", "cwd": ""}',
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "ModuleNotFoundError" not in result.stderr, (
+        f"session_close.py failed to import pending_queue from the installed "
+        f"tools dir. stderr was:\n{result.stderr}"
+    )
+
+
 def test_installer_skips_package_dunders(tmp_path):
     from agam.installer import run_wizard
 
