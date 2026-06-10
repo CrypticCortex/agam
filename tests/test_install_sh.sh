@@ -3,9 +3,11 @@
 #
 # install.sh no longer requires ~/.claude/.credentials.json. On macOS host,
 # Claude Code stores OAuth in Keychain and that file may never exist even
-# when auth is healthy. The hard prereqs are: uv on PATH, claude on PATH,
-# Darwin platform. The credentials-file check was retired after a real OSS
-# user hit a false-negative install failure on a fully-authenticated macOS host.
+# when auth is healthy. The HARD prereqs are: uv on PATH, Darwin platform.
+# claude on PATH and docker on PATH are WARNINGS, not failures -- the
+# watchdog docker-execs into the user's claude-code devcontainer, so a
+# host-side claude binary is optional. Both relaxations were triggered by
+# real OSS users hitting false-negative install failures.
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -52,3 +54,34 @@ if [[ "$OUTPUT" != *"install uv"* && "$OUTPUT" != *"install Claude Code"* ]]; th
   exit 1
 fi
 echo "PASS: install.sh fails loudly when a hard prereq is missing"
+
+# Regression guard 3: when claude is missing from PATH but uv is present,
+# install.sh must NOT hard-fail with an "install Claude Code" error. The
+# watchdog supports devcontainer-only setups via docker-exec, so a host-
+# side claude binary is optional. Triggered by a real OSS user whose
+# claude lived only inside their devcontainer and the install.sh hard-
+# checked for it on host. We can't fully simulate "uv yes, claude no"
+# without writing a fake uv stub on PATH, but we can at least assert the
+# install.sh source treats claude as a warning, not a hard fail.
+PREREQ_LINES="$(/usr/bin/awk '/--- begin prereq checks ---/,/--- end prereq checks ---/' "$INSTALL_SH")"
+# The claude line must contain WARN (a warning), not ERR followed by exit.
+CLAUDE_LINE="$(echo "$PREREQ_LINES" | /usr/bin/grep 'command -v claude' || true)"
+if [[ -z "$CLAUDE_LINE" ]]; then
+  echo "FAIL: install.sh has no 'command -v claude' check at all."
+  echo "      The check should remain as a warning even if claude is optional."
+  exit 1
+fi
+if echo "$CLAUDE_LINE" | /usr/bin/grep -q 'ERR:'; then
+  echo "FAIL: install.sh treats missing claude as a hard error."
+  echo "      Many users run Claude Code only inside a devcontainer (no host"
+  echo "      claude binary). The watchdog docker-execs in, so this should"
+  echo "      be a warning, not an exit. Found:"
+  echo "      $CLAUDE_LINE"
+  exit 1
+fi
+if ! echo "$CLAUDE_LINE" | /usr/bin/grep -q 'WARN:'; then
+  echo "FAIL: install.sh claude check does not surface a WARN message."
+  echo "      Found: $CLAUDE_LINE"
+  exit 1
+fi
+echo "PASS: install.sh treats missing host claude as a warning, not a hard fail"
