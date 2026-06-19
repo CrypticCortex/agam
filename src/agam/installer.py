@@ -684,6 +684,124 @@ def _commit_kg(src_db: Path, dst_db: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Neutral-home multi-agent orchestrator
+# ---------------------------------------------------------------------------
+
+
+def _render_neutral_plist(home: Path, agam_home: Path) -> Path | None:
+    """Render + write the watchdog plist pointing at the shared ~/.agam home.
+
+    Returns the written path, or None on non-mac (caller decides whether to
+    load it). The watchdog runs from the shared hooks/tools copy under ~/.agam,
+    so a single launchd job serves every wired agent.
+    """
+    launch_agents = home / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    tmpl = _find_resource("templates/com.agam.watchdog.plist.template")
+    text = (
+        tmpl.read_text(encoding="utf-8")
+        .replace("{{HOME}}", str(home))
+        .replace("{{AGAM_HOME}}", str(agam_home))
+        .replace("{{AGAM_HOOKS_DIR}}", str(agam_home / "hooks"))
+        .replace("{{AGAM_TOOLS_DIR}}", str(agam_home / "tools" / "agam"))
+        .replace("{{AGAM_KG_PATH}}", str(agam_home / "knowledge" / "graph.db"))
+    )
+    out = launch_agents / "com.agam.watchdog.plist"
+    out.write_text(text, encoding="utf-8")
+    return out
+
+
+@dataclass
+class MultiInstallResult:
+    home: Path
+    agam_home: Path
+    answers: Answers
+    targets: list[str]
+    migration_status: str
+    wrote_plist: bool = False
+
+
+def run_install(
+    answers: dict[str, Any] | Answers | None,
+    *,
+    targets: list[str],
+    home: Path | None = None,
+    write_plist: bool | None = None,
+) -> MultiInstallResult:
+    """Install agam for one or more agents around a shared ~/.agam data home.
+
+    Steps:
+      1. Migrate legacy ~/.claude data into ~/.agam (copy-only, reversible).
+      2. Write shared data into ~/.agam: config (always), identity files + KG
+         (only if absent, so migrated/edited data is preserved), prompts.
+      3. Install a shared hooks/tools copy under ~/.agam for the watchdog.
+      4. Install per-agent wiring for each selected target.
+      5. (mac) Render the watchdog plist pointing at the shared home.
+
+    ``targets`` is a list of agent names ("claude", "cursor").
+    """
+    from agam.agents import ClaudeAgent, CursorAgent
+    from agam.agents import _copy as agent_copy
+    from agam.migrate import migrate_if_needed
+
+    home = (home or Path(os.environ["HOME"])).resolve()
+    if answers is None:
+        resolved = _prompt_answers(home)
+    elif isinstance(answers, Answers):
+        resolved = answers
+    else:
+        resolved = Answers.from_dict(answers)
+
+    migration_status, _ = migrate_if_needed(home)
+
+    agam_home = home / ".agam"
+    agam_home.mkdir(parents=True, exist_ok=True)
+
+    # Config: always reflect the latest wizard answers.
+    _write_config(agam_home, resolved)
+    # Identity: preserve migrated/edited files; only seed from templates if absent.
+    if not (agam_home / "AGAM.md").exists():
+        _write_identity_files(agam_home)
+    # Prompts: safe to refresh (code templates).
+    _write_prompts(agam_home / "prompts")
+    # KG: never clobber an existing/migrated graph.
+    if not (agam_home / "knowledge" / "graph.db").exists():
+        _create_kg(agam_home / "knowledge")
+
+    # Shared hooks/tools copy for the watchdog.
+    agent_copy.copy_hooks_tree(agam_home / "hooks")
+    agent_copy.copy_tools_tree(
+        agam_home / "tools" / "agam", extra=[agent_copy.transcripts_src()]
+    )
+
+    # Per-agent wiring.
+    registry = {"claude": ClaudeAgent, "cursor": CursorAgent}
+    installed: list[str] = []
+    for name in targets:
+        agent_cls = registry.get(name)
+        if agent_cls is None:
+            continue
+        agent_cls().install(home)
+        installed.append(name)
+
+    if write_plist is None:
+        write_plist = resolved.platform == "mac"
+    wrote_plist = False
+    if write_plist:
+        if _render_neutral_plist(home, agam_home) is not None:
+            wrote_plist = True
+
+    return MultiInstallResult(
+        home=home,
+        agam_home=agam_home,
+        answers=resolved,
+        targets=installed,
+        migration_status=migration_status,
+        wrote_plist=wrote_plist,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 

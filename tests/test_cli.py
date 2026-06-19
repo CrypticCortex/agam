@@ -60,29 +60,29 @@ def test_cli_init_dispatches_to_installer(monkeypatch):
 
     called: list[dict] = []
 
-    def fake_run_wizard(**kw):
+    def fake_run_install(answers, **kw):
         called.append(kw)
         return MockResult()
 
-    monkeypatch.setattr("agam.installer.run_wizard", fake_run_wizard)
-
-    rc = cli.main(["init"])
-    assert called, "run_wizard was never invoked"
+    monkeypatch.setattr("agam.installer.run_install", fake_run_install)
+    # Explicit target keeps detection deterministic across machines.
+    rc = cli.main(["init", "--target", "claude"])
+    assert called, "run_install was never invoked"
+    assert called[0]["targets"] == ["claude"]
     assert rc == 0
 
 
-def test_cli_init_passes_force(monkeypatch):
+def test_cli_init_target_cursor(monkeypatch):
     from agam import cli
 
     called: list[dict] = []
     monkeypatch.setattr(
-        "agam.installer.run_wizard",
-        lambda **kw: called.append(kw) or MockResult(),
+        "agam.installer.run_install",
+        lambda answers, **kw: called.append(kw) or MockResult(),
     )
-
-    rc = cli.main(["init", "--force"])
+    rc = cli.main(["init", "--target", "cursor"])
     assert rc == 0
-    assert called[0]["force"] is True
+    assert called[0]["targets"] == ["cursor"]
 
 
 def test_cli_init_with_answers_yaml(monkeypatch, tmp_path):
@@ -96,38 +96,40 @@ def test_cli_init_with_answers_yaml(monkeypatch, tmp_path):
         "platform: mac\n"
         "container-mode: none\n"
         "bootstrap-now: false\n"
+        "targets:\n"
+        "  - cursor\n"
     )
 
-    called: list[dict] = []
+    captured: list = []
     monkeypatch.setattr(
-        "agam.installer.run_wizard",
-        lambda **kw: called.append(kw) or MockResult(),
+        "agam.installer.run_install",
+        lambda answers, **kw: captured.append((answers, kw)) or MockResult(),
     )
 
     rc = cli.main(["init", "--answers", str(answers_path)])
     assert rc == 0
-    assert called[0]["answers"]["name"] == "Alice"
-    assert called[0]["answers"]["projects-dir"] == "/tmp"
+    answers, kw = captured[0]
+    assert answers["name"] == "Alice"
+    assert kw["targets"] == ["cursor"]  # honored targets: from YAML
 
 
 def test_cli_init_chains_bootstrap_when_bootstrap_now_true(monkeypatch, tmp_path):
     """If the wizard captures bootstrap_now=True, init must auto-invoke
-    the bootstrap command. Without this wire-up the wizard question is
-    cosmetic and users have to run a second command anyway."""
+    the bootstrap command."""
     from agam import cli
 
     monkeypatch.setenv("HOME", str(tmp_path))
     answers = _MockAnswers(name="Alice", bootstrap_now=True, projects_dir=str(tmp_path))
     monkeypatch.setattr(
-        "agam.installer.run_wizard",
-        lambda **kw: MockResult(answers=answers),
+        "agam.installer.run_install",
+        lambda a, **kw: MockResult(answers=answers),
     )
 
     bootstrap_calls: list[object] = []
     monkeypatch.setattr("agam.cli._cmd_bootstrap", lambda ns: bootstrap_calls.append(ns) or 0)
     monkeypatch.setattr("agam.cli._launchctl_bootstrap", lambda paths: None)
 
-    rc = cli.main(["init"])
+    rc = cli.main(["init", "--target", "claude"])
     assert rc == 0
     assert bootstrap_calls, "bootstrap_now=True must trigger _cmd_bootstrap"
     ns = bootstrap_calls[0]
@@ -139,25 +141,21 @@ def test_cli_init_chains_bootstrap_when_bootstrap_now_true(monkeypatch, tmp_path
 def test_cli_init_does_not_chain_bootstrap_when_bootstrap_now_false(
     monkeypatch, tmp_path
 ):
-    """The default (bootstrap_now=False) must NOT trigger bootstrap.
-
-    Otherwise users who decline during the wizard would still get billed
-    for an unwanted scan.
-    """
+    """The default (bootstrap_now=False) must NOT trigger bootstrap."""
     from agam import cli
 
     monkeypatch.setenv("HOME", str(tmp_path))
     answers = _MockAnswers(name="Alice", bootstrap_now=False)
     monkeypatch.setattr(
-        "agam.installer.run_wizard",
-        lambda **kw: MockResult(answers=answers),
+        "agam.installer.run_install",
+        lambda a, **kw: MockResult(answers=answers),
     )
 
     bootstrap_calls: list[object] = []
     monkeypatch.setattr("agam.cli._cmd_bootstrap", lambda ns: bootstrap_calls.append(ns) or 0)
     monkeypatch.setattr("agam.cli._launchctl_bootstrap", lambda paths: None)
 
-    rc = cli.main(["init"])
+    rc = cli.main(["init", "--target", "claude"])
     assert rc == 0
     assert not bootstrap_calls, "bootstrap must NOT fire when user declined"
 
@@ -165,12 +163,12 @@ def test_cli_init_does_not_chain_bootstrap_when_bootstrap_now_false(
 def test_cli_init_returns_1_on_systemexit(monkeypatch):
     from agam import cli
 
-    def raiser(**kw):
+    def raiser(a, **kw):
         raise SystemExit("refusing to overwrite")
 
-    monkeypatch.setattr("agam.installer.run_wizard", raiser)
+    monkeypatch.setattr("agam.installer.run_install", raiser)
 
-    rc = cli.main(["init"])
+    rc = cli.main(["init", "--target", "claude"])
     assert rc == 1
 
 
