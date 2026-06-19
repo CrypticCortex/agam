@@ -55,6 +55,7 @@ def test_session_end_enqueues_real_work(tmp_path, tools_dir):
     entry = json.loads(queue.read_text().strip())
     assert entry["session_id"] == "sess-1"
     assert entry["context"] == "cursor"
+    assert entry["agent"] == "cursor"
     assert entry["transcript_path"].endswith("transcript_with_tools.jsonl")
 
 

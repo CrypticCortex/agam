@@ -509,13 +509,27 @@ def cmd_render_rule(max_entities=12):
 
     db = get_db()
     if db:
+        def _source_agent(name):
+            """Provenance tag for an entity, e.g. ' (cursor)'. Empty if unknown."""
+            try:
+                r = db.execute(
+                    """SELECT p.value FROM properties p
+                       JOIN entities e ON p.entity_id = e.id
+                       WHERE e.name = ? AND p.key = 'source-agent' LIMIT 1""",
+                    (name,),
+                ).fetchone()
+            except sqlite3.Error:
+                return ""
+            val = (r["value"] if r and hasattr(r, "keys") else (r[0] if r else "")) or ""
+            return f" ({val})" if val and val != "unknown" else ""
+
         ents = recently_active_entities(db, max_entities)
         if ents:
             lines.append("")
             lines.append("## Hot context (recent knowledge-graph state)")
             for e in ents:
                 desc = (e.get("description") or "")[:100]
-                lines.append(f"- {e['name']} [{e['type']}]: {desc}")
+                lines.append(f"- {e['name']} [{e['type']}]{_source_agent(e['name'])}: {desc}")
         try:
             lessons = db.execute(
                 """SELECT e.name, e.description
@@ -532,7 +546,7 @@ def cmd_render_rule(max_entities=12):
             for row in lessons:
                 nm = row["name"] if hasattr(row, "keys") else row[0]
                 desc = (row["description"] if hasattr(row, "keys") else row[1]) or ""
-                lines.append(f"- {nm}: {desc[:100]}")
+                lines.append(f"- {nm}{_source_agent(nm)}: {desc[:100]}")
         db.close()
 
     lines.append("")

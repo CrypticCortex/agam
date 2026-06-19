@@ -20,6 +20,7 @@ def enqueue(
     transcript_path: str,
     cwd: str,
     context: str,
+    agent: str = "unknown",
 ):
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -27,6 +28,7 @@ def enqueue(
         "transcript_path": transcript_path,
         "cwd": cwd,
         "context": context,
+        "agent": agent,
         "ts": time.time(),
     }
     with open(queue_path, "a") as f:
@@ -60,6 +62,7 @@ def replace_for_session(
     transcript_path: str,
     cwd: str,
     context: str,
+    agent: str = "unknown",
 ):
     """Remove any existing queue rows for this session_id, then append one fresh row.
     Atomic: holds an exclusive lock on the queue for the entire read-filter-write.
@@ -70,6 +73,7 @@ def replace_for_session(
         "transcript_path": transcript_path,
         "cwd": cwd,
         "context": context,
+        "agent": agent,
         "ts": time.time(),
     }
     with open(queue_path, "a+") as f:

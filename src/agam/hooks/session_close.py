@@ -98,6 +98,7 @@ def run(hook_input: dict, *, transcripts_root: pathlib.Path, queue_path: pathlib
         transcript_path=_host_path(transcript_path),
         cwd=_host_path(cwd),
         context=context,
+        agent="claude",
     )
     return 0
 

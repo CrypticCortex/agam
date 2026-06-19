@@ -412,6 +412,7 @@ def main() -> int:
     sid = entry.get("session_id", "unknown")
     transcript = entry.get("transcript_path", "")
     cwd = entry.get("cwd", "")
+    agent = entry.get("agent", "unknown")
     project = pathlib.Path(cwd).name or "unknown"
 
     log(sid, "start", transcript=transcript, cwd=cwd)
@@ -422,7 +423,11 @@ def main() -> int:
         try:
             subprocess.run(
                 [str(graph_update)],
-                input=json.dumps({"session_id": sid, "transcript_path": transcript}),
+                input=json.dumps({
+                    "session_id": sid,
+                    "transcript_path": transcript,
+                    "agent": agent,
+                }),
                 text=True,
                 timeout=30,
                 check=False,
@@ -520,7 +525,11 @@ def main() -> int:
     # Step d: apply
     if proposals_path.exists():
         applier = TOOLS / "apply_proposals.py"
-        r = subprocess.run([str(applier), str(proposals_path)], timeout=30, capture_output=True, text=True)
+        r = subprocess.run(
+            [str(applier), str(proposals_path)],
+            timeout=30, capture_output=True, text=True,
+            env=dict(os.environ, AGAM_SOURCE_AGENT=agent),
+        )
         log(sid, "apply-done", rc=r.returncode, stdout=r.stdout.strip(), stderr=r.stderr.strip())
         try:
             proposals_path.unlink(missing_ok=True)

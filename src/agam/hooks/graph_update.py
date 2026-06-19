@@ -57,6 +57,12 @@ VAULT_DIR = Path(
     os.environ.get("AGAM_VAULT_DIR", os.path.expanduser("~/claude-knowledge-vault"))
 )
 
+# Which agent's session produced this update (claude | cursor | unknown). Set in
+# main() from the hook stdin ("agent") or the AGAM_SOURCE_AGENT env. Stamped as a
+# source-agent property on every entity touched, so a shared graph records which
+# agent taught each fact.
+SOURCE_AGENT = os.environ.get("AGAM_SOURCE_AGENT", "unknown")
+
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -80,6 +86,13 @@ def normalize_name(name):
     return s
 
 
+def _stamp_source_agent(db, name):
+    """Record which agent last taught this entity (no-op when agent unknown)."""
+    if not SOURCE_AGENT or SOURCE_AGENT == "unknown":
+        return
+    set_prop(db, name, "source-agent", SOURCE_AGENT)
+
+
 def ensure_entity(db, name, etype, desc=""):
     """Insert or update entity. Returns entity id."""
     name = normalize_name(name)
@@ -92,6 +105,7 @@ def ensure_entity(db, name, etype, desc=""):
             )
         else:
             db.execute("UPDATE entities SET updated = ? WHERE id = ?", (now(), row[0]))
+        _stamp_source_agent(db, name)
         return row[0]
     else:
         cursor = db.execute(
@@ -107,6 +121,7 @@ def ensure_entity(db, name, etype, desc=""):
             )
         except Exception:
             pass
+        _stamp_source_agent(db, name)
         return eid
 
 
@@ -250,6 +265,10 @@ def main():
 
     data = json.load(sys.stdin)
     session_id = data.get("session_id", "unknown")
+
+    # Record the source agent for provenance stamping on entities.
+    global SOURCE_AGENT
+    SOURCE_AGENT = data.get("agent") or os.environ.get("AGAM_SOURCE_AGENT", "unknown")
 
     # Dedup: only run once per session
     flag = os.path.join(tempfile.gettempdir(), f"graph-update-{session_id}")

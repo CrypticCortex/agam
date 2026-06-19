@@ -17,6 +17,19 @@ from datetime import date
 AGAM_HOME = pathlib.Path(
     os.environ.get("AGAM_HOME", os.path.expanduser("~/.claude/agam"))
 )
+
+# Which agent's session produced these proposals (claude | cursor | unknown).
+# Stamped onto lesson/insight/correction bodies + the SUVADU audit trail so a
+# shared brain records provenance.
+SOURCE_AGENT = os.environ.get("AGAM_SOURCE_AGENT", "unknown")
+
+
+def _agent_suffix() -> str:
+    return f" (via {SOURCE_AGENT})" if SOURCE_AGENT and SOURCE_AGENT != "unknown" else ""
+
+
+def _agent_tag() -> str:
+    return f" [{SOURCE_AGENT}]" if SOURCE_AGENT and SOURCE_AGENT != "unknown" else ""
 # Memory dir lives under the projects directory's per-CWD slug, e.g.
 # ``~/.claude/projects/-home-alice-coding-foo/memory/``. Claude Code creates
 # the slug itself per active CWD; if not yet present we fall back to a
@@ -235,23 +248,23 @@ def apply_proposals(proposals: dict, *, agam_md: pathlib.Path, thisai_md: pathli
             text = agam_md.read_text()
             for l in proposals.get("lesson", []):
                 try:
-                    text = _append_lesson(text, l["body"])
+                    text = _append_lesson(text, l["body"].rstrip() + _agent_suffix())
                     applied["lessons"] += 1
-                    suvadu_lines.append(f"{today} | AGAM.md | Added lesson: {l.get('title', '')}")
+                    suvadu_lines.append(f"{today} | AGAM.md | Added lesson: {l.get('title', '')}{_agent_tag()}")
                 except ApplyError as e:
                     errors.append(f"lesson '{l.get('title')}': {e}")
             for ins in proposals.get("insight", []):
                 try:
-                    text = _append_insight_or_correction(text, ins["body"])
+                    text = _append_insight_or_correction(text, ins["body"].rstrip() + _agent_suffix())
                     applied["insights"] += 1
-                    suvadu_lines.append(f"{today} | AGAM.md | Added insight: {ins.get('title', '')}")
+                    suvadu_lines.append(f"{today} | AGAM.md | Added insight: {ins.get('title', '')}{_agent_tag()}")
                 except ApplyError as e:
                     errors.append(f"insight '{ins.get('title')}': {e}")
             for c in proposals.get("correction", []):
                 try:
-                    text = _append_insight_or_correction(text, c["body"])
+                    text = _append_insight_or_correction(text, c["body"].rstrip() + _agent_suffix())
                     applied["corrections"] += 1
-                    suvadu_lines.append(f"{today} | AGAM.md | Added correction: {c.get('title', '')}")
+                    suvadu_lines.append(f"{today} | AGAM.md | Added correction: {c.get('title', '')}{_agent_tag()}")
                 except ApplyError as e:
                     errors.append(f"correction '{c.get('title')}': {e}")
             agam_md.write_text(text)

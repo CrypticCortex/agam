@@ -88,6 +88,7 @@ def main() -> int:
             transcript_path=transcript,
             cwd=workspace,
             context="cursor",
+            agent="cursor",
         )
     except Exception:
         pass  # never block session close on enqueue failure
