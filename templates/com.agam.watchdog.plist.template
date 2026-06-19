@@ -37,6 +37,8 @@
     <string>{{AGAM_HOME}}/work-log.md</string>
     <key>AGAM_KG_PATH</key>
     <string>{{AGAM_KG_PATH}}</string>
+    <key>AGAM_GRAPH_ONLY</key>
+    <string>{{AGAM_GRAPH_ONLY}}</string>
     <key>PATH</key>
     <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
   </dict>

@@ -263,6 +263,12 @@ def fill(template: pathlib.Path, **vars: str) -> str:
 # standalone on a host with no Claude installed.
 LLM_CLI = os.environ.get("AGAM_LLM_CLI", "claude")
 
+# Graph-only mode: do the deterministic graph_update and skip the LLM layer
+# (work-log + agam-sync). Set this where the agent CLI can't write files in
+# headless mode (e.g. host `claude -p`), so we enrich the graph without burning
+# tokens on model calls that can't persist their output.
+GRAPH_ONLY = os.environ.get("AGAM_GRAPH_ONLY", "").strip() == "1"
+
 
 def run_claude(prompt: str, *, model: str, timeout: int) -> subprocess.CompletedProcess:
     """Run the enrichment prompt through whichever agent CLI is available.
@@ -441,11 +447,14 @@ def main() -> int:
 
     log(sid, "start", transcript=transcript, cwd=cwd)
 
-    # Step a: graph-update (pure Python, no LLM)
+    # Step a: graph-update (pure Python, no LLM). This is the durable enrichment
+    # floor -- it writes entities/relationships + source-agent provenance with no
+    # model call, so it works even on a host where `claude -p` can't write files.
     graph_update = HOOKS / "graph_update.py"
+    graph_update_ok = False
     if graph_update.exists():
         try:
-            subprocess.run(
+            r = subprocess.run(
                 [str(graph_update)],
                 input=json.dumps({
                     "session_id": sid,
@@ -456,11 +465,18 @@ def main() -> int:
                 timeout=30,
                 check=False,
             )
-            log(sid, "graph-update-done")
+            graph_update_ok = (r.returncode == 0)
+            log(sid, "graph-update-done", rc=r.returncode)
         except subprocess.TimeoutExpired:
             log(sid, "graph-update-timeout")
     else:
         log(sid, "graph-update-missing")
+
+    # Graph-only mode stops here: deterministic enrichment done, skip the LLM
+    # layer entirely (no token spend).
+    if GRAPH_ONLY:
+        log(sid, "graph-only-done", graph_update_ok=graph_update_ok)
+        return 0 if graph_update_ok else 1
 
     today = time.strftime("%Y-%m-%d")
     now = time.strftime("%H:%M")
@@ -566,10 +582,15 @@ def main() -> int:
         subprocess.Popen([str(lint), "--quick"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log(sid, "lint-fired")
 
-    if work_log_ok and sync_ok:
-        log(sid, "done")
+    # Graph enrichment is the floor: if it succeeded, the session is processed
+    # even when the LLM layer (work-log / agam-sync) could not run (e.g. host
+    # claude -p without file-write tools). The LLM layer is best-effort on top.
+    if graph_update_ok or (work_log_ok and sync_ok):
+        log(sid, "done", graph_update_ok=graph_update_ok,
+            work_log_ok=work_log_ok, sync_ok=sync_ok)
         return 0
-    log(sid, "partial", work_log_ok=work_log_ok, sync_ok=sync_ok)
+    log(sid, "partial", graph_update_ok=graph_update_ok,
+        work_log_ok=work_log_ok, sync_ok=sync_ok)
     return 1
 
 

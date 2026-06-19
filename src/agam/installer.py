@@ -688,12 +688,16 @@ def _commit_kg(src_db: Path, dst_db: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_neutral_plist(home: Path, agam_home: Path) -> Path | None:
+def _render_neutral_plist(
+    home: Path, agam_home: Path, *, graph_only: bool = False
+) -> Path | None:
     """Render + write the watchdog plist pointing at the shared ~/.agam home.
 
     Returns the written path, or None on non-mac (caller decides whether to
     load it). The watchdog runs from the shared hooks/tools copy under ~/.agam,
-    so a single launchd job serves every wired agent.
+    so a single launchd job serves every wired agent. ``graph_only`` pins
+    AGAM_GRAPH_ONLY so the drain does deterministic graph enrichment without
+    LLM calls (useful where headless `claude -p` can't write files).
     """
     launch_agents = home / "Library" / "LaunchAgents"
     launch_agents.mkdir(parents=True, exist_ok=True)
@@ -705,6 +709,7 @@ def _render_neutral_plist(home: Path, agam_home: Path) -> Path | None:
         .replace("{{AGAM_HOOKS_DIR}}", str(agam_home / "hooks"))
         .replace("{{AGAM_TOOLS_DIR}}", str(agam_home / "tools" / "agam"))
         .replace("{{AGAM_KG_PATH}}", str(agam_home / "knowledge" / "graph.db"))
+        .replace("{{AGAM_GRAPH_ONLY}}", "1" if graph_only else "0")
     )
     out = launch_agents / "com.agam.watchdog.plist"
     out.write_text(text, encoding="utf-8")
