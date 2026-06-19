@@ -34,6 +34,31 @@ def test_pending_queue_default_agent(tmp_path):
     assert entry["agent"] == "unknown"
 
 
+def test_enqueue_file_writes_per_session(tmp_path):
+    from agam.tools import pending_queue as pq
+
+    qdir = tmp_path / "queue"
+    target = pq.enqueue_file(
+        qdir, session_id="abc-123", transcript_path="/t.jsonl", cwd="/w",
+        context="cursor", agent="cursor",
+    )
+    assert target == qdir / "abc-123.json"
+    entry = json.loads(target.read_text().strip())
+    assert entry["agent"] == "cursor"
+    assert entry["session_id"] == "abc-123"
+
+
+def test_enqueue_file_idempotent_per_session(tmp_path):
+    from agam.tools import pending_queue as pq
+
+    qdir = tmp_path / "queue"
+    pq.enqueue_file(qdir, session_id="s", transcript_path="/a", cwd="/w", context="cursor", agent="cursor")
+    pq.enqueue_file(qdir, session_id="s", transcript_path="/b", cwd="/w", context="cursor", agent="cursor")
+    files = list(qdir.glob("*.json"))
+    assert len(files) == 1  # same session overwrites, no pile-up
+    assert json.loads(files[0].read_text())["transcript_path"] == "/b"
+
+
 def test_apply_proposals_tags_lesson(tmp_path, monkeypatch):
     from agam.tools import apply_proposals as ap
 
@@ -81,6 +106,8 @@ def _make_full_kg(path):
 
 
 def test_graph_update_stamps_source_agent(tmp_path):
+    import uuid
+    sid = f"prov-{uuid.uuid4().hex}"  # unique: avoid the /tmp dedup flag
     kg = tmp_path / "graph.db"
     _make_full_kg(kg)
 
@@ -105,7 +132,7 @@ def test_graph_update_stamps_source_agent(tmp_path):
     }
     r = subprocess.run(
         [sys.executable, str(GRAPH_UPDATE)],
-        input=json.dumps({"session_id": "s1", "transcript_path": str(transcript), "agent": "cursor"}),
+        input=json.dumps({"session_id": sid, "transcript_path": str(transcript), "agent": "cursor"}),
         capture_output=True, text=True, env=env, timeout=30,
     )
     assert r.returncode == 0, r.stderr

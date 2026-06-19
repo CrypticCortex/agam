@@ -50,9 +50,9 @@ def test_session_end_enqueues_real_work(tmp_path, tools_dir):
         {"AGAM_DATA_HOME": str(data_home), "AGAM_TOOLS_DIR": str(tools_dir)},
     )
     assert r.returncode == 0, r.stderr
-    queue = data_home / ".pending-closes.jsonl"
-    assert queue.exists()
-    entry = json.loads(queue.read_text().strip())
+    queue_file = data_home / "queue" / "sess-1.json"
+    assert queue_file.exists()
+    entry = json.loads(queue_file.read_text().strip())
     assert entry["session_id"] == "sess-1"
     assert entry["context"] == "cursor"
     assert entry["agent"] == "cursor"
@@ -72,7 +72,7 @@ def test_session_end_skips_trivial(tmp_path, tools_dir):
         {"AGAM_DATA_HOME": str(data_home), "AGAM_TOOLS_DIR": str(tools_dir)},
     )
     assert r.returncode == 0, r.stderr
-    assert not (data_home / ".pending-closes.jsonl").exists()
+    assert not (data_home / "queue").exists()
 
 
 def test_session_end_no_transcript_is_noop(tmp_path, tools_dir):
@@ -84,7 +84,7 @@ def test_session_end_no_transcript_is_noop(tmp_path, tools_dir):
         {"AGAM_DATA_HOME": str(data_home), "AGAM_TOOLS_DIR": str(tools_dir)},
     )
     assert r.returncode == 0
-    assert not (data_home / ".pending-closes.jsonl").exists()
+    assert not (data_home / "queue").exists()
 
 
 def _seed_kg(path):

@@ -48,16 +48,22 @@ CONTAINER_PATTERN="${AGAM_CONTAINER_PATTERN:-claude-code}"
 CONTAINER_NAME_OVERRIDE="${AGAM_CONTAINER_NAME:-}"
 
 probe_host() {
-    # 0 = healthy, 1 = unhealthy. Writes detail to global PROBE_DETAIL.
-    # Only requires ``claude`` on PATH. macOS host stores OAuth in Keychain,
-    # so a credentials.json file may not exist even when auth works. Real
-    # auth failures surface when claude -p actually runs.
-    if ! command -v claude >/dev/null 2>&1; then
-        PROBE_DETAIL="claude CLI not on PATH"
-        return 1
+    # 0 = healthy, 1 = unhealthy. Writes detail to global PROBE_DETAIL and the
+    # chosen LLM CLI to AGAM_LLM_CLI. Prefer claude; fall back to cursor-agent
+    # so a Cursor-only host (no claude installed) can still enrich the graph.
+    # Auth lives in each tool's own store; real auth failures surface at run.
+    if command -v claude >/dev/null 2>&1; then
+        AGAM_LLM_CLI="claude"
+        PROBE_DETAIL="host claude on PATH"
+        return 0
     fi
-    PROBE_DETAIL="host claude on PATH"
-    return 0
+    if command -v cursor-agent >/dev/null 2>&1; then
+        AGAM_LLM_CLI="cursor-agent"
+        PROBE_DETAIL="host cursor-agent on PATH (claude absent)"
+        return 0
+    fi
+    PROBE_DETAIL="neither claude nor cursor-agent on PATH"
+    return 1
 }
 
 probe_named_container() {
@@ -97,6 +103,7 @@ probe_pattern_container() {
 INVOKER_KIND=""
 INVOKER_DETAIL=""
 DISCOVERED=""
+AGAM_LLM_CLI="${AGAM_LLM_CLI:-claude}"
 declare -a FAILURES=()
 
 try_container_pin() {
@@ -185,6 +192,7 @@ run_entry() {
                 AGAM_PROMPTS_DIR="${AGAM_PROMPTS_DIR:-$AGAM_HOME/prompts}" \
                 AGAM_KG_PATH="${AGAM_KG_PATH:-$HOME/.claude/knowledge/graph.db}" \
                 AGAM_USER_ENTITY="${AGAM_USER_ENTITY:-User}" \
+                AGAM_LLM_CLI="$AGAM_LLM_CLI" \
                 "$HOOKS_DIR_RESOLVED/agam_watchdog_inner.py" < "$entry_file"
             ;;
         container|named-container)

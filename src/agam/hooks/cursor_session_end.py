@@ -80,10 +80,13 @@ def main() -> int:
 
     session_id = data.get("session_id") or data.get("conversation_id") or "cursor-unknown"
     workspace = _workspace_root(data)
-    queue_path = _data_home() / ".pending-closes.jsonl"
+    # File-per-session queue under ~/.agam/queue -- drained host-mode by
+    # agam_watchdog.sh. This is Cursor's standalone enrichment path; it does not
+    # touch Claude's .pending-closes.jsonl flow.
+    queue_dir = _data_home() / "queue"
     try:
-        pq.replace_for_session(
-            queue_path,
+        pq.enqueue_file(
+            queue_dir,
             session_id=session_id,
             transcript_path=transcript,
             cwd=workspace,

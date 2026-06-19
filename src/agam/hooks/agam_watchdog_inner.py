@@ -258,7 +258,28 @@ def fill(template: pathlib.Path, **vars: str) -> str:
     return text
 
 
+# Which LLM CLI drives enrichment. Set by agam_watchdog.sh's host probe:
+# "claude" when on PATH, else "cursor-agent". Lets Cursor enrich the graph
+# standalone on a host with no Claude installed.
+LLM_CLI = os.environ.get("AGAM_LLM_CLI", "claude")
+
+
 def run_claude(prompt: str, *, model: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run the enrichment prompt through whichever agent CLI is available.
+
+    claude: prompt on stdin, --model honored (haiku/sonnet slugs).
+    cursor-agent: prompt as a positional arg, --force for headless file writes.
+      Cursor uses its own model names, so we let it pick its default rather than
+      passing a claude-specific slug.
+    """
+    if LLM_CLI == "cursor-agent":
+        return subprocess.run(
+            ["cursor-agent", "-p", "--force", "--output-format", "text", prompt],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
     return subprocess.run(
         [
             "claude", "-p", "--disable-slash-commands",
