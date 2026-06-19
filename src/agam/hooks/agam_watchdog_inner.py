@@ -280,13 +280,16 @@ def run_claude(prompt: str, *, model: str, timeout: int) -> subprocess.Completed
             timeout=timeout,
             check=False,
         )
+    # Pass the prompt as a positional argument, not stdin. Host `claude -p`
+    # rejects piped stdin in some builds ("Input must be provided ... when using
+    # --print"); the positional form works on host and in containers alike.
     return subprocess.run(
         [
-            "claude", "-p", "--disable-slash-commands",
+            "claude", "-p", prompt,
+            "--disable-slash-commands",
             "--permission-mode", "acceptEdits",
             "--model", model,
         ],
-        input=prompt,
         text=True,
         capture_output=True,
         timeout=timeout,

@@ -33,6 +33,8 @@
     <string>{{AGAM_HOOKS_DIR}}</string>
     <key>AGAM_PROMPTS_DIR</key>
     <string>{{AGAM_HOME}}/prompts</string>
+    <key>AGAM_WORK_LOG</key>
+    <string>{{AGAM_HOME}}/work-log.md</string>
     <key>AGAM_KG_PATH</key>
     <string>{{AGAM_KG_PATH}}</string>
     <key>PATH</key>

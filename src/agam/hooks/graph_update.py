@@ -296,9 +296,10 @@ def main():
         transcript = f.read()
 
     # Skip trivial sessions. Count Claude ("type":"user") and Cursor
-    # ("role":"user") user turns -- the rest of the extraction below is raw-text
-    # regex and works for either transcript shape.
-    user_turns = transcript.count('"type":"user"') + transcript.count('"role":"user"')
+    # ("role":"user") user turns. Whitespace-tolerant so both compact and
+    # pretty-printed JSONL count correctly. The rest of the extraction below is
+    # raw-text regex and works for either transcript shape.
+    user_turns = len(re.findall(r'"(?:type|role)"\s*:\s*"user"', transcript))
     if user_turns < 3:
         sys.exit(0)
 
