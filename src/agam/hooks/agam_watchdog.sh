@@ -175,13 +175,17 @@ run_entry() {
             # NOT ~/.claude/tools/). Without these the inner script raises
             # FileNotFoundError calling apply_proposals.py and every queued
             # session ends up in queue-errors/.
+            # Resolve dirs from env (the launchd plist sets these to the shared
+            # ~/.agam location). Fall back to the legacy ~/.claude layout only
+            # when nothing is set, so old installs keep working pre-upgrade.
+            HOOKS_DIR_RESOLVED="${AGAM_HOOKS_DIR:-$HOME/.claude/hooks}"
             env AGAM_HOME="$AGAM_HOME" \
                 AGAM_TOOLS_DIR="${AGAM_TOOLS_DIR:-$HOME/.claude/tools/agam}" \
-                AGAM_HOOKS_DIR="${AGAM_HOOKS_DIR:-$HOME/.claude/hooks}" \
+                AGAM_HOOKS_DIR="$HOOKS_DIR_RESOLVED" \
                 AGAM_PROMPTS_DIR="${AGAM_PROMPTS_DIR:-$AGAM_HOME/prompts}" \
                 AGAM_KG_PATH="${AGAM_KG_PATH:-$HOME/.claude/knowledge/graph.db}" \
                 AGAM_USER_ENTITY="${AGAM_USER_ENTITY:-User}" \
-                "$HOME/.claude/hooks/agam_watchdog_inner.py" < "$entry_file"
+                "$HOOKS_DIR_RESOLVED/agam_watchdog_inner.py" < "$entry_file"
             ;;
         container|named-container)
             # Inside the container, ~/.claude is bind-mounted at

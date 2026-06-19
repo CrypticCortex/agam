@@ -1,0 +1,5 @@
+{"role": "user", "message": {"content": [{"type": "text", "text": "<timestamp>Friday, Jun 19, 2026, 12:58 PM (UTC+5:30)</timestamp>\n<user_query>\nhi\n</user_query>"}]}}
+{"type": "turn_ended", "status": "error", "error": "Model not available Anthropic has removed access to this model for all customers."}
+{"role": "user", "message": {"content": [{"type": "text", "text": "<timestamp>Friday, Jun 19, 2026, 12:58 PM (UTC+5:30)</timestamp>\n<user_query>\nhi\n</user_query>"}]}}
+{"role": "assistant", "message": {"content": [{"type": "text", "text": "Hi! What can I help you with today?"}]}}
+{"type": "turn_ended", "status": "success"}

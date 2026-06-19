@@ -256,21 +256,31 @@ def main():
     if os.path.exists(flag):
         sys.exit(0)
 
-    # Find latest transcript
-    transcripts = sorted(
-        glob.glob(str(SESSIONS_DIR / "**" / "*.jsonl"), recursive=True),
-        key=os.path.getmtime,
-    )
-    if not transcripts:
-        sys.exit(0)
+    # Resolve the transcript to scan. Cursor passes an explicit transcript_path
+    # (and stores transcripts in a different tree), so honor it when present.
+    # Claude's legacy path globs the sessions dir for the most recent file.
+    transcript_path = data.get("transcript_path", "")
+    if transcript_path and os.path.exists(transcript_path):
+        target = transcript_path
+    else:
+        transcripts = sorted(
+            glob.glob(str(SESSIONS_DIR / "**" / "*.jsonl"), recursive=True),
+            key=os.path.getmtime,
+        )
+        if not transcripts:
+            sys.exit(0)
+        target = transcripts[-1]
 
     # Read transcript (only last 50KB to stay fast)
-    with open(transcripts[-1]) as f:
-        f.seek(max(0, os.path.getsize(transcripts[-1]) - 50000))
+    with open(target, errors="replace") as f:
+        f.seek(max(0, os.path.getsize(target) - 50000))
         transcript = f.read()
 
-    # Skip trivial sessions
-    if transcript.count('"type":"user"') < 3:
+    # Skip trivial sessions. Count Claude ("type":"user") and Cursor
+    # ("role":"user") user turns -- the rest of the extraction below is raw-text
+    # regex and works for either transcript shape.
+    user_turns = transcript.count('"type":"user"') + transcript.count('"role":"user"')
+    if user_turns < 3:
         sys.exit(0)
 
     db = get_db()
