@@ -323,6 +323,23 @@ def _error_count() -> int:
     return n
 
 
+def _daily_cap() -> int:
+    """The watchdog's MAX_PER_DAY. Honors AGAM_MAX_PER_DAY, else parses the
+    personal watchdog script, else a conservative default."""
+    env = os.environ.get("AGAM_MAX_PER_DAY")
+    if env and env.isdigit():
+        return int(env)
+    wd = HOOKS_DIR / "agam-watchdog.sh"
+    if wd.exists():
+        try:
+            m = re.search(r"^MAX_PER_DAY=(\d+)", wd.read_text(), re.M)
+            if m:
+                return int(m.group(1))
+        except OSError:
+            pass
+    return 8
+
+
 def _today_growth() -> int:
     rows = _kg_query(
         "SELECT COUNT(*) FROM entities WHERE created LIKE ?",
@@ -359,7 +376,8 @@ def render_overview() -> Text:
         daycap_n = int(daycap_file.read_text().strip()) if daycap_file.exists() else 0
     except (ValueError, OSError):
         daycap_n = 0
-    cap_left = max(0, 8 - daycap_n)
+    cap = _daily_cap()
+    cap_left = max(0, cap - daycap_n)
 
     last = _last_drain_ts()
     last_age = (time.time() - last) if last else None
@@ -387,7 +405,7 @@ def render_overview() -> Text:
         row("stale", f"{stale_n}  (prunable -- queue tab, D)", "orange3")
     row("in-flight", "draining now" if _draining() else "idle",
         "green" if _draining() else "grey50")
-    row("daily cap", f"{cap_left}/8 left",
+    row("daily cap", f"{cap_left}/{cap} left",
         "red" if cap_left == 0 else ("orange3" if cap_left <= 2 else "green"))
     if last_age is None:
         row("last drain", "(none seen)", "orange3")
