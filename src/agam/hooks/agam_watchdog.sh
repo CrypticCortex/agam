@@ -23,7 +23,7 @@
 #   AGAM_CONTAINER_NAME    exact name override
 set -u
 
-AGAM_HOME="${AGAM_HOME:-$HOME/.claude/agam}"
+AGAM_HOME="${AGAM_HOME:-${AGAM_DATA_HOME:-$HOME/.agam}}"
 LOG="$AGAM_HOME/logs/watchdog.log"
 LOCK="$AGAM_HOME/.watchdog.lock"
 mkdir -p "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" "$AGAM_HOME/queue-errors"

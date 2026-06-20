@@ -227,11 +227,20 @@ def _watchdog_sync_status():
 
     log_path = AGAM_HOME / ".watchdog-log"
     queue_path = AGAM_HOME / ".pending-closes.jsonl"
+    queue_dir = AGAM_HOME / "queue"
 
+    # Post-migration the queue is file-per-session under queue/; the legacy
+    # .pending-closes.jsonl may still hold rows for the container watchdog.
+    # Count both so the boot status reflects reality.
     queue_depth = 0
+    if queue_dir.exists():
+        try:
+            queue_depth += sum(1 for _ in queue_dir.glob("*.json"))
+        except OSError:
+            pass
     if queue_path.exists():
         try:
-            queue_depth = sum(1 for line in queue_path.read_text().splitlines() if line.strip())
+            queue_depth += sum(1 for line in queue_path.read_text().splitlines() if line.strip())
         except OSError:
             pass
 

@@ -379,7 +379,7 @@ def apply_proposals(proposals: dict, *, agam_md: pathlib.Path, thisai_md: pathli
                 target_kg = pathlib.Path(
                     os.environ.get(
                         "AGAM_KG_PATH",
-                        os.path.expanduser("~/.claude/knowledge/graph.db"),
+                        os.path.expanduser("~/.agam/knowledge/graph.db"),
                     )
                 )
             for ob in obsoletes:

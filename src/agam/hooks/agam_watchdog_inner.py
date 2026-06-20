@@ -37,7 +37,9 @@ from collections import deque
 HOME = pathlib.Path(os.path.expanduser("~"))
 
 AGAM_HOME = pathlib.Path(
-    os.environ.get("AGAM_HOME", str(HOME / ".claude" / "agam"))
+    os.environ.get("AGAM_HOME")
+    or os.environ.get("AGAM_DATA_HOME")
+    or str(HOME / ".agam")
 )
 PROMPTS = pathlib.Path(
     os.environ.get("AGAM_PROMPTS_DIR", str(AGAM_HOME / "prompts"))

@@ -49,12 +49,12 @@ def agam_hook_entries(hooks_dir: Path) -> dict[str, list[dict[str, Any]]]:
         # Cheap, fire-and-forget: refresh the .cursor/rules/agam.mdc digest and
         # do a best-effort heuristic graph update with whatever is on disk.
         "stop": [
-            {"command": str(hooks_dir / "cursor_stop.py")},
+            {"command": str(hooks_dir / "cursor_stop.py"), "timeout": 30},
         ],
         # Authoritative: at session end the transcript is fully flushed, so this
         # is where we gate + enqueue for the watchdog's LLM pass.
         "sessionEnd": [
-            {"command": str(hooks_dir / "cursor_session_end.py")},
+            {"command": str(hooks_dir / "cursor_session_end.py"), "timeout": 30},
         ],
     }
 

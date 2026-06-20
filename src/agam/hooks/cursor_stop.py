@@ -84,10 +84,19 @@ def main() -> int:
     env = dict(os.environ)
     env.setdefault("AGAM_HOME", str(data_home))
     env.setdefault("AGAM_KG_PATH", str(data_home / "knowledge" / "graph.db"))
+    # Prefer `uv run --script` so agam_context.py's own PEP 723 dep block is
+    # honored (sys.executable here is this hook's ephemeral uv venv, which would
+    # not resolve a future dependency of the target script). Fall back to the
+    # current interpreter when uv isn't on PATH.
+    import shutil
+    uv = shutil.which("uv")
+    cmd = (
+        [uv, "run", "--script", str(context_tool), "render-rule"]
+        if uv else [sys.executable, str(context_tool), "render-rule"]
+    )
     try:
         r = subprocess.run(
-            [sys.executable, str(context_tool), "render-rule"],
-            capture_output=True, text=True, timeout=10, env=env,
+            cmd, capture_output=True, text=True, timeout=20, env=env,
         )
     except (subprocess.TimeoutExpired, OSError):
         print("{}")

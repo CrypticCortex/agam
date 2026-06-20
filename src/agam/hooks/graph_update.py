@@ -71,8 +71,12 @@ def now():
 def get_db():
     if not DB_PATH.exists():
         sys.exit(0)
-    db = sqlite3.connect(str(DB_PATH), timeout=2)
+    # 15s busy timeout (was 2s): a second writer -- e.g. the watchdog draining
+    # while an interactive Stop hook writes -- waits for the WAL lock instead of
+    # erroring out and dropping the enrichment.
+    db = sqlite3.connect(str(DB_PATH), timeout=15)
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=15000")
     db.execute("PRAGMA foreign_keys=ON")
     return db
 
@@ -108,11 +112,20 @@ def ensure_entity(db, name, etype, desc=""):
         _stamp_source_agent(db, name)
         return row[0]
     else:
-        cursor = db.execute(
-            "INSERT INTO entities (name, type, description, created, updated) VALUES (?, ?, ?, ?, ?)",
-            (name, etype, desc, now(), now())
-        )
-        eid = cursor.lastrowid
+        try:
+            cursor = db.execute(
+                "INSERT INTO entities (name, type, description, created, updated) VALUES (?, ?, ?, ?, ?)",
+                (name, etype, desc, now(), now())
+            )
+            eid = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            # Concurrent writer inserted the same name between our SELECT and
+            # INSERT. Re-fetch and treat as an update rather than crashing.
+            row = db.execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchone()
+            if not row:
+                raise
+            _stamp_source_agent(db, name)
+            return row[0]
         # Sync FTS
         try:
             db.execute(
