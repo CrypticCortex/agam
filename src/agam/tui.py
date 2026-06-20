@@ -36,6 +36,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -79,11 +80,26 @@ TOOLS_DIR = _env_path("AGAM_TOOLS", HOME / ".claude" / "tools")
 
 QUEUE_PATH = AGAM / ".pending-closes.jsonl"
 ARCHIVE_PATH = AGAM / ".pending-closes.archive.jsonl"
-# Neutral shared data home (Cursor + OSS). The shared watchdog drains a
-# file-per-session queue here; the TUI surfaces it alongside the legacy
-# .pending-closes.jsonl so both agents' pending sessions are visible.
-DATA_HOME = _env_path("AGAM_DATA_HOME", HOME / ".agam")
+
+
+def _cursor_home() -> Path:
+    """Cursor's operational home (file-per-session queue + processed/errors/log).
+    Honors AGAM_DATA_HOME, else the re-homed ~/.claude/cursor-agam, else the
+    legacy neutral ~/.agam."""
+    env = os.environ.get("AGAM_DATA_HOME")
+    if env:
+        return Path(os.path.expanduser(env))
+    for cand in (HOME / ".claude" / "cursor-agam", HOME / ".agam"):
+        if cand.exists():
+            return cand
+    return HOME / ".claude" / "cursor-agam"
+
+
+DATA_HOME = _cursor_home()
 NEW_QUEUE_DIR = DATA_HOME / "queue"
+CURSOR_PROCESSED = DATA_HOME / "processed"
+CURSOR_ERRORS = DATA_HOME / "queue-errors"
+CURSOR_WLOG = DATA_HOME / "logs" / "watchdog.log"
 PROCESSED = AGAM / ".processed-sessions.jsonl"
 WLOG = AGAM / ".watchdog-log"
 LINT = AGAM / ".lint-findings.md"
@@ -273,100 +289,129 @@ def _queue_state(entries: list[dict]) -> list[dict]:
 
 # ---- panel renderers ----------------------------------------------------
 
+def _last_drain_ts() -> float | None:
+    """Most recent successful drain across BOTH pipelines: the personal jsonl
+    watchdog-log and the cursor text watchdog.log."""
+    best = None
+    for e in reversed(_tail_jsonl(WLOG, 120)):
+        if e.get("event") in ("done", "work-log-appended", "agam-sync-done"):
+            best = e.get("ts")
+            break
+    if CURSOR_WLOG.exists():
+        try:
+            for line in reversed(CURSOR_WLOG.read_text(errors="replace").splitlines()):
+                if line.startswith("[") and (" ok " in line or "drain-done" in line):
+                    iso = line[1:line.index("]")].replace("Z", "+00:00")
+                    ts = datetime.fromisoformat(iso).timestamp()
+                    best = ts if best is None else max(best, ts)
+                    break
+        except (ValueError, OSError):
+            pass
+    return best
+
+
+def _draining() -> bool:
+    """A drain is in flight if either pipeline holds its single-flight lock."""
+    return (AGAM / ".watchdog.lock.d").exists() or (DATA_HOME / ".watchdog.lock").exists()
+
+
+def _error_count() -> int:
+    n = 0
+    for d in (CURSOR_ERRORS, AGAM / "queue-errors"):
+        if d.exists() and d.is_dir():
+            n += sum(1 for _ in d.glob("*.json"))
+    return n
+
+
+def _today_growth() -> int:
+    rows = _kg_query(
+        "SELECT COUNT(*) FROM entities WHERE created LIKE ?",
+        (time.strftime("%Y-%m-%d") + "%",),
+    )
+    return rows[0][0] if rows else 0
+
+
+def _invoker() -> tuple[str, str]:
+    """(label, color): can the watchdog drain right now?"""
+    if _container_name():
+        return ("container", "green")
+    if shutil.which("claude") or shutil.which("cursor-agent"):
+        return ("host", "green")
+    return ("none", "red")
+
+
 def render_overview() -> Text:
-    queue = _read_queue()
-    queue_states = _queue_state(queue)
-    queue_counts = Counter(q["_state"] for q in queue_states)
+    # --- gather the vital signs (cheap) ---
+    states = _queue_state(_read_queue())
+    pending = [s for s in states if "done" not in s["_state"]]
+    # Actionable = will actually be drained (ready/waiting). Stale/missing are
+    # cruft (>48h old, or transcript gone) -- counting them as "queue" is the
+    # noise we're killing. Surface them separately as prunable.
+    actionable = [s for s in pending if "ready" in s["_state"] or "waiting" in s["_state"]]
+    stale_n = len(pending) - len(actionable)
+    qn = len(actionable)
+    ready = sum(1 for s in actionable if "ready" in s["_state"])
+    waiting = sum(1 for s in actionable if "waiting" in s["_state"])
+    oldest = max((s["_age"] for s in actionable), default=0)
 
     daycap_file = AGAM / f".daycap-{time.strftime('%Y-%m-%d')}"
     try:
         daycap_n = int(daycap_file.read_text().strip()) if daycap_file.exists() else 0
     except (ValueError, OSError):
         daycap_n = 0
+    cap_left = max(0, 8 - daycap_n)
 
-    container = _container_name()
-    log_events = _tail_jsonl(WLOG, 80)
-    last_drain = None
-    for e in reversed(log_events):
-        if e.get("event") in ("done", "work-log-appended", "agam-sync-done"):
-            last_drain = e.get("ts")
-            break
-    last_drain_str = _age_str(time.time() - last_drain) + " ago" if last_drain else "(none seen)"
+    last = _last_drain_ts()
+    last_age = (time.time() - last) if last else None
+    errors = _error_count()
+    inv_label, inv_color = _invoker()
 
     ent = _kg_query("SELECT COUNT(*) FROM entities")
-    rel = _kg_query("SELECT COUNT(*) FROM relationships")
-    types = _kg_query("SELECT type, COUNT(*) c FROM entities GROUP BY type ORDER BY c DESC LIMIT 6")
+    total = ent[0][0] if ent else 0
+    growth = _today_growth()
+    prov = {a: c for a, c in _provenance_counts()}
 
-    text = Text()
+    t = Text()
 
-    text.append("WATCHDOG\n", style="bold yellow")
-    container_color = "green" if container else "red"
-    text.append("  container     ", style="grey50")
-    text.append(f"{container or '(none) — press c to start'}\n", style=container_color)
-    text.append("  queue depth   ", style="grey50")
-    text.append(f"{len(queue)}\n", style="yellow")
-    text.append("  daycap        ", style="grey50")
-    daycap_color = "red" if daycap_n >= 8 else ("orange3" if daycap_n >= 6 else "green")
-    text.append(f"{daycap_n}/8 ", style=daycap_color)
-    text.append(_bar(daycap_n, 8, 16) + "\n", style="grey50")
-    text.append("  last drain    ", style="grey50")
-    text.append(f"{last_drain_str}\n\n", style="yellow")
+    def row(label: str, value: str, color: str) -> None:
+        t.append(f"  {label:13}", style="grey50")
+        t.append(f"{value}\n", style=color)
 
-    text.append("QUEUE BREAKDOWN\n", style="bold yellow")
-    if queue_counts:
-        max_n = max(queue_counts.values())
-        for state, n in sorted(queue_counts.items(), key=lambda x: -x[1]):
-            color = "green" if "ready" in state else ("orange3" if "stale" in state else "grey50")
-            text.append(f"  {state:12}", style=color)
-            text.append(_bar(n, max_n, 18) + " ", style=color)
-            text.append(f"{n}\n", style="yellow")
+    t.append("PIPELINE\n", style="bold yellow")
+    row(
+        "queue",
+        f"{qn} active" + (f"   ({ready} ready, {waiting} waiting)" if qn else ""),
+        "green" if qn == 0 else ("red" if qn > 25 else "yellow"),
+    )
+    if stale_n:
+        row("stale", f"{stale_n}  (prunable -- queue tab, D)", "orange3")
+    row("in-flight", "draining now" if _draining() else "idle",
+        "green" if _draining() else "grey50")
+    row("daily cap", f"{cap_left}/8 left",
+        "red" if cap_left == 0 else ("orange3" if cap_left <= 2 else "green"))
+    if last_age is None:
+        row("last drain", "(none seen)", "orange3")
     else:
-        text.append("  empty\n", style="grey50")
-    text.append("\n")
-
-    text.append("KNOWLEDGE GRAPH\n", style="bold yellow")
-    if ent:
-        n_ent = ent[0][0]
-        n_rel = rel[0][0]
-        text.append(f"  {n_ent}", style="bold yellow")
-        text.append(" entities  ", style="grey50")
-        text.append(f"{n_rel}", style="bold yellow")
-        text.append(" relationships\n", style="grey50")
-        if types:
-            max_count = types[0][1]
-            for type_name, count in types:
-                text.append(f"  {type_name:12} ", style="grey50")
-                text.append(_bar(count, max_count, 20) + " ", style="yellow3")
-                text.append(f"{count}\n", style="yellow")
-    text.append("\n")
-
-    text.append("PROVENANCE (source-agent)\n", style="bold yellow")
-    prov = _provenance_counts()
-    if prov:
-        max_p = max(c for _, c in prov)
-        for agent, count in prov:
-            color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
-            text.append(f"  {agent:12} ", style="grey50")
-            text.append(_bar(count, max_p, 18) + " ", style=color)
-            text.append(f"{count}\n", style=color)
+        row("last drain", f"{_age_str(last_age)} ago",
+            "green" if last_age < 7200 else ("orange3" if last_age < 86400 else "red"))
+    if qn:
+        oc = "green" if oldest < 3600 else ("orange3" if oldest < 21600 else "red")
+        row("oldest wait", _age_str(oldest), oc)
     else:
-        text.append("  (no entities)\n", style="grey50")
-    text.append("\n")
+        row("oldest wait", "-", "grey50")
+    row("errors", str(errors), "green" if errors == 0 else "red")
+    row("invoker", inv_label, inv_color)
 
-    text.append("IDENTITY FILES\n", style="bold yellow")
-    for name, path in [("AGAM.md", AGAM_MD), ("THISAI.md", THISAI), ("MUGAM.md", MUGAM), ("SUVADU.md", SUVADU)]:
-        if path.exists():
-            age_h = (time.time() - path.stat().st_mtime) / 3600
-            color = "green" if age_h < 48 else ("orange3" if age_h < 168 else "red")
-            lines = sum(1 for _ in path.open())
-            text.append(f"  {name:12} ", style="grey50")
-            text.append(f"{_age_str(time.time() - path.stat().st_mtime)} ago  ", style=color)
-            text.append(f"{lines} lines\n", style="grey50")
-        else:
-            text.append(f"  {name:12} ", style="grey50")
-            text.append("missing\n", style="red")
-
-    return text
+    t.append("\nBRAIN\n", style="bold yellow")
+    t.append(f"  {total}", style="bold magenta")
+    t.append(" memories", style="grey50")
+    if growth:
+        t.append(f"   +{growth} today", style="green")
+    t.append("\n  ", style="grey50")
+    t.append(f"claude {prov.get('claude', 0)}", style="yellow3")
+    t.append(" \u00b7 ", style="grey50")
+    t.append(f"cursor {prov.get('cursor', 0)}\n", style="cyan")
+    return t
 
 
 def render_activity() -> Text:
