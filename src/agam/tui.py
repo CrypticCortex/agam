@@ -509,11 +509,16 @@ class DetailScreen(ModalScreen):
 # ---- animated brain bar -------------------------------------------------
 
 class BrainBar(Static):
-    """Top bar: an animated ASCII brain showing which agents feed the shared
-    graph, pulsing as memory flows in. Right-aligned, refreshes counts every
-    10s and animates every ~0.45s."""
+    """Top-right panel: an animated ASCII brain. The gyri (~/folds) shimmer like
+    neural firing, the core pulses, and each wired agent feeds a pulse into the
+    brain. Counts refresh every 10s; animation ticks every 0.5s.
 
-    _CORES = ["( · )", "( ◦ )", "( ◉ )", "( ◦ )"]
+    NOTE: we drive content via ``update()`` -- do NOT override ``_render`` (that
+    is Textual's internal method and must return a Visual, not a rich Text)."""
+
+    _FOLDS = ["~", "\u2248", "\u223f", "\u2248"]   # ~ ≈ ∿ ≈ -- shimmering gyri
+    _CORES = ["\u25c9", "\u25ce", "\u25cf", "\u25ce"]  # ◉ ◎ ● ◎ -- pulsing core
+    _BW = 13  # brain box width (each art line centered to this)
 
     def on_mount(self) -> None:
         self._frame = 0
@@ -521,7 +526,7 @@ class BrainBar(Static):
         self._total = 0
         self._prov: dict = {}
         self._refresh_stats()
-        self.set_interval(0.45, self._animate)
+        self.set_interval(0.5, self._animate)
         self.set_interval(10.0, self._refresh_stats)
 
     def _refresh_stats(self) -> None:
@@ -535,48 +540,51 @@ class BrainBar(Static):
         ent = _kg_query("SELECT COUNT(*) FROM entities")
         self._total = ent[0][0] if ent else 0
         self._prov = {a: c for a, c in _provenance_counts()}
-        self.update(self._render())
+        self.update(self._build())
 
     def _animate(self) -> None:
         self._frame += 1
-        self.update(self._render())
+        self.update(self._build())
 
-    def _flow(self, width: int, toward_right: bool) -> str:
-        cells = ["·"] * width
-        pos = self._frame % width
-        cells[pos if toward_right else width - 1 - pos] = "●"
+    def _brain_lines(self) -> list[str]:
+        g = self._FOLDS[self._frame % 4]
+        c = self._CORES[self._frame % 4]
+        return [
+            '.-"""-.',
+            f"/{g}/{g}|{g}\\{g}\\",
+            f"|{g}( ({c}) ){g}|",
+            f"\\{g}\\{g}|{g}/{g}/",
+            "'-...-'",
+        ]
+
+    def _pulse(self, width: int) -> str:
+        cells = ["\u00b7"] * width      # ·····
+        cells[self._frame % width] = "\u25cf"  # ●
         return "".join(cells)
 
-    def _render(self) -> Text:
-        core = self._CORES[self._frame % len(self._CORES)]
-        claude_on = "claude" in self._agents
-        cursor_on = "cursor" in self._agents
+    def _build(self) -> Text:
+        brain = [ln.center(self._BW) for ln in self._brain_lines()]
+        left = ["", "", "", "", ""]
+        if "claude" in self._agents:
+            left[1] = ("claude ", "yellow3", self._pulse(4) + "\u25b8 ")  # ▸
+        if "cursor" in self._agents:
+            left[3] = ("cursor ", "cyan", self._pulse(4) + "\u25b8 ")
 
-        line1 = Text(justify="right")
-        if claude_on:
-            line1.append("claude ", style="yellow3")
-            line1.append(self._flow(5, True), style="green")
-            line1.append(" ╮ ", style="grey50")
-        line1.append(core, style="bold magenta")
-        line1.append(" agam", style="bold magenta")
-        if cursor_on:
-            line1.append(" ╭ ", style="grey50")
-            line1.append(self._flow(5, False), style="cyan")
-            line1.append(" cursor", style="cyan")
+        out = Text(justify="right")
+        for i, bl in enumerate(brain):
+            if left[i]:
+                label, style, pulse = left[i]
+                out.append(label, style=style)
+                out.append(pulse, style="green" if style == "yellow3" else "cyan")
+            out.append(bl + "\n", style="bold magenta")
 
         minds = len(self._agents)
         cn = self._prov.get("claude", 0)
         un = self._prov.get("cursor", 0)
-        line2 = Text(justify="right")
-        line2.append(f"{minds} mind{'s' if minds != 1 else ''} linked · {self._total} memories  ", style="grey50")
-        line2.append(f"claude {cn}", style="yellow3")
-        line2.append(" / ", style="grey50")
-        line2.append(f"cursor {un}", style="cyan")
-
-        out = Text()
-        out.append_text(line1)
-        out.append("\n")
-        out.append_text(line2)
+        out.append(f"{minds} mind{'s' if minds != 1 else ''} \u00b7 {self._total} memories  ", style="grey50")
+        out.append(f"claude {cn}", style="yellow3")
+        out.append(" / ", style="grey50")
+        out.append(f"cursor {un}", style="cyan")
         return out
 
 
@@ -590,7 +598,7 @@ class AgamApp(App):
     Header { background: #0d1120; color: #e8a849; }
     #brain-bar {
         dock: top;
-        height: 2;
+        height: 7;
         padding: 0 2;
         background: #0d1120;
         color: #e8a849;
