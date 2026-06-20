@@ -506,6 +506,80 @@ class DetailScreen(ModalScreen):
         )
 
 
+# ---- animated brain bar -------------------------------------------------
+
+class BrainBar(Static):
+    """Top bar: an animated ASCII brain showing which agents feed the shared
+    graph, pulsing as memory flows in. Right-aligned, refreshes counts every
+    10s and animates every ~0.45s."""
+
+    _CORES = ["( · )", "( ◦ )", "( ◉ )", "( ◦ )"]
+
+    def on_mount(self) -> None:
+        self._frame = 0
+        self._agents: list[str] = []
+        self._total = 0
+        self._prov: dict = {}
+        self._refresh_stats()
+        self.set_interval(0.45, self._animate)
+        self.set_interval(10.0, self._refresh_stats)
+
+    def _refresh_stats(self) -> None:
+        home = Path.home()
+        agents = []
+        if (home / ".claude" / "settings.json").exists() or (home / ".claude" / "hooks").exists():
+            agents.append("claude")
+        if (home / ".cursor" / "hooks.json").exists():
+            agents.append("cursor")
+        self._agents = agents
+        ent = _kg_query("SELECT COUNT(*) FROM entities")
+        self._total = ent[0][0] if ent else 0
+        self._prov = {a: c for a, c in _provenance_counts()}
+        self.update(self._render())
+
+    def _animate(self) -> None:
+        self._frame += 1
+        self.update(self._render())
+
+    def _flow(self, width: int, toward_right: bool) -> str:
+        cells = ["·"] * width
+        pos = self._frame % width
+        cells[pos if toward_right else width - 1 - pos] = "●"
+        return "".join(cells)
+
+    def _render(self) -> Text:
+        core = self._CORES[self._frame % len(self._CORES)]
+        claude_on = "claude" in self._agents
+        cursor_on = "cursor" in self._agents
+
+        line1 = Text(justify="right")
+        if claude_on:
+            line1.append("claude ", style="yellow3")
+            line1.append(self._flow(5, True), style="green")
+            line1.append(" ╮ ", style="grey50")
+        line1.append(core, style="bold magenta")
+        line1.append(" agam", style="bold magenta")
+        if cursor_on:
+            line1.append(" ╭ ", style="grey50")
+            line1.append(self._flow(5, False), style="cyan")
+            line1.append(" cursor", style="cyan")
+
+        minds = len(self._agents)
+        cn = self._prov.get("claude", 0)
+        un = self._prov.get("cursor", 0)
+        line2 = Text(justify="right")
+        line2.append(f"{minds} mind{'s' if minds != 1 else ''} linked · {self._total} memories  ", style="grey50")
+        line2.append(f"claude {cn}", style="yellow3")
+        line2.append(" / ", style="grey50")
+        line2.append(f"cursor {un}", style="cyan")
+
+        out = Text()
+        out.append_text(line1)
+        out.append("\n")
+        out.append_text(line2)
+        return out
+
+
 # ---- the App ------------------------------------------------------------
 
 class AgamApp(App):
@@ -514,6 +588,14 @@ class AgamApp(App):
     CSS = """
     Screen { background: #080b14; }
     Header { background: #0d1120; color: #e8a849; }
+    #brain-bar {
+        dock: top;
+        height: 2;
+        padding: 0 2;
+        background: #0d1120;
+        color: #e8a849;
+        content-align: right top;
+    }
     Footer { background: #0d1120; color: #7a7a8a; }
     TabbedContent { background: #080b14; }
     TabPane { padding: 1 2; }
@@ -554,6 +636,7 @@ class AgamApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield BrainBar(id="brain-bar")
         with TabbedContent(initial="overview", id="tabs"):
             with TabPane("overview", id="overview"):
                 yield ScrollableContainer(
