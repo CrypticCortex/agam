@@ -32,6 +32,7 @@ Per-tab row bindings (DataTables):
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -516,9 +517,9 @@ class BrainBar(Static):
     NOTE: we drive content via ``update()`` -- do NOT override ``_render`` (that
     is Textual's internal method and must return a Visual, not a rich Text)."""
 
-    _FOLDS = ["~", "\u2248", "\u223f", "\u2248"]   # ~ ≈ ∿ ≈ -- shimmering gyri
-    _CORES = ["\u25c9", "\u25ce", "\u25cf", "\u25ce"]  # ◉ ◎ ● ◎ -- pulsing core
-    _BW = 13  # brain box width (each art line centered to this)
+    _W = 24            # brain pixel width
+    _H = 14            # brain pixel height (half-block packed -> 7 cell rows)
+    _BG = "#0d1120"    # panel background (empty pixels blend into this)
 
     def on_mount(self) -> None:
         self._frame = 0
@@ -526,7 +527,7 @@ class BrainBar(Static):
         self._total = 0
         self._prov: dict = {}
         self._refresh_stats()
-        self.set_interval(0.5, self._animate)
+        self.set_interval(0.4, self._animate)
         self.set_interval(10.0, self._refresh_stats)
 
     def _refresh_stats(self) -> None:
@@ -546,37 +547,79 @@ class BrainBar(Static):
         self._frame += 1
         self.update(self._build())
 
-    def _brain_lines(self) -> list[str]:
-        g = self._FOLDS[self._frame % 4]
-        c = self._CORES[self._frame % 4]
-        return [
-            '.-"""-.',
-            f"/{g}/{g}|{g}\\{g}\\",
-            f"|{g}( ({c}) ){g}|",
-            f"\\{g}\\{g}|{g}/{g}/",
-            "'-...-'",
-        ]
+    def _mask(self) -> list[list[bool]]:
+        """Procedural brain silhouette: two hemispheres, central fissure, gyri
+        grooves that slowly migrate (neural firing). Returns H rows of W bools."""
+        W, H = self._W, self._H
+        phase = self._frame * 0.12
+        out = []
+        for py in range(H):
+            ny = (py + 0.5) / H * 2 - 1
+            row = []
+            for px in range(W):
+                nx = (px + 0.5) / W * 2 - 1
+                ax = abs(nx)
+                env = 0.90 + 0.07 * math.sin(ax * 10.0) + (0.05 * math.sin(ax * 16.0) if ny < 0 else 0)
+                inside = (nx * nx) / 0.9604 + (ny * ny) / 0.64 < env
+                if ny > 0.68:
+                    inside = inside and ax < 0.45          # flat base / stem
+                if inside and ax > 0.10 and abs(math.sin(ax * 7.5 + ny * 3.2 + phase)) < 0.17:
+                    inside = False                          # sulci grooves
+                if ax < 0.045 and ny < 0.66:
+                    inside = False                          # central fissure
+                row.append(inside)
+            out.append(row)
+        return out
 
-    def _pulse(self, width: int) -> str:
-        cells = ["\u00b7"] * width      # ·····
-        cells[self._frame % width] = "\u25cf"  # ●
-        return "".join(cells)
+    def _px_hex(self, px: int, py: int, pulse: float) -> str:
+        nx = (px + 0.5) / self._W * 2 - 1
+        ny = (py + 0.5) / self._H * 2 - 1
+        d = min(1.0, math.hypot(nx, ny / 0.85) / 1.05)      # 0 core -> 1 rim
+        core = (255, 45, 200)                                # magenta core
+        rim = (60, 110, 235)                                 # blue-cyan rim
+        r = core[0] + (rim[0] - core[0]) * d
+        g = core[1] + (rim[1] - core[1]) * d
+        b = core[2] + (rim[2] - core[2]) * d
+        bright = 0.55 + 0.45 * pulse * (1.0 - 0.45 * d)       # core breathes brightest
+        return f"#{int(r*bright):02x}{int(g*bright):02x}{int(b*bright):02x}"
+
+    def _agent_row(self, idx: int):
+        """Synapse packet feeding the brain, for the cell row `idx`."""
+        spec = None
+        if idx == 2 and "claude" in self._agents:
+            spec = ("claude ", "yellow3", "green")
+        elif idx == 4 and "cursor" in self._agents:
+            spec = ("cursor ", "cyan", "cyan")
+        if not spec:
+            return None
+        label, label_style, pulse_style = spec
+        track = ["\u00b7"] * 5
+        track[self._frame % 5] = "\u25cf"      # ● packet travels in
+        seg = Text()
+        seg.append(label, style=label_style)
+        seg.append("".join(track) + "\u25b8 ", style=pulse_style)  # ▸
+        return seg
 
     def _build(self) -> Text:
-        brain = [ln.center(self._BW) for ln in self._brain_lines()]
-        left = ["", "", "", "", ""]
-        if "claude" in self._agents:
-            left[1] = ("claude ", "yellow3", self._pulse(4) + "\u25b8 ")  # ▸
-        if "cursor" in self._agents:
-            left[3] = ("cursor ", "cyan", self._pulse(4) + "\u25b8 ")
-
+        m = self._mask()
+        pulse = 0.5 + 0.5 * math.sin(self._frame * 0.4)
         out = Text(justify="right")
-        for i, bl in enumerate(brain):
-            if left[i]:
-                label, style, pulse = left[i]
-                out.append(label, style=style)
-                out.append(pulse, style="green" if style == "yellow3" else "cyan")
-            out.append(bl + "\n", style="bold magenta")
+        for r in range(self._H // 2):
+            line = Text()
+            ag = self._agent_row(r)
+            if ag is not None:
+                line.append_text(ag)
+            top_row, bot_row = m[2 * r], m[2 * r + 1]
+            for x in range(self._W):
+                top, bot = top_row[x], bot_row[x]
+                if not top and not bot:
+                    line.append(" ")
+                    continue
+                fg = self._px_hex(x, 2 * r + 1, pulse) if bot else self._BG
+                bgc = self._px_hex(x, 2 * r, pulse) if top else self._BG
+                line.append("\u2584", style=f"{fg} on {bgc}")   # ▄ lower half block
+            out.append_text(line)
+            out.append("\n")
 
         minds = len(self._agents)
         cn = self._prov.get("claude", 0)
@@ -598,7 +641,7 @@ class AgamApp(App):
     Header { background: #0d1120; color: #e8a849; }
     #brain-bar {
         dock: top;
-        height: 7;
+        height: 8;
         padding: 0 2;
         background: #0d1120;
         color: #e8a849;
