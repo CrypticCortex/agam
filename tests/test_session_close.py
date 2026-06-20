@@ -45,6 +45,16 @@ def _snapshot_real():
     }
 
 
+def _queue_entries(agam_home):
+    """Read all file-per-session queue entries under $AGAM_HOME/queue."""
+    qdir = agam_home / "queue"
+    return [json.loads(p.read_text()) for p in sorted(qdir.glob("*.json"))]
+
+
+def _not_enqueued(agam_home):
+    return not list((agam_home / "queue").glob("*.json"))
+
+
 def _assert_real_untouched(snapshots):
     assert _mtime(REAL_KG) == snapshots["kg"], "Real graph.db was modified"
     assert _mtime(REAL_AGAM_MD) == snapshots["agam_md"], "Real AGAM.md was modified"
@@ -109,7 +119,7 @@ def test_short_session_does_not_enqueue(hook_env, tmp_path):
     r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert "Traceback" not in r.stderr, r.stderr
-    assert not (agam_home / ".pending-closes.jsonl").exists()
+    assert _not_enqueued(agam_home)
     _assert_real_untouched(snapshots)
 
 
@@ -118,7 +128,7 @@ def test_no_edit_or_write_does_not_enqueue(hook_env, tmp_path):
     _write_transcript(sessions / "p1", human_turns=10, has_edit=False, signal=True, name="s1")
     r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    assert not (agam_home / ".pending-closes.jsonl").exists()
+    assert _not_enqueued(agam_home)
     _assert_real_untouched(snapshots)
 
 
@@ -127,7 +137,7 @@ def test_no_signal_keyword_does_not_enqueue(hook_env, tmp_path):
     _write_transcript(sessions / "p1", human_turns=10, has_edit=True, signal=False, name="s1")
     r = _run_hook(env, {"session_id": "s1", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    assert not (agam_home / ".pending-closes.jsonl").exists()
+    assert _not_enqueued(agam_home)
     _assert_real_untouched(snapshots)
 
 
@@ -140,9 +150,7 @@ def test_all_gates_pass_enqueues_with_host_context(hook_env, tmp_path):
         cwd=str(tmp_path),
     )
     assert r.returncode == 0, r.stderr
-    queue = agam_home / ".pending-closes.jsonl"
-    assert queue.exists(), r.stderr
-    entries = [json.loads(line) for line in queue.read_text().strip().splitlines()]
+    entries = _queue_entries(agam_home)
     assert len(entries) == 1
     assert entries[0]["session_id"] == "s-host"
     assert entries[0]["context"] == "host"
@@ -159,8 +167,7 @@ def test_devcontainer_cwd_detected_as_devcontainer_context(hook_env, tmp_path):
         cwd=str(tmp_path),
     )
     assert r.returncode == 0, r.stderr
-    queue = agam_home / ".pending-closes.jsonl"
-    entries = [json.loads(line) for line in queue.read_text().strip().splitlines()]
+    entries = _queue_entries(agam_home)
     assert entries[0]["context"] == "devcontainer"
     _assert_real_untouched(snapshots)
 
@@ -169,7 +176,7 @@ def test_no_transcripts_exits_cleanly(hook_env, tmp_path):
     env, _sessions, agam_home, snapshots = hook_env
     r = _run_hook(env, {"session_id": "s", "cwd": "/"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    assert not (agam_home / ".pending-closes.jsonl").exists()
+    assert _not_enqueued(agam_home)
     _assert_real_untouched(snapshots)
 
 
@@ -189,8 +196,7 @@ def test_picks_transcript_matching_session_id_not_latest_mtime(hook_env, tmp_pat
 
     r = _run_hook(env, {"session_id": "my-sid", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    queue = agam_home / ".pending-closes.jsonl"
-    entries = [json.loads(line) for line in queue.read_text().strip().splitlines()]
+    entries = _queue_entries(agam_home)
     assert len(entries) == 1
     assert entries[0]["session_id"] == "my-sid"
     assert entries[0]["transcript_path"].endswith("my-sid.jsonl")
@@ -205,7 +211,7 @@ def test_skips_enqueue_when_no_matching_transcript(hook_env, tmp_path):
     )
     r = _run_hook(env, {"session_id": "missing-sid", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    assert not (agam_home / ".pending-closes.jsonl").exists()
+    assert _not_enqueued(agam_home)
     _assert_real_untouched(snapshots)
 
 
@@ -220,8 +226,7 @@ def test_enqueue_normalizes_cwd_to_host_view(hook_env, tmp_path):
         cwd=str(tmp_path),
     )
     assert r.returncode == 0, r.stderr
-    queue = agam_home / ".pending-closes.jsonl"
-    entries = [json.loads(line) for line in queue.read_text().strip().splitlines()]
+    entries = _queue_entries(agam_home)
     assert entries[0]["context"] == "devcontainer"
     assert entries[0]["cwd"] == "/Users/test/coding/bar"
     _assert_real_untouched(snapshots)
@@ -237,7 +242,7 @@ def test_uses_agam_home_and_sessions_dir_env_vars(hook_env, tmp_path):
     r = _run_hook(env, {"session_id": "s-env", "cwd": "/Users/test"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     # Queue must land under AGAM_HOME, not real ~/.claude/agam
-    assert (agam_home / ".pending-closes.jsonl").exists()
+    assert _queue_entries(agam_home)
     _assert_real_untouched(snapshots)
 
 
@@ -261,5 +266,5 @@ def test_queue_path_independent_of_sessions_dir(tmp_path):
     snapshots = _snapshot_real()
     r = _run_hook(env, {"session_id": "s-sep", "cwd": "/Users/test/coding/x"}, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    assert (agam_home / ".pending-closes.jsonl").exists()
+    assert _queue_entries(agam_home)
     _assert_real_untouched(snapshots)

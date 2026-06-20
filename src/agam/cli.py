@@ -728,6 +728,52 @@ def _kg_path() -> Path:
     return _home() / ".claude" / "knowledge" / "graph.db"
 
 
+def backfill_source_agent(kg_path: Path, agent: str) -> int:
+    """Stamp source-agent=<agent> on every entity that lacks the property.
+
+    Used to attribute the pre-existing graph (built before provenance existed)
+    to the incumbent agent, and idempotent thereafter -- already-tagged entities
+    (e.g. source-agent=cursor) are left alone. Returns the count tagged.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    if not kg_path.exists():
+        return 0
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(str(kg_path), timeout=10)
+    try:
+        cur = conn.execute(
+            """INSERT INTO properties (entity_id, key, value, updated)
+               SELECT e.id, 'source-agent', ?, ?
+               FROM entities e
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM properties p
+                   WHERE p.entity_id = e.id AND p.key = 'source-agent'
+               )""",
+            (agent, ts),
+        )
+        conn.commit()
+        return cur.rowcount if cur.rowcount is not None else 0
+    except sqlite3.OperationalError:
+        # Graph predates the expected schema (no entities/properties table).
+        # Nothing to backfill; don't fail the install.
+        return 0
+    finally:
+        conn.close()
+
+
+def _cmd_tag_source(args: argparse.Namespace) -> int:
+    """Backfill source-agent provenance on untagged entities."""
+    kg = _kg_path()
+    if not kg.exists():
+        print(f"[agam tag-source] no KG at {kg}.", file=sys.stderr)
+        return 1
+    n = backfill_source_agent(kg, args.agent)
+    print(f"[agam tag-source] tagged {n} untagged entit{'y' if n == 1 else 'ies'} as source-agent={args.agent}.")
+    return 0
+
+
 def _cmd_obsolete(args: argparse.Namespace) -> int:
     """Mark an entity as obsolete so graph_recall stops surfacing it.
 
@@ -1407,6 +1453,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Deep diagnostic checks. Use when something feels off.",
     )
     p_doc.set_defaults(func=_cmd_doctor)
+
+    # -- tag-source
+    p_tag = sub.add_parser(
+        "tag-source",
+        help="Backfill source-agent provenance on entities that lack it.",
+    )
+    p_tag.add_argument(
+        "--agent",
+        required=True,
+        choices=["claude", "cursor"],
+        help="Agent to attribute untagged entities to.",
+    )
+    p_tag.set_defaults(func=_cmd_tag_source)
 
     # -- obsolete
     p_obs = sub.add_parser(

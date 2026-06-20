@@ -73,7 +73,7 @@ def should_enqueue(transcript_content: str) -> bool:
     return True
 
 
-def run(hook_input: dict, *, transcripts_root: pathlib.Path, queue_path: pathlib.Path) -> int:
+def run(hook_input: dict, *, transcripts_root: pathlib.Path, queue_dir: pathlib.Path) -> int:
     session_id = hook_input.get("session_id", "unknown")
     cwd = hook_input.get("cwd", "")
 
@@ -92,8 +92,12 @@ def run(hook_input: dict, *, transcripts_root: pathlib.Path, queue_path: pathlib
         return 0
 
     context = detect_context(cwd)
-    pq.replace_for_session(
-        queue_path,
+    # File-per-session queue under $AGAM_HOME/queue -- the same host-mode queue
+    # the shared watchdog (agam_watchdog.sh) drains for Cursor. Unifying both
+    # agents here means one watchdog + one invoker cascade serves all scenarios
+    # (claude-only, cursor-only, both).
+    pq.enqueue_file(
+        queue_dir,
         session_id=session_id,
         transcript_path=_host_path(transcript_path),
         cwd=_host_path(cwd),
@@ -114,7 +118,7 @@ def main():
     rc = run(
         data,
         transcripts_root=transcripts_root,
-        queue_path=agam_home / ".pending-closes.jsonl",
+        queue_dir=agam_home / "queue",
     )
     sys.exit(rc)
 

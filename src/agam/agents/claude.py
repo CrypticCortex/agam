@@ -63,11 +63,16 @@ class ClaudeAgent(AgentTarget):
 
         merge_hooks_into_settings(self.hook_config_path(home), hooks_dir)
 
-        # Pin AGAM_DATA_HOME so Claude hooks read ~/.agam deterministically.
+        # Pin the shared-home env so Claude's hooks (recall, session_close,
+        # graph_update) read + enqueue against ~/.agam -- the same brain + queue
+        # the shared watchdog drains. Without AGAM_HOME the Stop hook would
+        # enqueue to ~/.claude/agam/queue, which the watchdog never reads.
         from agam.installer import _set_settings_env
 
+        agam_home = home / ".agam"
+        settings_path = self.hook_config_path(home)
+        _set_settings_env(settings_path, "AGAM_DATA_HOME", str(agam_home))
+        _set_settings_env(settings_path, "AGAM_HOME", str(agam_home))
         _set_settings_env(
-            self.hook_config_path(home),
-            "AGAM_DATA_HOME",
-            str(home / ".agam"),
+            settings_path, "AGAM_KG_PATH", str(agam_home / "knowledge" / "graph.db")
         )

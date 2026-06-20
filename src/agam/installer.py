@@ -779,6 +779,13 @@ def run_install(
         agam_home / "tools" / "agam", extra=[agent_copy.transcripts_src()]
     )
 
+    # Provenance backfill: a migrated graph was built entirely by Claude before
+    # provenance existed, so attribute its untagged entities to "claude". New
+    # writes carry their own source-agent. Idempotent + skips already-tagged.
+    if migration_status == "migrated":
+        from agam.cli import backfill_source_agent
+        backfill_source_agent(agam_home / "knowledge" / "graph.db", "claude")
+
     # Per-agent wiring.
     registry = {"claude": ClaudeAgent, "cursor": CursorAgent}
     installed: list[str] = []
