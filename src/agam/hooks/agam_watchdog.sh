@@ -184,6 +184,24 @@ case "$INVOKER_KIND" in
         ;;
 esac
 
+# Snapshot the knowledge graph before mutating it. Cursor host-mode enrichment
+# writes the shared graph; if a Claude container ever writes concurrently over a
+# bind mount the WAL guarantee can break, so a pre-drain backup makes any damage
+# recoverable. Keep the newest 5. Uses sqlite3 .backup (WAL-consistent) when
+# available, else a plain copy.
+if [[ ${#entries[@]} -gt 0 && -n "${AGAM_KG_PATH:-}" && -f "${AGAM_KG_PATH:-}" ]]; then
+    BK_DIR="$AGAM_HOME/backups"
+    mkdir -p "$BK_DIR"
+    BK="$BK_DIR/graph-predrain-$(date -u +%Y%m%dT%H%M%SZ).db"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$AGAM_KG_PATH" ".backup '$BK'" 2>/dev/null || cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
+    else
+        cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
+    fi
+    ls -1t "$BK_DIR"/graph-predrain-*.db 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+    log "pre-drain-backup $BK"
+fi
+
 run_entry() {
     local entry_file="$1"
     case "$INVOKER_KIND" in
