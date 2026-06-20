@@ -360,7 +360,9 @@ def _invoker() -> tuple[str, str]:
 def render_overview() -> Text:
     # --- gather the vital signs (cheap) ---
     states = _queue_state(_read_queue())
-    pending = [s for s in states if "done" not in s["_state"]]
+    # _queue_state appends "*" to the state for sessions already in
+    # .processed-sessions.jsonl -- those are done, never count them.
+    pending = [s for s in states if not s["_state"].endswith("*")]
     # Actionable = will actually be drained (ready/waiting). Stale/missing are
     # cruft (>48h old, or transcript gone) -- counting them as "queue" is the
     # noise we're killing. Surface them separately as prunable.
