@@ -689,7 +689,7 @@ def _commit_kg(src_db: Path, dst_db: Path) -> None:
 
 
 def _render_neutral_plist(
-    home: Path, agam_home: Path, *, graph_only: bool = False
+    home: Path, agam_home: Path, *, graph_only: bool = False, llm_cli_pin: str = ""
 ) -> Path | None:
     """Render + write the watchdog plist pointing at the shared ~/.agam home.
 
@@ -710,6 +710,7 @@ def _render_neutral_plist(
         .replace("{{AGAM_TOOLS_DIR}}", str(agam_home / "tools" / "agam"))
         .replace("{{AGAM_KG_PATH}}", str(agam_home / "knowledge" / "graph.db"))
         .replace("{{AGAM_GRAPH_ONLY}}", "1" if graph_only else "0")
+        .replace("{{AGAM_LLM_CLI_PIN}}", llm_cli_pin or "")
     )
     out = launch_agents / "com.agam.watchdog.plist"
     out.write_text(text, encoding="utf-8")

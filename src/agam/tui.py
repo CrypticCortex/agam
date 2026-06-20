@@ -78,6 +78,11 @@ TOOLS_DIR = _env_path("AGAM_TOOLS", HOME / ".claude" / "tools")
 
 QUEUE_PATH = AGAM / ".pending-closes.jsonl"
 ARCHIVE_PATH = AGAM / ".pending-closes.archive.jsonl"
+# Neutral shared data home (Cursor + OSS). The shared watchdog drains a
+# file-per-session queue here; the TUI surfaces it alongside the legacy
+# .pending-closes.jsonl so both agents' pending sessions are visible.
+DATA_HOME = _env_path("AGAM_DATA_HOME", HOME / ".agam")
+NEW_QUEUE_DIR = DATA_HOME / "queue"
 PROCESSED = AGAM / ".processed-sessions.jsonl"
 WLOG = AGAM / ".watchdog-log"
 LINT = AGAM / ".lint-findings.md"
@@ -213,6 +218,31 @@ def _kg_query(sql: str, params: tuple = ()) -> list:
         conn.close()
 
 
+def _read_queue() -> list[dict]:
+    """Merge both queue sources: legacy .pending-closes.jsonl (personal Claude
+    pipeline) + the file-per-session queue/*.json the shared watchdog drains
+    (Cursor + OSS). Each entry keeps its 'agent' tag where present."""
+    entries = list(_read_jsonl(QUEUE_PATH))
+    if NEW_QUEUE_DIR.exists():
+        for p in sorted(NEW_QUEUE_DIR.glob("*.json")):
+            try:
+                entries.append(json.loads(p.read_text()))
+            except (json.JSONDecodeError, OSError):
+                continue
+    return entries
+
+
+def _provenance_counts() -> list[tuple]:
+    """source-agent breakdown across the graph: [(agent, count), ...]."""
+    return _kg_query(
+        """SELECT COALESCE(p.value, '(untagged)') AS agent, COUNT(*) c
+           FROM entities e
+           LEFT JOIN properties p
+             ON p.entity_id = e.id AND p.key = 'source-agent'
+           GROUP BY agent ORDER BY c DESC"""
+    )
+
+
 def _queue_state(entries: list[dict]) -> list[dict]:
     processed = {e.get("session_id") for e in _read_jsonl(PROCESSED)}
     now = time.time()
@@ -243,7 +273,7 @@ def _queue_state(entries: list[dict]) -> list[dict]:
 # ---- panel renderers ----------------------------------------------------
 
 def render_overview() -> Text:
-    queue = _read_jsonl(QUEUE_PATH)
+    queue = _read_queue()
     queue_states = _queue_state(queue)
     queue_counts = Counter(q["_state"] for q in queue_states)
 
@@ -307,6 +337,19 @@ def render_overview() -> Text:
                 text.append(f"  {type_name:12} ", style="grey50")
                 text.append(_bar(count, max_count, 20) + " ", style="yellow3")
                 text.append(f"{count}\n", style="yellow")
+    text.append("\n")
+
+    text.append("PROVENANCE (source-agent)\n", style="bold yellow")
+    prov = _provenance_counts()
+    if prov:
+        max_p = max(c for _, c in prov)
+        for agent, count in prov:
+            color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
+            text.append(f"  {agent:12} ", style="grey50")
+            text.append(_bar(count, max_p, 18) + " ", style=color)
+            text.append(f"{count}\n", style=color)
+    else:
+        text.append("  (no entities)\n", style="grey50")
     text.append("\n")
 
     text.append("IDENTITY FILES\n", style="bold yellow")
@@ -426,7 +469,7 @@ def render_next_actions() -> Text:
             pass
     if _container_name() is None:
         suggestions.append(("no claude-code container", "press c to start"))
-    queue = _read_jsonl(QUEUE_PATH)
+    queue = _read_queue()
     if len(queue) > 25:
         suggestions.append((f"queue depth high ({len(queue)})", "switch to queue tab to inspect"))
     if LINT.exists():
@@ -734,12 +777,13 @@ class AgamApp(App):
 
     def _queue_row_detail(self) -> None:
         idx = self._queue_cursor_idx()
-        rows = _queue_state(_read_jsonl(QUEUE_PATH))
+        rows = _queue_state(_read_queue())
         if idx is None or idx >= len(rows):
             return
         e = rows[idx]
         body = Text()
         body.append("session_id     ", style="grey50"); body.append(f"{e.get('session_id','?')}\n", style="yellow")
+        body.append("agent          ", style="grey50"); body.append(f"{e.get('agent','?')}\n", style="yellow")
         body.append("transcript     ", style="grey50"); body.append(f"{e.get('transcript_path','?')}\n")
         body.append("cwd            ", style="grey50"); body.append(f"{e.get('cwd','?')}\n")
         body.append("context        ", style="grey50"); body.append(f"{e.get('context','?')}\n")
@@ -840,10 +884,11 @@ class AgamApp(App):
     def _populate_queue(self) -> None:
         table = self.query_one("#queue-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("idx", "state", "sid", "ctx", "age", "idle", "path")
-        rows = _queue_state(_read_jsonl(QUEUE_PATH))
+        table.add_columns("idx", "state", "sid", "agent", "ctx", "age", "idle", "path")
+        rows = _queue_state(_read_queue())
         for i, e in enumerate(rows):
             sid = (e.get("session_id") or "?")[:8]
+            agent = (e.get("agent") or "?")[:8]
             ctx = (e.get("context") or "?")[:10]
             tp = e.get("transcript_path", "?")
             short_path = "/".join(tp.split("/")[-2:])
@@ -853,10 +898,13 @@ class AgamApp(App):
                 "orange3" if "stale" in state else
                 "yellow" if "waiting" in state else "grey50"
             )
+            agent_color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
             table.add_row(
                 str(i),
                 Text(state, style=color),
-                sid, ctx,
+                sid,
+                Text(agent, style=agent_color),
+                ctx,
                 _age_str(e["_age"]),
                 _age_str(e["_idle"]) if e["_idle"] >= 0 else "?",
                 short_path,
@@ -891,7 +939,7 @@ class AgamApp(App):
     def _populate_lessons(self) -> None:
         table = self.query_one("#lessons-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("name", "armed", "description")
+        table.add_columns("name", "agent", "armed", "description")
         rows = _kg_query("""
             SELECT e.id, e.name, e.description FROM entities e
             WHERE e.type = 'lesson' ORDER BY e.updated DESC
@@ -901,10 +949,17 @@ class AgamApp(App):
                 "SELECT key FROM properties WHERE entity_id = ? AND key IN ('trigger_commands','trigger_errors','armed')",
                 (eid,),
             )
+            agent_row = _kg_query(
+                "SELECT value FROM properties WHERE entity_id = ? AND key = 'source-agent'",
+                (eid,),
+            )
+            agent = agent_row[0][0] if agent_row else "?"
+            agent_color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
             armed = "yes" if triggers else "—"
             short_desc = (desc or "").splitlines()[0][:80] if desc else ""
             table.add_row(
                 Text(name[:30], style="yellow"),
+                Text(agent, style=agent_color),
                 Text(armed, style="green" if armed == "yes" else "grey50"),
                 short_desc,
             )

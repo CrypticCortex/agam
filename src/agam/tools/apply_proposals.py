@@ -189,6 +189,81 @@ def _apply_obsolete(kg_path: pathlib.Path, name: str, reason: str = "") -> bool:
         conn.close()
 
 
+def _normalize_name(name: str) -> str:
+    """Slugify a lesson title into a stable kebab-case entity name."""
+    s = re.sub(r"([a-z])([A-Z])", r"\1-\2", name)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1-\2", s)
+    s = s.replace("_", "-").lower()
+    s = re.sub(r"[^a-z0-9-]", "-", s)
+    return re.sub(r"-+", "-", s).strip("-")[:60]
+
+
+def _write_lesson_entities(kg_path: pathlib.Path, items: list, etype: str,
+                           agent: str, today: str) -> int:
+    """Upsert lesson/insight/correction proposals as graph entities.
+
+    THIS is what makes lessons symbiotic across agents: a lesson written to the
+    shared graph (not just an agent-local AGAM.md) is surfaced by the other
+    agent's recall/digest. Each entity is tagged source-agent so provenance is
+    clear and the write is reversible. Best-effort: never raises.
+    """
+    if not items or not kg_path.exists():
+        return 0
+    import sqlite3
+    n = 0
+    try:
+        conn = sqlite3.connect(str(kg_path), timeout=10)
+    except sqlite3.Error:
+        return 0
+    try:
+        for item in items:
+            title = (item.get("title") or "").strip()
+            body = (item.get("body") or "").strip()
+            if not title:
+                continue
+            name = _normalize_name(title)
+            if not name:
+                continue
+            severity = (item.get("severity") or "medium").strip()
+            try:
+                row = conn.execute("SELECT id FROM entities WHERE name=?", (name,)).fetchone()
+                if row:
+                    eid = row[0]
+                    conn.execute(
+                        "UPDATE entities SET description=?, updated=? WHERE id=?",
+                        (body[:500], today, eid),
+                    )
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO entities (name, type, description, created, updated) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (name, etype, body[:500], today, today),
+                    )
+                    eid = cur.lastrowid
+                    try:
+                        conn.execute(
+                            "INSERT INTO entities_fts(rowid, name, type, description) "
+                            "VALUES (?, ?, ?, ?)",
+                            (eid, name, etype, body[:500]),
+                        )
+                    except sqlite3.Error:
+                        pass
+                for k, v in (("source-agent", agent), ("severity", severity)):
+                    if v and v != "unknown":
+                        conn.execute(
+                            "INSERT OR REPLACE INTO properties (entity_id, key, value, updated) "
+                            "VALUES (?, ?, ?, ?)",
+                            (eid, k, v, today),
+                        )
+                n += 1
+            except sqlite3.Error:
+                continue
+        conn.commit()
+    finally:
+        conn.close()
+    return n
+
+
 def apply_proposals(proposals: dict, *, agam_md: pathlib.Path, thisai_md: pathlib.Path,
                     suvadu_md: pathlib.Path, memory_dir: pathlib.Path,
                     kg_path: pathlib.Path | None = None,
@@ -268,6 +343,24 @@ def apply_proposals(proposals: dict, *, agam_md: pathlib.Path, thisai_md: pathli
                 except ApplyError as e:
                     errors.append(f"correction '{c.get('title')}': {e}")
             agam_md.write_text(text)
+
+            # Mirror lessons/insights/corrections into the shared graph as
+            # entities so the OTHER agent's recall/digest surfaces them. This is
+            # the symbiosis link: an AGAM.md file is agent-local, but a graph
+            # entity is shared. Tagged source-agent; best-effort.
+            #
+            # IMPORTANT: only write when a KG path is EXPLICITLY provided (arg or
+            # AGAM_KG_PATH env). No filesystem default -- a default would make
+            # unit tests that call apply_proposals() without a kg_path silently
+            # write into the real graph.
+            _env_kg = os.environ.get("AGAM_KG_PATH")
+            lesson_kg = kg_path or (pathlib.Path(_env_kg) if _env_kg else None)
+            if lesson_kg is not None:
+                for key, etype in (("lesson", "lesson"), ("insight", "insight"),
+                                   ("correction", "correction")):
+                    _write_lesson_entities(
+                        lesson_kg, proposals.get(key, []), etype, SOURCE_AGENT, today
+                    )
 
         # Obsoletion proposals operate on the KG, not on markdown files. The
         # ``obsolete`` proposal list is a flat list of ``{"name": ..., "reason": ...}``

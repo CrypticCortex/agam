@@ -52,6 +52,18 @@ probe_host() {
     # chosen LLM CLI to AGAM_LLM_CLI. Prefer claude; fall back to cursor-agent
     # so a Cursor-only host (no claude installed) can still enrich the graph.
     # Auth lives in each tool's own store; real auth failures surface at run.
+    #
+    # AGAM_LLM_CLI_PIN overrides the preference (e.g. pin cursor-agent on a host
+    # where claude -p can't write files headlessly).
+    if [[ -n "${AGAM_LLM_CLI_PIN:-}" ]]; then
+        if command -v "$AGAM_LLM_CLI_PIN" >/dev/null 2>&1; then
+            AGAM_LLM_CLI="$AGAM_LLM_CLI_PIN"
+            PROBE_DETAIL="pinned $AGAM_LLM_CLI_PIN on PATH"
+            return 0
+        fi
+        PROBE_DETAIL="pinned $AGAM_LLM_CLI_PIN not on PATH"
+        return 1
+    fi
     if command -v claude >/dev/null 2>&1; then
         AGAM_LLM_CLI="claude"
         PROBE_DETAIL="host claude on PATH"

@@ -417,7 +417,7 @@ After completing analysis, write a JSON file to {proposals_path} with this exact
   "thisai_projects": [{"name": "Project Name", "note": "progress note"}],
   "thisai_goals": [{"name": "Goal Name", "note": "progress note"}],
   "memory": [{"filename": "x.md", "type": "user|feedback|project|reference", "description": "hook", "content": "body"}],
-  "lesson": [{"title": "Short title", "body": "[lesson] **Title.** Explanation. Source: DATE session."}],
+  "lesson": [{"title": "Short title", "severity": "high|medium|low", "body": "[lesson] **Title.** Explanation. Source: DATE session."}],
   "insight": [{"title": "Short title", "body": "[insight] **Title.** Explanation. Source: DATE session."}],
   "correction": [{"title": "Short title", "body": "[correction] **Title** (DATE). Summary."}],
   "obsolete": [{"name": "entity-name", "reason": "why no longer current"}]

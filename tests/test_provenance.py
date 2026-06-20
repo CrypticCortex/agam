@@ -84,6 +84,42 @@ def test_apply_proposals_tags_lesson(tmp_path, monkeypatch):
     assert "[cursor]" in suvadu_md.read_text()
 
 
+def test_apply_proposals_creates_graph_lesson_entity(tmp_path, monkeypatch):
+    """The symbiosis link: a lesson proposal becomes a shared graph entity
+    tagged source-agent, not just agent-local markdown."""
+    from agam.tools import apply_proposals as ap
+
+    monkeypatch.setattr(ap, "SOURCE_AGENT", "cursor")
+    kg = tmp_path / "graph.db"
+    _make_full_kg(kg)
+
+    agam_md = tmp_path / "AGAM.md"
+    agam_md.write_text("## What I've Learned\n\n### Lessons\n\n")
+    proposals = {
+        "lesson": [{
+            "title": "Always use truststore in conda",
+            "severity": "high",
+            "body": "[lesson] **Truststore.** Use truststore for SSL in conda.",
+        }],
+    }
+    ap.apply_proposals(
+        proposals, agam_md=agam_md, thisai_md=tmp_path / "T.md",
+        suvadu_md=tmp_path / "S.md", memory_dir=tmp_path / "m", kg_path=kg,
+    )
+    conn = sqlite3.connect(str(kg))
+    ent = conn.execute(
+        "SELECT type FROM entities WHERE name='always-use-truststore-in-conda'"
+    ).fetchone()
+    props = dict(conn.execute(
+        """SELECT p.key, p.value FROM properties p JOIN entities e ON p.entity_id=e.id
+           WHERE e.name='always-use-truststore-in-conda'"""
+    ).fetchall())
+    conn.close()
+    assert ent is not None and ent[0] == "lesson"
+    assert props.get("source-agent") == "cursor"
+    assert props.get("severity") == "high"
+
+
 def test_apply_proposals_no_tag_when_unknown(tmp_path, monkeypatch):
     from agam.tools import apply_proposals as ap
 
