@@ -211,43 +211,129 @@ def merge_hooks(
 # ---------------------------------------------------------------------------
 
 
+def _guarded(script: Path) -> str:
+    """Wrap a hook script path so a missing file is a silent no-op.
+
+    Without this, a registered command that points at an absent script
+    errors on *every* matching event -- e.g. when a devcontainer inherits
+    the host's settings.json but not the host's ``~/.claude/hooks`` (agam
+    is host-only by design; the absolute host path simply doesn't exist
+    inside the container). The guard short-circuits to exit 0 in that case.
+
+    ``exec`` (not a plain call) is deliberate: when the script *is*
+    present it replaces the shell, so its real exit code propagates and
+    blocking hooks (PreToolUse) still block. The trailing ``|| true`` only
+    runs when ``exec`` was never reached -- i.e. the file is absent.
+    """
+    p = str(script)
+    return f'[ -x "{p}" ] && exec "{p}" || true'
+
+
 def _agam_hook_entries(hooks_dir: Path) -> dict[str, list[dict[str, Any]]]:
     """Return the canonical Agam hook registration map.
 
     ``hooks_dir`` is the directory where the installer wrote the Agam
-    hook scripts (typically ``~/.claude/hooks``). All commands are
-    absolute paths -- Claude Code resolves ``~`` itself, but absolute
-    paths are safer and unambiguous.
+    hook scripts (typically ``~/.claude/hooks``). Commands use absolute
+    host paths wrapped in an existence guard (see ``_guarded``) so a
+    partial install or a container that lacks the scripts degrades to a
+    no-op instead of erroring on every prompt.
     """
     hooks_dir = Path(hooks_dir)
     return {
         "UserPromptSubmit": [
-            {"command": str(hooks_dir / "graph_recall.py"), "matcher": ""},
+            {"command": _guarded(hooks_dir / "graph_recall.py"), "matcher": ""},
         ],
         "Stop": [
-            {"command": str(hooks_dir / "graph_update.py"), "matcher": ""},
-            {"command": str(hooks_dir / "session_close.py"), "matcher": ""},
+            {"command": _guarded(hooks_dir / "graph_update.py"), "matcher": ""},
+            {"command": _guarded(hooks_dir / "session_close.py"), "matcher": ""},
         ],
         "PreToolUse": [
             # Bash trigger -> command-pattern lessons (e.g. "pip install in conda").
             {
-                "command": str(hooks_dir / "lesson_activate.py"),
+                "command": _guarded(hooks_dir / "lesson_activate.py"),
                 "matcher": "Bash",
             },
             # Edit/Write/MultiEdit trigger -> file-path lessons (e.g. "mirror
             # this change into the repo"). Same script, different matcher.
             {
-                "command": str(hooks_dir / "lesson_activate.py"),
+                "command": _guarded(hooks_dir / "lesson_activate.py"),
                 "matcher": "Edit|Write|MultiEdit",
             },
         ],
         "PostToolUse": [
             {
-                "command": str(hooks_dir / "lesson_activate_post.py"),
+                "command": _guarded(hooks_dir / "lesson_activate_post.py"),
                 "matcher": "Bash",
             },
         ],
     }
+
+
+def _legacy_agam_commands(hooks_dir: Path) -> set[str]:
+    """Bare (unguarded) command strings written by pre-guard installs.
+
+    Earlier versions registered each hook as the raw absolute script path.
+    Those entries error on every event when the file is absent (e.g. a
+    devcontainer that inherited the host settings.json). We strip them on
+    re-merge so the guarded form supersedes them instead of sitting beside
+    a still-broken duplicate.
+
+    Derived from the current canonical entry map so the two never drift:
+    each guarded command embeds its script path between the first pair of
+    double quotes (``[ -x "<path>" ] && ...``).
+    """
+    legacy: set[str] = set()
+    for entries in _agam_hook_entries(hooks_dir).values():
+        for entry in entries:
+            cmd = entry["command"]
+            first = cmd.find('"')
+            second = cmd.find('"', first + 1)
+            if first != -1 and second != -1:
+                legacy.add(cmd[first + 1 : second])
+    return legacy
+
+
+def _strip_commands(
+    settings: dict[str, Any], stale: set[str]
+) -> dict[str, Any]:
+    """Return a copy of ``settings`` with any hook inner-command in
+    ``stale`` removed. Blocks left with no inner hooks are dropped; events
+    left with no blocks are dropped. Non-hook keys are untouched.
+    """
+    result = copy.deepcopy(settings)
+    hooks_section = result.get("hooks")
+    if not isinstance(hooks_section, dict):
+        return result
+    for event in list(hooks_section.keys()):
+        blocks = hooks_section[event]
+        if not isinstance(blocks, list):
+            continue
+        kept_blocks = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                kept_blocks.append(block)
+                continue
+            inners = block.get("hooks")
+            if isinstance(inners, list):
+                survivors = [
+                    inner
+                    for inner in inners
+                    if not (
+                        isinstance(inner, dict)
+                        and inner.get("command") in stale
+                    )
+                ]
+                if not survivors:
+                    continue
+                block = {**block, "hooks": survivors}
+            elif block.get("command") in stale:
+                continue
+            kept_blocks.append(block)
+        if kept_blocks:
+            hooks_section[event] = kept_blocks
+        else:
+            del hooks_section[event]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +370,9 @@ def merge_hooks_into_settings(
     else:
         existing = {}
 
+    # Drop any legacy bare-path agam registrations first so the guarded
+    # form below supersedes them (no still-broken duplicate left behind).
+    existing = _strip_commands(existing, _legacy_agam_commands(hooks_dir))
     merged = merge_hooks(existing, _agam_hook_entries(hooks_dir))
 
     # Atomic write: tempfile in the same directory + os.replace. Keeping
