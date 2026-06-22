@@ -11,7 +11,11 @@ from unittest import mock
 
 import pytest
 
-from agam.settings_merger import merge_hooks, merge_hooks_into_settings
+from agam.settings_merger import (
+    _guarded,
+    merge_hooks,
+    merge_hooks_into_settings,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +236,21 @@ def test_agam_commands_are_guarded_against_missing_files(tmp_path: Path):
         assert str(hooks_dir) in c, c
 
 
+def test_guarded_shell_escapes_metacharacters():
+    # A path containing shell metacharacters must not be expandable or
+    # word-splittable by the shell that runs the hook. shlex.quote handles
+    # $VAR, $(...), and spaces.
+    cmd = _guarded(Path("/home/$(touch pwned)/x y/hook.py"))
+    # The path is single-quoted so the shell treats it verbatim -- no
+    # command substitution, no word-splitting on the space.
+    assert "'/home/$(touch pwned)/x y/hook.py'" in cmd
+    # No unquoted $(...) that the shell would execute.
+    assert "$(touch pwned)" not in cmd.replace(
+        "'/home/$(touch pwned)/x y/hook.py'", ""
+    )
+    assert cmd.startswith("[ -x ") and cmd.endswith("|| true")
+
+
 def test_legacy_bare_path_entries_are_superseded(tmp_path: Path):
     # A pre-guard install left a bare-path agam command that errors on every
     # event. Re-merging must REPLACE it with the guarded form, not append a
@@ -259,9 +278,13 @@ def test_legacy_bare_path_entries_are_superseded(tmp_path: Path):
         for block in disk["hooks"]["UserPromptSubmit"]
         for inner in block["hooks"]
     ]
-    # The bare command is gone; exactly one guarded entry remains.
+    # The bare command is gone; exactly one guarded entry remains that
+    # still references the script path.
     assert legacy_cmd not in ups_cmds
-    assert ups_cmds == [f'[ -x "{legacy_cmd}" ] && exec "{legacy_cmd}" || true']
+    assert len(ups_cmds) == 1
+    only = ups_cmds[0]
+    assert only.startswith("[ -x ") and only.endswith("|| true")
+    assert legacy_cmd in only and "exec " in only
 
 
 def test_strip_does_not_touch_user_hooks(tmp_path: Path):

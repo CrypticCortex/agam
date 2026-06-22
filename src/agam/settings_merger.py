@@ -47,6 +47,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -211,6 +212,21 @@ def merge_hooks(
 # ---------------------------------------------------------------------------
 
 
+# Single source of truth for the Agam hook set: (event, script filename,
+# matcher). Both the live registration map and the legacy-command set are
+# derived from this, so the two can never drift. lesson_activate fires under
+# two matchers (Bash -> command-pattern lessons, Edit|Write|MultiEdit ->
+# file-path lessons), hence two rows for the same script.
+_AGAM_HOOKS: tuple[tuple[str, str, str], ...] = (
+    ("UserPromptSubmit", "graph_recall.py", ""),
+    ("Stop", "graph_update.py", ""),
+    ("Stop", "session_close.py", ""),
+    ("PreToolUse", "lesson_activate.py", "Bash"),
+    ("PreToolUse", "lesson_activate.py", "Edit|Write|MultiEdit"),
+    ("PostToolUse", "lesson_activate_post.py", "Bash"),
+)
+
+
 def _guarded(script: Path) -> str:
     """Wrap a hook script path so a missing file is a silent no-op.
 
@@ -224,9 +240,13 @@ def _guarded(script: Path) -> str:
     present it replaces the shell, so its real exit code propagates and
     blocking hooks (PreToolUse) still block. The trailing ``|| true`` only
     runs when ``exec`` was never reached -- i.e. the file is absent.
+
+    The path is run through ``shlex.quote`` so a path containing shell
+    metacharacters (``$VAR``, ``$(...)``, spaces) can't be expanded or
+    word-split by the shell that runs the hook.
     """
-    p = str(script)
-    return f'[ -x "{p}" ] && exec "{p}" || true'
+    p = shlex.quote(str(script))
+    return f"[ -x {p} ] && exec {p} || true"
 
 
 def _agam_hook_entries(hooks_dir: Path) -> dict[str, list[dict[str, Any]]]:
@@ -239,34 +259,12 @@ def _agam_hook_entries(hooks_dir: Path) -> dict[str, list[dict[str, Any]]]:
     no-op instead of erroring on every prompt.
     """
     hooks_dir = Path(hooks_dir)
-    return {
-        "UserPromptSubmit": [
-            {"command": _guarded(hooks_dir / "graph_recall.py"), "matcher": ""},
-        ],
-        "Stop": [
-            {"command": _guarded(hooks_dir / "graph_update.py"), "matcher": ""},
-            {"command": _guarded(hooks_dir / "session_close.py"), "matcher": ""},
-        ],
-        "PreToolUse": [
-            # Bash trigger -> command-pattern lessons (e.g. "pip install in conda").
-            {
-                "command": _guarded(hooks_dir / "lesson_activate.py"),
-                "matcher": "Bash",
-            },
-            # Edit/Write/MultiEdit trigger -> file-path lessons (e.g. "mirror
-            # this change into the repo"). Same script, different matcher.
-            {
-                "command": _guarded(hooks_dir / "lesson_activate.py"),
-                "matcher": "Edit|Write|MultiEdit",
-            },
-        ],
-        "PostToolUse": [
-            {
-                "command": _guarded(hooks_dir / "lesson_activate_post.py"),
-                "matcher": "Bash",
-            },
-        ],
-    }
+    entries: dict[str, list[dict[str, Any]]] = {}
+    for event, filename, matcher in _AGAM_HOOKS:
+        entries.setdefault(event, []).append(
+            {"command": _guarded(hooks_dir / filename), "matcher": matcher}
+        )
+    return entries
 
 
 def _legacy_agam_commands(hooks_dir: Path) -> set[str]:
@@ -276,21 +274,11 @@ def _legacy_agam_commands(hooks_dir: Path) -> set[str]:
     Those entries error on every event when the file is absent (e.g. a
     devcontainer that inherited the host settings.json). We strip them on
     re-merge so the guarded form supersedes them instead of sitting beside
-    a still-broken duplicate.
-
-    Derived from the current canonical entry map so the two never drift:
-    each guarded command embeds its script path between the first pair of
-    double quotes (``[ -x "<path>" ] && ...``).
+    a still-broken duplicate. Derived from the same ``_AGAM_HOOKS`` source
+    as the live map, so the two can't drift.
     """
-    legacy: set[str] = set()
-    for entries in _agam_hook_entries(hooks_dir).values():
-        for entry in entries:
-            cmd = entry["command"]
-            first = cmd.find('"')
-            second = cmd.find('"', first + 1)
-            if first != -1 and second != -1:
-                legacy.add(cmd[first + 1 : second])
-    return legacy
+    hooks_dir = Path(hooks_dir)
+    return {str(hooks_dir / filename) for _event, filename, _matcher in _AGAM_HOOKS}
 
 
 def _strip_commands(
