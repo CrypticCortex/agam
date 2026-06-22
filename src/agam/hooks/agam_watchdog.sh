@@ -37,12 +37,21 @@ mkdir -p "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" "$AGAM_HOME
 
 log() { echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
 
-# Single-flight lock.
-if [[ -f "$LOCK" ]] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+# Single-flight lock. A live lock holder defers us; a stale lock (dead pid) is
+# reclaimed. The claim itself uses noclobber (set -C) so that two ticks racing
+# through the check->write window can't both succeed -- the loser's create fails
+# and it defers instead of clobbering the winner's pid.
+if [[ -f "$LOCK" ]]; then
+    if kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+        log "already-running pid=$(cat "$LOCK" 2>/dev/null)"
+        exit 0
+    fi
+    rm -f "$LOCK"  # stale: holder is dead
+fi
+if ! ( set -C; echo $$ > "$LOCK" ) 2>/dev/null; then
     log "already-running pid=$(cat "$LOCK" 2>/dev/null)"
     exit 0
 fi
-echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 # --- Resolve invoker (shell cascade mirror of agam.invoker.resolve_invoker)
@@ -201,11 +210,14 @@ if [[ ${#entries[@]} -gt 0 && -n "${AGAM_KG_PATH:-}" && -f "${AGAM_KG_PATH:-}" ]
     mkdir -p "$BK_DIR"
     BK="$BK_DIR/graph-predrain-$(date -u +%Y%m%dT%H%M%SZ).db"
     if command -v sqlite3 >/dev/null 2>&1; then
-        sqlite3 "$AGAM_KG_PATH" ".backup '$BK'" 2>/dev/null || cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
+        # Escape single quotes for the SQL string literal (paths with a quote
+        # would otherwise break the .backup statement and silently fall to cp).
+        BK_SQL=${BK//\'/\'\'}
+        sqlite3 "$AGAM_KG_PATH" ".backup '$BK_SQL'" 2>/dev/null || cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
     else
         cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
     fi
-    ls -1t "$BK_DIR"/graph-predrain-*.db 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+    ls -1t "$BK_DIR"/graph-predrain-*.db 2>/dev/null | tail -n +6 | while IFS= read -r old; do rm -f "$old"; done
     log "pre-drain-backup $BK"
 fi
 
@@ -265,7 +277,10 @@ retry_n=0
 while IFS= read -r entry; do
     [[ -z "$entry" ]] && continue
     if [[ $drained -ge $MAX_PER_RUN ]]; then
-        log "per-run-cap cap=$MAX_PER_RUN drained=$drained remaining=$(( ${#entries[@]} - drained ))"
+        # Live count of what's still queued (not the pre-drain snapshot, which
+        # would mislead once entries have moved to processed/queue-errors).
+        remaining=$(ls -1 "$AGAM_HOME"/queue/*.json 2>/dev/null | wc -l | tr -d ' ')
+        log "per-run-cap cap=$MAX_PER_RUN drained=$drained remaining=$remaining"
         break
     fi
     name=$(basename "$entry")

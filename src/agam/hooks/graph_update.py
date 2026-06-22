@@ -283,8 +283,10 @@ def main():
     global SOURCE_AGENT
     SOURCE_AGENT = data.get("agent") or os.environ.get("AGAM_SOURCE_AGENT", "unknown")
 
-    # Dedup: only run once per session
-    flag = os.path.join(tempfile.gettempdir(), f"graph-update-{session_id}")
+    # Dedup: only run once per session. Sanitize session_id first so a hostile
+    # or malformed id (slashes, ..) can't escape the temp dir.
+    safe_sid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id))[:80] or "unknown"
+    flag = os.path.join(tempfile.gettempdir(), f"graph-update-{safe_sid}")
     if os.path.exists(flag):
         sys.exit(0)
 
@@ -317,73 +319,74 @@ def main():
         sys.exit(0)
 
     db = get_db()
-    changes = 0
+    try:
+        changes = 0
 
-    # Extract projects worked on
-    projects = extract_projects_from_paths(transcript)
-    today = datetime.now().strftime("%Y-%m-%d")
+        # Extract projects worked on
+        projects = extract_projects_from_paths(transcript)
+        today = datetime.now().strftime("%Y-%m-%d")
 
-    user_entity = os.environ.get("AGAM_USER_ENTITY", "User").strip() or "User"
-    for proj in projects:
-        eid = ensure_entity(db, proj, "project")
-        if eid:
-            set_prop(db, proj, "last-worked", today)
-            ensure_relation(db, user_entity, "works-on", proj)
-            changes += 1
+        user_entity = os.environ.get("AGAM_USER_ENTITY", "User").strip() or "User"
+        for proj in projects:
+            eid = ensure_entity(db, proj, "project")
+            if eid:
+                set_prop(db, proj, "last-worked", today)
+                ensure_relation(db, user_entity, "works-on", proj)
+                changes += 1
 
-    # Extract npm packages (new dependencies = new relationships)
-    packages = extract_npm_packages(transcript)
-    for pkg in packages:
-        eid = ensure_entity(db, pkg, "package", f"npm package {pkg}")
-        if eid:
-            # Try to relate to the most recent project
-            if projects:
-                proj = sorted(projects)[-1]
-                ensure_relation(db, proj, "uses-package", pkg)
-            changes += 1
+        # Extract npm packages (new dependencies = new relationships)
+        packages = extract_npm_packages(transcript)
+        for pkg in packages:
+            eid = ensure_entity(db, pkg, "package", f"npm package {pkg}")
+            if eid:
+                # Try to relate to the most recent project
+                if projects:
+                    proj = sorted(projects)[-1]
+                    ensure_relation(db, proj, "uses-package", pkg)
+                changes += 1
 
-    # Extract research activity from /investigate-topic and /research
-    research_projects = extract_research_activity(transcript)
-    for rp in research_projects:
-        eid = ensure_entity(db, rp['slug'], "research-project", f"Research: {rp['topic']}")
-        if eid:
-            set_prop(db, rp['slug'], "date", rp['date'])
-            if rp.get('framework', 'unknown') != 'unknown':
-                set_prop(db, rp['slug'], "framework", rp['framework'])
-            if rp.get('depth'):
-                set_prop(db, rp['slug'], "depth", rp['depth'])
-            ensure_relation(db, user_entity, "researched", rp['slug'])
-            changes += 1
+        # Extract research activity from /investigate-topic and /research
+        research_projects = extract_research_activity(transcript)
+        for rp in research_projects:
+            eid = ensure_entity(db, rp['slug'], "research-project", f"Research: {rp['topic']}")
+            if eid:
+                set_prop(db, rp['slug'], "date", rp['date'])
+                if rp.get('framework', 'unknown') != 'unknown':
+                    set_prop(db, rp['slug'], "framework", rp['framework'])
+                if rp.get('depth'):
+                    set_prop(db, rp['slug'], "depth", rp['depth'])
+                ensure_relation(db, user_entity, "researched", rp['slug'])
+                changes += 1
 
-    # Error extraction removed -- errors are transient, they pollute the graph
-    # with raw compiler output that has no relational value. Bugs should be
-    # added manually with meaningful names and descriptions.
+        # Error extraction removed -- errors are transient, they pollute the graph
+        # with raw compiler output that has no relational value. Bugs should be
+        # added manually with meaningful names and descriptions.
 
-    if changes > 0:
-        db.commit()
-        refresh_cache(db)
+        if changes > 0:
+            db.commit()
+            refresh_cache(db)
 
-        # Rebuild concept index (keeps O(1) lookup in sync with graph)
-        if KG_TOOL.exists():
-            try:
-                subprocess.run(
-                    [sys.executable, str(KG_TOOL), "build-index"],
-                    capture_output=True, timeout=5
-                )
-            except Exception:
-                pass
+            # Rebuild concept index (keeps O(1) lookup in sync with graph)
+            if KG_TOOL.exists():
+                try:
+                    subprocess.run(
+                        [sys.executable, str(KG_TOOL), "build-index"],
+                        capture_output=True, timeout=5
+                    )
+                except Exception:
+                    pass
 
-        # Check vault drift -- write stale marker if needed
-        if VAULT_DIR.exists():
-            graph_count = db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-            vault_count = len(list(VAULT_DIR.glob("*.md")))
-            drift = abs(graph_count - vault_count)
-            if drift > 5 or (graph_count > 0 and drift / graph_count > 0.03):
-                VAULT_MARKER.parent.mkdir(parents=True, exist_ok=True)
-                with open(VAULT_MARKER, "w") as m:
-                    m.write(f"drift={drift}\ngraph={graph_count}\nvault={vault_count}\n")
-
-    db.close()
+            # Check vault drift -- write stale marker if needed
+            if VAULT_DIR.exists():
+                graph_count = db.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+                vault_count = len(list(VAULT_DIR.glob("*.md")))
+                drift = abs(graph_count - vault_count)
+                if drift > 5 or (graph_count > 0 and drift / graph_count > 0.03):
+                    VAULT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+                    with open(VAULT_MARKER, "w") as m:
+                        m.write(f"drift={drift}\ngraph={graph_count}\nvault={vault_count}\n")
+    finally:
+        db.close()
 
     # Mark as done
     with open(flag, "w") as f:
