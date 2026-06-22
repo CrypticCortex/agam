@@ -488,7 +488,11 @@ def main() -> int:
     # with acceptEdits -- mechanical Python append bypasses that.
     since_iso, cutoff_mode = _compute_cutoff(sid)
     log(sid, "cutoff", since_iso=since_iso, mode=cutoff_mode)
-    wlog_out = pathlib.Path(f"/tmp/work-log-entry-{sid}.md")
+    # mkstemp: 0600 file at an unguessable path so a pre-planted symlink at a
+    # predictable /tmp/work-log-entry-<sid>.md can't redirect haiku's write.
+    _wfd, _wname = tempfile.mkstemp(prefix=f"work-log-entry-{sid}-", suffix=".md")
+    os.close(_wfd)
+    wlog_out = pathlib.Path(_wname)
     wlog_prompt = fill(
         PROMPTS / "work-log.txt",
         JSONL_PATH=transcript,
@@ -504,15 +508,14 @@ def main() -> int:
     work_log_ok = False
     try:
         r = run_claude(wlog_prompt, model="claude-haiku-4-5", timeout=180)
-        log(sid, "work-log-done", rc=r.returncode, body_written=wlog_out.exists())
-        if wlog_out.exists():
+        # mkstemp pre-creates the file, so "did haiku write?" is a size check,
+        # not an existence check.
+        has_body = wlog_out.exists() and wlog_out.stat().st_size > 0
+        log(sid, "work-log-done", rc=r.returncode, body_written=has_body)
+        if has_body:
             appended = _append_work_log(wlog_out, project, today, now, sid, mode=cutoff_mode)
             if appended:
                 _record_work_log_written(sid, transcript)
-            try:
-                wlog_out.unlink(missing_ok=True)
-            except OSError:
-                pass
             work_log_ok = True
         elif r.returncode == 0:
             # Haiku completed cleanly but skipped writing OUTPUT_PATH. Treat as implicit SKIP
@@ -521,6 +524,8 @@ def main() -> int:
             work_log_ok = True
     except subprocess.TimeoutExpired:
         log(sid, "work-log-timeout")
+    finally:
+        wlog_out.unlink(missing_ok=True)
 
     # Step c: agam-sync (sonnet) -> proposals JSON
     # Slice the transcript first. Big transcripts exceed sonnet's context and
@@ -541,7 +546,12 @@ def main() -> int:
         except OSError:
             pass
 
-    proposals_path = pathlib.Path(f"/tmp/proposals-{sid}.json")
+    # mkstemp for the same symlink-safety reason as the work-log temp above:
+    # apply_proposals.py applies this file's content to identity files, so a
+    # predictable path would be an attractive redirect target.
+    _pfd, _pname = tempfile.mkstemp(prefix=f"proposals-{sid}-", suffix=".json")
+    os.close(_pfd)
+    proposals_path = pathlib.Path(_pname)
     schema_block = JSON_SCHEMA_HINT.replace("{proposals_path}", str(proposals_path))
     sync_prompt = fill(
         PROMPTS / "agam-sync.txt",
@@ -564,19 +574,19 @@ def main() -> int:
         except OSError:
             pass
 
-    # Step d: apply
-    if proposals_path.exists():
-        applier = TOOLS / "apply_proposals.py"
-        r = subprocess.run(
-            [str(applier), str(proposals_path)],
-            timeout=30, capture_output=True, text=True,
-            env=dict(os.environ, AGAM_SOURCE_AGENT=agent),
-        )
-        log(sid, "apply-done", rc=r.returncode, stdout=r.stdout.strip(), stderr=r.stderr.strip())
-        try:
-            proposals_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    # Step d: apply (only if sonnet actually wrote proposals; mkstemp pre-creates
+    # an empty file, so gate on size).
+    try:
+        if proposals_path.exists() and proposals_path.stat().st_size > 0:
+            applier = TOOLS / "apply_proposals.py"
+            r = subprocess.run(
+                [str(applier), str(proposals_path)],
+                timeout=30, capture_output=True, text=True,
+                env=dict(os.environ, AGAM_SOURCE_AGENT=agent),
+            )
+            log(sid, "apply-done", rc=r.returncode, stdout=r.stdout.strip(), stderr=r.stderr.strip())
+    finally:
+        proposals_path.unlink(missing_ok=True)
 
     # Step e: lint (fire and forget)
     lint = TOOLS / "agam_lint.py"

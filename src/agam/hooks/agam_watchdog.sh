@@ -37,12 +37,21 @@ mkdir -p "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" "$AGAM_HOME
 
 log() { echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
 
-# Single-flight lock.
-if [[ -f "$LOCK" ]] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+# Single-flight lock. A live lock holder defers us; a stale lock (dead pid) is
+# reclaimed. The claim itself uses noclobber (set -C) so that two ticks racing
+# through the check->write window can't both succeed -- the loser's create fails
+# and it defers instead of clobbering the winner's pid.
+if [[ -f "$LOCK" ]]; then
+    if kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+        log "already-running pid=$(cat "$LOCK" 2>/dev/null)"
+        exit 0
+    fi
+    rm -f "$LOCK"  # stale: holder is dead
+fi
+if ! ( set -C; echo $$ > "$LOCK" ) 2>/dev/null; then
     log "already-running pid=$(cat "$LOCK" 2>/dev/null)"
     exit 0
 fi
-echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 # --- Resolve invoker (shell cascade mirror of agam.invoker.resolve_invoker)

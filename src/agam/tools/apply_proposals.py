@@ -234,20 +234,36 @@ def _write_lesson_entities(kg_path: pathlib.Path, items: list, etype: str,
                         (body[:500], today, eid),
                     )
                 else:
-                    cur = conn.execute(
-                        "INSERT INTO entities (name, type, description, created, updated) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (name, etype, body[:500], today, today),
-                    )
-                    eid = cur.lastrowid
                     try:
-                        conn.execute(
-                            "INSERT INTO entities_fts(rowid, name, type, description) "
-                            "VALUES (?, ?, ?, ?)",
-                            (eid, name, etype, body[:500]),
+                        cur = conn.execute(
+                            "INSERT INTO entities (name, type, description, created, updated) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (name, etype, body[:500], today, today),
                         )
-                    except sqlite3.Error:
-                        pass
+                        eid = cur.lastrowid
+                        try:
+                            conn.execute(
+                                "INSERT INTO entities_fts(rowid, name, type, description) "
+                                "VALUES (?, ?, ?, ?)",
+                                (eid, name, etype, body[:500]),
+                            )
+                        except sqlite3.Error:
+                            pass
+                    except sqlite3.IntegrityError:
+                        # A concurrent enrichment run inserted this name between
+                        # our SELECT and INSERT. Re-fetch and treat as an update
+                        # so the provenance/severity properties below still land
+                        # (mirrors graph_update.ensure_entity).
+                        row = conn.execute(
+                            "SELECT id FROM entities WHERE name=?", (name,)
+                        ).fetchone()
+                        if not row:
+                            continue
+                        eid = row[0]
+                        conn.execute(
+                            "UPDATE entities SET description=?, updated=? WHERE id=?",
+                            (body[:500], today, eid),
+                        )
                 for k, v in (("source-agent", agent), ("severity", severity)):
                     if v and v != "unknown":
                         conn.execute(
