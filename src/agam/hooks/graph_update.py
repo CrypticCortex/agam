@@ -57,6 +57,12 @@ VAULT_DIR = Path(
     os.environ.get("AGAM_VAULT_DIR", os.path.expanduser("~/claude-knowledge-vault"))
 )
 
+# Which agent's session produced this update (claude | cursor | unknown). Set in
+# main() from the hook stdin ("agent") or the AGAM_SOURCE_AGENT env. Stamped as a
+# source-agent property on every entity touched, so a shared graph records which
+# agent taught each fact.
+SOURCE_AGENT = os.environ.get("AGAM_SOURCE_AGENT", "unknown")
+
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -65,8 +71,12 @@ def now():
 def get_db():
     if not DB_PATH.exists():
         sys.exit(0)
-    db = sqlite3.connect(str(DB_PATH), timeout=2)
+    # 15s busy timeout (was 2s): a second writer -- e.g. the watchdog draining
+    # while an interactive Stop hook writes -- waits for the WAL lock instead of
+    # erroring out and dropping the enrichment.
+    db = sqlite3.connect(str(DB_PATH), timeout=15)
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=15000")
     db.execute("PRAGMA foreign_keys=ON")
     return db
 
@@ -78,6 +88,13 @@ def normalize_name(name):
     s = s.replace('_', '-').lower()
     s = re.sub(r'-+', '-', s).strip('-')
     return s
+
+
+def _stamp_source_agent(db, name):
+    """Record which agent last taught this entity (no-op when agent unknown)."""
+    if not SOURCE_AGENT or SOURCE_AGENT == "unknown":
+        return
+    set_prop(db, name, "source-agent", SOURCE_AGENT)
 
 
 def ensure_entity(db, name, etype, desc=""):
@@ -92,13 +109,23 @@ def ensure_entity(db, name, etype, desc=""):
             )
         else:
             db.execute("UPDATE entities SET updated = ? WHERE id = ?", (now(), row[0]))
+        _stamp_source_agent(db, name)
         return row[0]
     else:
-        cursor = db.execute(
-            "INSERT INTO entities (name, type, description, created, updated) VALUES (?, ?, ?, ?, ?)",
-            (name, etype, desc, now(), now())
-        )
-        eid = cursor.lastrowid
+        try:
+            cursor = db.execute(
+                "INSERT INTO entities (name, type, description, created, updated) VALUES (?, ?, ?, ?, ?)",
+                (name, etype, desc, now(), now())
+            )
+            eid = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            # Concurrent writer inserted the same name between our SELECT and
+            # INSERT. Re-fetch and treat as an update rather than crashing.
+            row = db.execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchone()
+            if not row:
+                raise
+            _stamp_source_agent(db, name)
+            return row[0]
         # Sync FTS
         try:
             db.execute(
@@ -107,6 +134,7 @@ def ensure_entity(db, name, etype, desc=""):
             )
         except Exception:
             pass
+        _stamp_source_agent(db, name)
         return eid
 
 
@@ -251,26 +279,41 @@ def main():
     data = json.load(sys.stdin)
     session_id = data.get("session_id", "unknown")
 
+    # Record the source agent for provenance stamping on entities.
+    global SOURCE_AGENT
+    SOURCE_AGENT = data.get("agent") or os.environ.get("AGAM_SOURCE_AGENT", "unknown")
+
     # Dedup: only run once per session
     flag = os.path.join(tempfile.gettempdir(), f"graph-update-{session_id}")
     if os.path.exists(flag):
         sys.exit(0)
 
-    # Find latest transcript
-    transcripts = sorted(
-        glob.glob(str(SESSIONS_DIR / "**" / "*.jsonl"), recursive=True),
-        key=os.path.getmtime,
-    )
-    if not transcripts:
-        sys.exit(0)
+    # Resolve the transcript to scan. Cursor passes an explicit transcript_path
+    # (and stores transcripts in a different tree), so honor it when present.
+    # Claude's legacy path globs the sessions dir for the most recent file.
+    transcript_path = data.get("transcript_path", "")
+    if transcript_path and os.path.exists(transcript_path):
+        target = transcript_path
+    else:
+        transcripts = sorted(
+            glob.glob(str(SESSIONS_DIR / "**" / "*.jsonl"), recursive=True),
+            key=os.path.getmtime,
+        )
+        if not transcripts:
+            sys.exit(0)
+        target = transcripts[-1]
 
     # Read transcript (only last 50KB to stay fast)
-    with open(transcripts[-1]) as f:
-        f.seek(max(0, os.path.getsize(transcripts[-1]) - 50000))
+    with open(target, errors="replace") as f:
+        f.seek(max(0, os.path.getsize(target) - 50000))
         transcript = f.read()
 
-    # Skip trivial sessions
-    if transcript.count('"type":"user"') < 3:
+    # Skip trivial sessions. Count Claude ("type":"user") and Cursor
+    # ("role":"user") user turns. Whitespace-tolerant so both compact and
+    # pretty-printed JSONL count correctly. The rest of the extraction below is
+    # raw-text regex and works for either transcript shape.
+    user_turns = len(re.findall(r'"(?:type|role)"\s*:\s*"user"', transcript))
+    if user_turns < 3:
         sys.exit(0)
 
     db = get_db()

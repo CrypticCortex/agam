@@ -32,9 +32,11 @@ Per-tab row bindings (DataTables):
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -78,6 +80,26 @@ TOOLS_DIR = _env_path("AGAM_TOOLS", HOME / ".claude" / "tools")
 
 QUEUE_PATH = AGAM / ".pending-closes.jsonl"
 ARCHIVE_PATH = AGAM / ".pending-closes.archive.jsonl"
+
+
+def _cursor_home() -> Path:
+    """Cursor's operational home (file-per-session queue + processed/errors/log).
+    Honors AGAM_DATA_HOME, else the re-homed ~/.claude/cursor-agam, else the
+    legacy neutral ~/.agam."""
+    env = os.environ.get("AGAM_DATA_HOME")
+    if env:
+        return Path(os.path.expanduser(env))
+    for cand in (HOME / ".claude" / "cursor-agam", HOME / ".agam"):
+        if cand.exists():
+            return cand
+    return HOME / ".claude" / "cursor-agam"
+
+
+DATA_HOME = _cursor_home()
+NEW_QUEUE_DIR = DATA_HOME / "queue"
+CURSOR_PROCESSED = DATA_HOME / "processed"
+CURSOR_ERRORS = DATA_HOME / "queue-errors"
+CURSOR_WLOG = DATA_HOME / "logs" / "watchdog.log"
 PROCESSED = AGAM / ".processed-sessions.jsonl"
 WLOG = AGAM / ".watchdog-log"
 LINT = AGAM / ".lint-findings.md"
@@ -213,6 +235,31 @@ def _kg_query(sql: str, params: tuple = ()) -> list:
         conn.close()
 
 
+def _read_queue() -> list[dict]:
+    """Merge both queue sources: legacy .pending-closes.jsonl (personal Claude
+    pipeline) + the file-per-session queue/*.json the shared watchdog drains
+    (Cursor + OSS). Each entry keeps its 'agent' tag where present."""
+    entries = list(_read_jsonl(QUEUE_PATH))
+    if NEW_QUEUE_DIR.exists():
+        for p in sorted(NEW_QUEUE_DIR.glob("*.json")):
+            try:
+                entries.append(json.loads(p.read_text()))
+            except (json.JSONDecodeError, OSError):
+                continue
+    return entries
+
+
+def _provenance_counts() -> list[tuple]:
+    """source-agent breakdown across the graph: [(agent, count), ...]."""
+    return _kg_query(
+        """SELECT COALESCE(p.value, '(untagged)') AS agent, COUNT(*) c
+           FROM entities e
+           LEFT JOIN properties p
+             ON p.entity_id = e.id AND p.key = 'source-agent'
+           GROUP BY agent ORDER BY c DESC"""
+    )
+
+
 def _queue_state(entries: list[dict]) -> list[dict]:
     processed = {e.get("session_id") for e in _read_jsonl(PROCESSED)}
     now = time.time()
@@ -242,87 +289,149 @@ def _queue_state(entries: list[dict]) -> list[dict]:
 
 # ---- panel renderers ----------------------------------------------------
 
+def _last_drain_ts() -> float | None:
+    """Most recent successful drain across BOTH pipelines: the personal jsonl
+    watchdog-log and the cursor text watchdog.log."""
+    best = None
+    for e in reversed(_tail_jsonl(WLOG, 120)):
+        if e.get("event") in ("done", "work-log-appended", "agam-sync-done"):
+            best = e.get("ts")
+            break
+    if CURSOR_WLOG.exists():
+        try:
+            for line in reversed(CURSOR_WLOG.read_text(errors="replace").splitlines()):
+                if line.startswith("[") and (" ok " in line or "drain-done" in line):
+                    iso = line[1:line.index("]")].replace("Z", "+00:00")
+                    ts = datetime.fromisoformat(iso).timestamp()
+                    best = ts if best is None else max(best, ts)
+                    break
+        except (ValueError, OSError):
+            pass
+    return best
+
+
+def _draining() -> bool:
+    """A drain is in flight if either pipeline holds its single-flight lock."""
+    return (AGAM / ".watchdog.lock.d").exists() or (DATA_HOME / ".watchdog.lock").exists()
+
+
+def _error_count() -> int:
+    n = 0
+    for d in (CURSOR_ERRORS, AGAM / "queue-errors"):
+        if d.exists() and d.is_dir():
+            n += sum(1 for _ in d.glob("*.json"))
+    return n
+
+
+def _daily_cap() -> int:
+    """The watchdog's MAX_PER_DAY. Honors AGAM_MAX_PER_DAY, else parses the
+    personal watchdog script, else a conservative default."""
+    env = os.environ.get("AGAM_MAX_PER_DAY")
+    if env and env.isdigit():
+        return int(env)
+    wd = HOOKS_DIR / "agam-watchdog.sh"
+    if wd.exists():
+        try:
+            m = re.search(r"^MAX_PER_DAY=(\d+)", wd.read_text(), re.M)
+            if m:
+                return int(m.group(1))
+        except OSError:
+            pass
+    return 8
+
+
+def _today_growth() -> int:
+    rows = _kg_query(
+        "SELECT COUNT(*) FROM entities WHERE created LIKE ?",
+        (time.strftime("%Y-%m-%d") + "%",),
+    )
+    return rows[0][0] if rows else 0
+
+
+def _invoker() -> tuple[str, str]:
+    """(label, color): can the watchdog drain right now?"""
+    if _container_name():
+        return ("container", "green")
+    if shutil.which("claude") or shutil.which("cursor-agent"):
+        return ("host", "green")
+    return ("none", "red")
+
+
 def render_overview() -> Text:
-    queue = _read_jsonl(QUEUE_PATH)
-    queue_states = _queue_state(queue)
-    queue_counts = Counter(q["_state"] for q in queue_states)
+    # --- gather the vital signs (cheap) ---
+    states = _queue_state(_read_queue())
+    # _queue_state appends "*" to the state for sessions already in
+    # .processed-sessions.jsonl -- those are done, never count them.
+    pending = [s for s in states if not s["_state"].endswith("*")]
+    # Actionable = will actually be drained (ready/waiting). Stale/missing are
+    # cruft (>48h old, or transcript gone) -- counting them as "queue" is the
+    # noise we're killing. Surface them separately as prunable.
+    actionable = [s for s in pending if "ready" in s["_state"] or "waiting" in s["_state"]]
+    stale_n = len(pending) - len(actionable)
+    qn = len(actionable)
+    ready = sum(1 for s in actionable if "ready" in s["_state"])
+    waiting = sum(1 for s in actionable if "waiting" in s["_state"])
+    oldest = max((s["_age"] for s in actionable), default=0)
 
     daycap_file = AGAM / f".daycap-{time.strftime('%Y-%m-%d')}"
     try:
         daycap_n = int(daycap_file.read_text().strip()) if daycap_file.exists() else 0
     except (ValueError, OSError):
         daycap_n = 0
+    cap = _daily_cap()
+    cap_left = max(0, cap - daycap_n)
 
-    container = _container_name()
-    log_events = _tail_jsonl(WLOG, 80)
-    last_drain = None
-    for e in reversed(log_events):
-        if e.get("event") in ("done", "work-log-appended", "agam-sync-done"):
-            last_drain = e.get("ts")
-            break
-    last_drain_str = _age_str(time.time() - last_drain) + " ago" if last_drain else "(none seen)"
+    last = _last_drain_ts()
+    last_age = (time.time() - last) if last else None
+    errors = _error_count()
+    inv_label, inv_color = _invoker()
 
     ent = _kg_query("SELECT COUNT(*) FROM entities")
-    rel = _kg_query("SELECT COUNT(*) FROM relationships")
-    types = _kg_query("SELECT type, COUNT(*) c FROM entities GROUP BY type ORDER BY c DESC LIMIT 6")
+    total = ent[0][0] if ent else 0
+    growth = _today_growth()
+    prov = {a: c for a, c in _provenance_counts()}
 
-    text = Text()
+    t = Text()
 
-    text.append("WATCHDOG\n", style="bold yellow")
-    container_color = "green" if container else "red"
-    text.append("  container     ", style="grey50")
-    text.append(f"{container or '(none) — press c to start'}\n", style=container_color)
-    text.append("  queue depth   ", style="grey50")
-    text.append(f"{len(queue)}\n", style="yellow")
-    text.append("  daycap        ", style="grey50")
-    daycap_color = "red" if daycap_n >= 8 else ("orange3" if daycap_n >= 6 else "green")
-    text.append(f"{daycap_n}/8 ", style=daycap_color)
-    text.append(_bar(daycap_n, 8, 16) + "\n", style="grey50")
-    text.append("  last drain    ", style="grey50")
-    text.append(f"{last_drain_str}\n\n", style="yellow")
+    def row(label: str, value: str, color: str) -> None:
+        t.append(f"  {label:13}", style="grey50")
+        t.append(f"{value}\n", style=color)
 
-    text.append("QUEUE BREAKDOWN\n", style="bold yellow")
-    if queue_counts:
-        max_n = max(queue_counts.values())
-        for state, n in sorted(queue_counts.items(), key=lambda x: -x[1]):
-            color = "green" if "ready" in state else ("orange3" if "stale" in state else "grey50")
-            text.append(f"  {state:12}", style=color)
-            text.append(_bar(n, max_n, 18) + " ", style=color)
-            text.append(f"{n}\n", style="yellow")
+    t.append("PIPELINE\n", style="bold yellow")
+    row(
+        "queue",
+        f"{qn} active" + (f"   ({ready} ready, {waiting} waiting)" if qn else ""),
+        "green" if qn == 0 else ("red" if qn > 25 else "yellow"),
+    )
+    if stale_n:
+        row("stale", f"{stale_n}  (prunable -- queue tab, D)", "orange3")
+    row("in-flight", "draining now" if _draining() else "idle",
+        "green" if _draining() else "grey50")
+    row("daily cap", f"{cap_left}/{cap} left",
+        "red" if cap_left == 0 else ("orange3" if cap_left <= 2 else "green"))
+    if last_age is None:
+        row("last drain", "(none seen)", "orange3")
     else:
-        text.append("  empty\n", style="grey50")
-    text.append("\n")
+        row("last drain", f"{_age_str(last_age)} ago",
+            "green" if last_age < 7200 else ("orange3" if last_age < 86400 else "red"))
+    if qn:
+        oc = "green" if oldest < 3600 else ("orange3" if oldest < 21600 else "red")
+        row("oldest wait", _age_str(oldest), oc)
+    else:
+        row("oldest wait", "-", "grey50")
+    row("errors", str(errors), "green" if errors == 0 else "red")
+    row("invoker", inv_label, inv_color)
 
-    text.append("KNOWLEDGE GRAPH\n", style="bold yellow")
-    if ent:
-        n_ent = ent[0][0]
-        n_rel = rel[0][0]
-        text.append(f"  {n_ent}", style="bold yellow")
-        text.append(" entities  ", style="grey50")
-        text.append(f"{n_rel}", style="bold yellow")
-        text.append(" relationships\n", style="grey50")
-        if types:
-            max_count = types[0][1]
-            for type_name, count in types:
-                text.append(f"  {type_name:12} ", style="grey50")
-                text.append(_bar(count, max_count, 20) + " ", style="yellow3")
-                text.append(f"{count}\n", style="yellow")
-    text.append("\n")
-
-    text.append("IDENTITY FILES\n", style="bold yellow")
-    for name, path in [("AGAM.md", AGAM_MD), ("THISAI.md", THISAI), ("MUGAM.md", MUGAM), ("SUVADU.md", SUVADU)]:
-        if path.exists():
-            age_h = (time.time() - path.stat().st_mtime) / 3600
-            color = "green" if age_h < 48 else ("orange3" if age_h < 168 else "red")
-            lines = sum(1 for _ in path.open())
-            text.append(f"  {name:12} ", style="grey50")
-            text.append(f"{_age_str(time.time() - path.stat().st_mtime)} ago  ", style=color)
-            text.append(f"{lines} lines\n", style="grey50")
-        else:
-            text.append(f"  {name:12} ", style="grey50")
-            text.append("missing\n", style="red")
-
-    return text
+    t.append("\nBRAIN\n", style="bold yellow")
+    t.append(f"  {total}", style="bold magenta")
+    t.append(" memories", style="grey50")
+    if growth:
+        t.append(f"   +{growth} today", style="green")
+    t.append("\n  ", style="grey50")
+    t.append(f"claude {prov.get('claude', 0)}", style="yellow3")
+    t.append(" \u00b7 ", style="grey50")
+    t.append(f"cursor {prov.get('cursor', 0)}\n", style="cyan")
+    return t
 
 
 def render_activity() -> Text:
@@ -426,7 +535,7 @@ def render_next_actions() -> Text:
             pass
     if _container_name() is None:
         suggestions.append(("no claude-code container", "press c to start"))
-    queue = _read_jsonl(QUEUE_PATH)
+    queue = _read_queue()
     if len(queue) > 25:
         suggestions.append((f"queue depth high ({len(queue)})", "switch to queue tab to inspect"))
     if LINT.exists():
@@ -463,6 +572,130 @@ class DetailScreen(ModalScreen):
         )
 
 
+# ---- animated brain bar -------------------------------------------------
+
+class BrainBar(Static):
+    """Top-right panel: an animated ASCII brain. The gyri (~/folds) shimmer like
+    neural firing, the core pulses, and each wired agent feeds a pulse into the
+    brain. Counts refresh every 10s; animation ticks every 0.5s.
+
+    NOTE: we drive content via ``update()`` -- do NOT override ``_render`` (that
+    is Textual's internal method and must return a Visual, not a rich Text)."""
+
+    _W = 24            # brain pixel width
+    _H = 14            # brain pixel height (half-block packed -> 7 cell rows)
+    _BG = "#0d1120"    # panel background (empty pixels blend into this)
+
+    def on_mount(self) -> None:
+        self._frame = 0
+        self._agents: list[str] = []
+        self._total = 0
+        self._prov: dict = {}
+        self._refresh_stats()
+        self.set_interval(0.4, self._animate)
+        self.set_interval(10.0, self._refresh_stats)
+
+    def _refresh_stats(self) -> None:
+        home = Path.home()
+        agents = []
+        if (home / ".claude" / "settings.json").exists() or (home / ".claude" / "hooks").exists():
+            agents.append("claude")
+        if (home / ".cursor" / "hooks.json").exists():
+            agents.append("cursor")
+        self._agents = agents
+        ent = _kg_query("SELECT COUNT(*) FROM entities")
+        self._total = ent[0][0] if ent else 0
+        self._prov = {a: c for a, c in _provenance_counts()}
+        self.update(self._build())
+
+    def _animate(self) -> None:
+        self._frame += 1
+        self.update(self._build())
+
+    def _mask(self) -> list[list[bool]]:
+        """Procedural brain silhouette: two hemispheres, central fissure, gyri
+        grooves that slowly migrate (neural firing). Returns H rows of W bools."""
+        W, H = self._W, self._H
+        phase = self._frame * 0.12
+        out = []
+        for py in range(H):
+            ny = (py + 0.5) / H * 2 - 1
+            row = []
+            for px in range(W):
+                nx = (px + 0.5) / W * 2 - 1
+                ax = abs(nx)
+                env = 0.90 + 0.07 * math.sin(ax * 10.0) + (0.05 * math.sin(ax * 16.0) if ny < 0 else 0)
+                inside = (nx * nx) / 0.9604 + (ny * ny) / 0.64 < env
+                if ny > 0.68:
+                    inside = inside and ax < 0.45          # flat base / stem
+                if inside and ax > 0.10 and abs(math.sin(ax * 7.5 + ny * 3.2 + phase)) < 0.17:
+                    inside = False                          # sulci grooves
+                if ax < 0.045 and ny < 0.66:
+                    inside = False                          # central fissure
+                row.append(inside)
+            out.append(row)
+        return out
+
+    def _px_hex(self, px: int, py: int, pulse: float) -> str:
+        nx = (px + 0.5) / self._W * 2 - 1
+        ny = (py + 0.5) / self._H * 2 - 1
+        d = min(1.0, math.hypot(nx, ny / 0.85) / 1.05)      # 0 core -> 1 rim
+        core = (255, 45, 200)                                # magenta core
+        rim = (60, 110, 235)                                 # blue-cyan rim
+        r = core[0] + (rim[0] - core[0]) * d
+        g = core[1] + (rim[1] - core[1]) * d
+        b = core[2] + (rim[2] - core[2]) * d
+        bright = 0.55 + 0.45 * pulse * (1.0 - 0.45 * d)       # core breathes brightest
+        return f"#{int(r*bright):02x}{int(g*bright):02x}{int(b*bright):02x}"
+
+    def _agent_row(self, idx: int):
+        """Synapse packet feeding the brain, for the cell row `idx`."""
+        spec = None
+        if idx == 2 and "claude" in self._agents:
+            spec = ("claude ", "yellow3", "green")
+        elif idx == 4 and "cursor" in self._agents:
+            spec = ("cursor ", "cyan", "cyan")
+        if not spec:
+            return None
+        label, label_style, pulse_style = spec
+        track = ["\u00b7"] * 5
+        track[self._frame % 5] = "\u25cf"      # ● packet travels in
+        seg = Text()
+        seg.append(label, style=label_style)
+        seg.append("".join(track) + "\u25b8 ", style=pulse_style)  # ▸
+        return seg
+
+    def _build(self) -> Text:
+        m = self._mask()
+        pulse = 0.5 + 0.5 * math.sin(self._frame * 0.4)
+        out = Text(justify="right")
+        for r in range(self._H // 2):
+            line = Text()
+            ag = self._agent_row(r)
+            if ag is not None:
+                line.append_text(ag)
+            top_row, bot_row = m[2 * r], m[2 * r + 1]
+            for x in range(self._W):
+                top, bot = top_row[x], bot_row[x]
+                if not top and not bot:
+                    line.append(" ")
+                    continue
+                fg = self._px_hex(x, 2 * r + 1, pulse) if bot else self._BG
+                bgc = self._px_hex(x, 2 * r, pulse) if top else self._BG
+                line.append("\u2584", style=f"{fg} on {bgc}")   # ▄ lower half block
+            out.append_text(line)
+            out.append("\n")
+
+        minds = len(self._agents)
+        cn = self._prov.get("claude", 0)
+        un = self._prov.get("cursor", 0)
+        out.append(f"{minds} mind{'s' if minds != 1 else ''} \u00b7 {self._total} memories  ", style="grey50")
+        out.append(f"claude {cn}", style="yellow3")
+        out.append(" / ", style="grey50")
+        out.append(f"cursor {un}", style="cyan")
+        return out
+
+
 # ---- the App ------------------------------------------------------------
 
 class AgamApp(App):
@@ -471,6 +704,14 @@ class AgamApp(App):
     CSS = """
     Screen { background: #080b14; }
     Header { background: #0d1120; color: #e8a849; }
+    #brain-bar {
+        dock: top;
+        height: 8;
+        padding: 0 2;
+        background: #0d1120;
+        color: #e8a849;
+        content-align: right top;
+    }
     Footer { background: #0d1120; color: #7a7a8a; }
     TabbedContent { background: #080b14; }
     TabPane { padding: 1 2; }
@@ -511,6 +752,7 @@ class AgamApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield BrainBar(id="brain-bar")
         with TabbedContent(initial="overview", id="tabs"):
             with TabPane("overview", id="overview"):
                 yield ScrollableContainer(
@@ -734,12 +976,13 @@ class AgamApp(App):
 
     def _queue_row_detail(self) -> None:
         idx = self._queue_cursor_idx()
-        rows = _queue_state(_read_jsonl(QUEUE_PATH))
+        rows = _queue_state(_read_queue())
         if idx is None or idx >= len(rows):
             return
         e = rows[idx]
         body = Text()
         body.append("session_id     ", style="grey50"); body.append(f"{e.get('session_id','?')}\n", style="yellow")
+        body.append("agent          ", style="grey50"); body.append(f"{e.get('agent','?')}\n", style="yellow")
         body.append("transcript     ", style="grey50"); body.append(f"{e.get('transcript_path','?')}\n")
         body.append("cwd            ", style="grey50"); body.append(f"{e.get('cwd','?')}\n")
         body.append("context        ", style="grey50"); body.append(f"{e.get('context','?')}\n")
@@ -840,10 +1083,11 @@ class AgamApp(App):
     def _populate_queue(self) -> None:
         table = self.query_one("#queue-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("idx", "state", "sid", "ctx", "age", "idle", "path")
-        rows = _queue_state(_read_jsonl(QUEUE_PATH))
+        table.add_columns("idx", "state", "sid", "agent", "ctx", "age", "idle", "path")
+        rows = _queue_state(_read_queue())
         for i, e in enumerate(rows):
             sid = (e.get("session_id") or "?")[:8]
+            agent = (e.get("agent") or "?")[:8]
             ctx = (e.get("context") or "?")[:10]
             tp = e.get("transcript_path", "?")
             short_path = "/".join(tp.split("/")[-2:])
@@ -853,10 +1097,13 @@ class AgamApp(App):
                 "orange3" if "stale" in state else
                 "yellow" if "waiting" in state else "grey50"
             )
+            agent_color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
             table.add_row(
                 str(i),
                 Text(state, style=color),
-                sid, ctx,
+                sid,
+                Text(agent, style=agent_color),
+                ctx,
                 _age_str(e["_age"]),
                 _age_str(e["_idle"]) if e["_idle"] >= 0 else "?",
                 short_path,
@@ -891,7 +1138,7 @@ class AgamApp(App):
     def _populate_lessons(self) -> None:
         table = self.query_one("#lessons-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("name", "armed", "description")
+        table.add_columns("name", "agent", "armed", "description")
         rows = _kg_query("""
             SELECT e.id, e.name, e.description FROM entities e
             WHERE e.type = 'lesson' ORDER BY e.updated DESC
@@ -901,10 +1148,17 @@ class AgamApp(App):
                 "SELECT key FROM properties WHERE entity_id = ? AND key IN ('trigger_commands','trigger_errors','armed')",
                 (eid,),
             )
+            agent_row = _kg_query(
+                "SELECT value FROM properties WHERE entity_id = ? AND key = 'source-agent'",
+                (eid,),
+            )
+            agent = agent_row[0][0] if agent_row else "?"
+            agent_color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
             armed = "yes" if triggers else "—"
             short_desc = (desc or "").splitlines()[0][:80] if desc else ""
             table.add_row(
                 Text(name[:30], style="yellow"),
+                Text(agent, style=agent_color),
                 Text(armed, style="green" if armed == "yes" else "grey50"),
                 short_desc,
             )

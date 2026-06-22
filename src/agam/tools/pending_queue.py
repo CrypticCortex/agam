@@ -20,6 +20,7 @@ def enqueue(
     transcript_path: str,
     cwd: str,
     context: str,
+    agent: str = "unknown",
 ):
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -27,12 +28,49 @@ def enqueue(
         "transcript_path": transcript_path,
         "cwd": cwd,
         "context": context,
+        "agent": agent,
         "ts": time.time(),
     }
     with open(queue_path, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.write(json.dumps(entry) + "\n")
         fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def enqueue_file(
+    queue_dir: pathlib.Path,
+    *,
+    session_id: str,
+    transcript_path: str,
+    cwd: str,
+    context: str,
+    agent: str = "unknown",
+):
+    """Write a single ``<queue_dir>/<session_id>.json`` entry.
+
+    This is the file-per-session queue that ``agam_watchdog.sh`` drains (it
+    globs ``queue/*.json``, pipes each into the inner script, then moves it to
+    ``processed/``). Cursor uses this host-mode path so it can enrich the graph
+    standalone without the container-only ``.pending-closes.jsonl`` flow.
+
+    Idempotent per session: re-enqueuing the same session_id overwrites its
+    pending entry rather than piling up duplicates.
+    """
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = (session_id or "unknown").replace("/", "_").replace("\\", "_")[:80]
+    entry = {
+        "session_id": session_id,
+        "transcript_path": transcript_path,
+        "cwd": cwd,
+        "context": context,
+        "agent": agent,
+        "ts": time.time(),
+    }
+    target = queue_dir / f"{safe_id}.json"
+    tmp = queue_dir / f".{safe_id}.json.tmp"
+    tmp.write_text(json.dumps(entry) + "\n")
+    tmp.replace(target)
+    return target
 
 
 def read_and_prune(queue_path: pathlib.Path, *, max_age_seconds: int):
@@ -60,6 +98,7 @@ def replace_for_session(
     transcript_path: str,
     cwd: str,
     context: str,
+    agent: str = "unknown",
 ):
     """Remove any existing queue rows for this session_id, then append one fresh row.
     Atomic: holds an exclusive lock on the queue for the entire read-filter-write.
@@ -70,6 +109,7 @@ def replace_for_session(
         "transcript_path": transcript_path,
         "cwd": cwd,
         "context": context,
+        "agent": agent,
         "ts": time.time(),
     }
     with open(queue_path, "a+") as f:

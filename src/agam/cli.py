@@ -77,8 +77,49 @@ def _load_answers_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _resolve_targets(args: argparse.Namespace, answers: dict[str, Any] | None) -> list[str]:
+    """Decide which agents to wire: explicit flag/answers, else auto-detect.
+
+    Precedence: ``--target`` flags > ``targets:`` in the answers YAML >
+    auto-detection (with an interactive confirm/refine when possible). Falls
+    back to ``["claude"]`` when nothing is detected so a bare install still does
+    something sensible.
+    """
+    from agam.agents import detect_agents
+
+    if getattr(args, "target", None):
+        return list(args.target)
+    if answers and isinstance(answers.get("targets"), list) and answers["targets"]:
+        return [str(t) for t in answers["targets"]]
+
+    home = _home()
+    detected = [a.name for a in detect_agents(home)]
+    if not detected:
+        return ["claude"]
+
+    # Interactive refine when a real wizard is in play (no scripted answers).
+    if answers is None:
+        try:
+            import questionary  # type: ignore[import-not-found]
+
+            print("[agam init] detected agents:")
+            for a in detect_agents(home):
+                print(f"  - {a.name}: {a.detect_evidence(home)}")
+            chosen = questionary.checkbox(
+                "Install agam for which agents?",
+                choices=[
+                    questionary.Choice(name, checked=True) for name in detected
+                ],
+            ).ask()
+            if chosen:
+                return chosen
+        except Exception:  # noqa: BLE001 -- non-interactive / no questionary
+            pass
+    return detected
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
-    # Deferred import: lets tests monkeypatch ``agam.installer.run_wizard``
+    # Deferred import: lets tests monkeypatch ``agam.installer.run_install``
     # without the CLI module caching the original reference.
     from agam import installer
 
@@ -86,11 +127,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if args.answers is not None:
         answers = _load_answers_yaml(Path(args.answers))
 
+    targets = _resolve_targets(args, answers)
+
     try:
-        result = installer.run_wizard(answers=answers, force=args.force)
+        result = installer.run_install(answers, targets=targets)
     except SystemExit as exc:
-        # Wizard raised with a user-facing message (e.g. "refusing to
-        # overwrite"). Print it, return 1 -- no stack trace noise.
         msg = str(exc)
         if msg:
             print(msg, file=sys.stderr)
@@ -99,22 +140,22 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"[agam init] failed: {exc}", file=sys.stderr)
         return 1
 
-    # Best-effort summary. Fall back gracefully if the result object lacks
-    # the expected attrs (e.g. a test's MockResult).
-    paths = getattr(result, "paths", None)
-    if paths is not None:
-        agam_dir = getattr(paths, "agam", None)
-        if agam_dir is not None:
-            print(f"[agam init] installed into {agam_dir}")
-    backup = getattr(result, "backup", None)
-    if backup is not None:
-        print(f"[agam init] previous install backed up to {backup}")
+    agam_home = getattr(result, "agam_home", None)
+    if agam_home is not None:
+        print(f"[agam init] shared data home: {agam_home}")
+    installed = getattr(result, "targets", None)
+    if installed:
+        print(f"[agam init] wired agents: {', '.join(installed)}")
+    if getattr(result, "migration_status", None) == "migrated":
+        print(f"[agam init] migrated legacy ~/.claude data into {agam_home}")
 
     # Load the launchd plist on macOS so the watchdog actually starts running.
-    # Without this step the plist file sits in ~/Library/LaunchAgents/ unloaded
-    # and the watchdog never fires, which is a silent failure mode.
     if getattr(result, "wrote_plist", False):
-        _launchctl_bootstrap(paths)
+        import types
+        home = getattr(result, "home", _home())
+        _launchctl_bootstrap(
+            types.SimpleNamespace(launch_agents=home / "Library" / "LaunchAgents")
+        )
 
     answers = getattr(result, "answers", None)
 
@@ -685,6 +726,52 @@ def _kg_path() -> Path:
     if env:
         return Path(env)
     return _home() / ".claude" / "knowledge" / "graph.db"
+
+
+def backfill_source_agent(kg_path: Path, agent: str) -> int:
+    """Stamp source-agent=<agent> on every entity that lacks the property.
+
+    Used to attribute the pre-existing graph (built before provenance existed)
+    to the incumbent agent, and idempotent thereafter -- already-tagged entities
+    (e.g. source-agent=cursor) are left alone. Returns the count tagged.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    if not kg_path.exists():
+        return 0
+    ts = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(str(kg_path), timeout=10)
+    try:
+        cur = conn.execute(
+            """INSERT INTO properties (entity_id, key, value, updated)
+               SELECT e.id, 'source-agent', ?, ?
+               FROM entities e
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM properties p
+                   WHERE p.entity_id = e.id AND p.key = 'source-agent'
+               )""",
+            (agent, ts),
+        )
+        conn.commit()
+        return cur.rowcount if cur.rowcount is not None else 0
+    except sqlite3.OperationalError:
+        # Graph predates the expected schema (no entities/properties table).
+        # Nothing to backfill; don't fail the install.
+        return 0
+    finally:
+        conn.close()
+
+
+def _cmd_tag_source(args: argparse.Namespace) -> int:
+    """Backfill source-agent provenance on untagged entities."""
+    kg = _kg_path()
+    if not kg.exists():
+        print(f"[agam tag-source] no KG at {kg}.", file=sys.stderr)
+        return 1
+    n = backfill_source_agent(kg, args.agent)
+    print(f"[agam tag-source] tagged {n} untagged entit{'y' if n == 1 else 'ies'} as source-agent={args.agent}.")
+    return 0
 
 
 def _cmd_obsolete(args: argparse.Namespace) -> int:
@@ -1291,6 +1378,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to a YAML file with pre-built install answers.",
     )
+    p_init.add_argument(
+        "--target",
+        action="append",
+        choices=["claude", "cursor"],
+        default=None,
+        help="Agent(s) to wire (repeatable). Omit to auto-detect + prompt.",
+    )
     p_init.set_defaults(func=_cmd_init)
 
     # -- bootstrap
@@ -1359,6 +1453,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Deep diagnostic checks. Use when something feels off.",
     )
     p_doc.set_defaults(func=_cmd_doctor)
+
+    # -- tag-source
+    p_tag = sub.add_parser(
+        "tag-source",
+        help="Backfill source-agent provenance on entities that lack it.",
+    )
+    p_tag.add_argument(
+        "--agent",
+        required=True,
+        choices=["claude", "cursor"],
+        help="Agent to attribute untagged entities to.",
+    )
+    p_tag.set_defaults(func=_cmd_tag_source)
 
     # -- obsolete
     p_obs = sub.add_parser(
