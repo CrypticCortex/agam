@@ -210,11 +210,14 @@ if [[ ${#entries[@]} -gt 0 && -n "${AGAM_KG_PATH:-}" && -f "${AGAM_KG_PATH:-}" ]
     mkdir -p "$BK_DIR"
     BK="$BK_DIR/graph-predrain-$(date -u +%Y%m%dT%H%M%SZ).db"
     if command -v sqlite3 >/dev/null 2>&1; then
-        sqlite3 "$AGAM_KG_PATH" ".backup '$BK'" 2>/dev/null || cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
+        # Escape single quotes for the SQL string literal (paths with a quote
+        # would otherwise break the .backup statement and silently fall to cp).
+        BK_SQL=${BK//\'/\'\'}
+        sqlite3 "$AGAM_KG_PATH" ".backup '$BK_SQL'" 2>/dev/null || cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
     else
         cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
     fi
-    ls -1t "$BK_DIR"/graph-predrain-*.db 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+    ls -1t "$BK_DIR"/graph-predrain-*.db 2>/dev/null | tail -n +6 | while IFS= read -r old; do rm -f "$old"; done
     log "pre-drain-backup $BK"
 fi
 
@@ -274,7 +277,10 @@ retry_n=0
 while IFS= read -r entry; do
     [[ -z "$entry" ]] && continue
     if [[ $drained -ge $MAX_PER_RUN ]]; then
-        log "per-run-cap cap=$MAX_PER_RUN drained=$drained remaining=$(( ${#entries[@]} - drained ))"
+        # Live count of what's still queued (not the pre-drain snapshot, which
+        # would mislead once entries have moved to processed/queue-errors).
+        remaining=$(ls -1 "$AGAM_HOME"/queue/*.json 2>/dev/null | wc -l | tr -d ' ')
+        log "per-run-cap cap=$MAX_PER_RUN drained=$drained remaining=$remaining"
         break
     fi
     name=$(basename "$entry")

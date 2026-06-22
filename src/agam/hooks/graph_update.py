@@ -283,8 +283,10 @@ def main():
     global SOURCE_AGENT
     SOURCE_AGENT = data.get("agent") or os.environ.get("AGAM_SOURCE_AGENT", "unknown")
 
-    # Dedup: only run once per session
-    flag = os.path.join(tempfile.gettempdir(), f"graph-update-{session_id}")
+    # Dedup: only run once per session. Sanitize session_id first so a hostile
+    # or malformed id (slashes, ..) can't escape the temp dir.
+    safe_sid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id))[:80] or "unknown"
+    flag = os.path.join(tempfile.gettempdir(), f"graph-update-{safe_sid}")
     if os.path.exists(flag):
         sys.exit(0)
 
