@@ -21,9 +21,16 @@
 #   AGAM_WATCHDOG_MODE     host | container (legacy alias)
 #   AGAM_CONTAINER_PATTERN regex (default claude-code)
 #   AGAM_CONTAINER_NAME    exact name override
+#   AGAM_MAX_PER_RUN       max entries drained per tick (default 25). Bounds
+#                          one pass so a backlog after downtime can't fire an
+#                          unbounded number of enrichment runs at once.
+#   AGAM_MAX_RETRIES       attempts before an entry is dead-lettered to
+#                          queue-errors/ (default 3). A transient failure
+#                          (e.g. container mid-restart) is retried next tick
+#                          instead of being exiled permanently.
 set -u
 
-AGAM_HOME="${AGAM_HOME:-$HOME/.claude/agam}"
+AGAM_HOME="${AGAM_HOME:-${AGAM_DATA_HOME:-$HOME/.agam}}"
 LOG="$AGAM_HOME/logs/watchdog.log"
 LOCK="$AGAM_HOME/.watchdog.lock"
 mkdir -p "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" "$AGAM_HOME/queue-errors"
@@ -48,16 +55,34 @@ CONTAINER_PATTERN="${AGAM_CONTAINER_PATTERN:-claude-code}"
 CONTAINER_NAME_OVERRIDE="${AGAM_CONTAINER_NAME:-}"
 
 probe_host() {
-    # 0 = healthy, 1 = unhealthy. Writes detail to global PROBE_DETAIL.
-    # Only requires ``claude`` on PATH. macOS host stores OAuth in Keychain,
-    # so a credentials.json file may not exist even when auth works. Real
-    # auth failures surface when claude -p actually runs.
-    if ! command -v claude >/dev/null 2>&1; then
-        PROBE_DETAIL="claude CLI not on PATH"
+    # 0 = healthy, 1 = unhealthy. Writes detail to global PROBE_DETAIL and the
+    # chosen LLM CLI to AGAM_LLM_CLI. Prefer claude; fall back to cursor-agent
+    # so a Cursor-only host (no claude installed) can still enrich the graph.
+    # Auth lives in each tool's own store; real auth failures surface at run.
+    #
+    # AGAM_LLM_CLI_PIN overrides the preference (e.g. pin cursor-agent on a host
+    # where claude -p can't write files headlessly).
+    if [[ -n "${AGAM_LLM_CLI_PIN:-}" ]]; then
+        if command -v "$AGAM_LLM_CLI_PIN" >/dev/null 2>&1; then
+            AGAM_LLM_CLI="$AGAM_LLM_CLI_PIN"
+            PROBE_DETAIL="pinned $AGAM_LLM_CLI_PIN on PATH"
+            return 0
+        fi
+        PROBE_DETAIL="pinned $AGAM_LLM_CLI_PIN not on PATH"
         return 1
     fi
-    PROBE_DETAIL="host claude on PATH"
-    return 0
+    if command -v claude >/dev/null 2>&1; then
+        AGAM_LLM_CLI="claude"
+        PROBE_DETAIL="host claude on PATH"
+        return 0
+    fi
+    if command -v cursor-agent >/dev/null 2>&1; then
+        AGAM_LLM_CLI="cursor-agent"
+        PROBE_DETAIL="host cursor-agent on PATH (claude absent)"
+        return 0
+    fi
+    PROBE_DETAIL="neither claude nor cursor-agent on PATH"
+    return 1
 }
 
 probe_named_container() {
@@ -97,6 +122,7 @@ probe_pattern_container() {
 INVOKER_KIND=""
 INVOKER_DETAIL=""
 DISCOVERED=""
+AGAM_LLM_CLI="${AGAM_LLM_CLI:-claude}"
 declare -a FAILURES=()
 
 try_container_pin() {
@@ -165,6 +191,24 @@ case "$INVOKER_KIND" in
         ;;
 esac
 
+# Snapshot the knowledge graph before mutating it. Cursor host-mode enrichment
+# writes the shared graph; if a Claude container ever writes concurrently over a
+# bind mount the WAL guarantee can break, so a pre-drain backup makes any damage
+# recoverable. Keep the newest 5. Uses sqlite3 .backup (WAL-consistent) when
+# available, else a plain copy.
+if [[ ${#entries[@]} -gt 0 && -n "${AGAM_KG_PATH:-}" && -f "${AGAM_KG_PATH:-}" ]]; then
+    BK_DIR="$AGAM_HOME/backups"
+    mkdir -p "$BK_DIR"
+    BK="$BK_DIR/graph-predrain-$(date -u +%Y%m%dT%H%M%SZ).db"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$AGAM_KG_PATH" ".backup '$BK'" 2>/dev/null || cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
+    else
+        cp "$AGAM_KG_PATH" "$BK" 2>/dev/null
+    fi
+    ls -1t "$BK_DIR"/graph-predrain-*.db 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+    log "pre-drain-backup $BK"
+fi
+
 run_entry() {
     local entry_file="$1"
     case "$INVOKER_KIND" in
@@ -175,13 +219,18 @@ run_entry() {
             # NOT ~/.claude/tools/). Without these the inner script raises
             # FileNotFoundError calling apply_proposals.py and every queued
             # session ends up in queue-errors/.
+            # Resolve dirs from env (the launchd plist sets these to the shared
+            # ~/.agam location). Fall back to the legacy ~/.claude layout only
+            # when nothing is set, so old installs keep working pre-upgrade.
+            HOOKS_DIR_RESOLVED="${AGAM_HOOKS_DIR:-$HOME/.claude/hooks}"
             env AGAM_HOME="$AGAM_HOME" \
                 AGAM_TOOLS_DIR="${AGAM_TOOLS_DIR:-$HOME/.claude/tools/agam}" \
-                AGAM_HOOKS_DIR="${AGAM_HOOKS_DIR:-$HOME/.claude/hooks}" \
+                AGAM_HOOKS_DIR="$HOOKS_DIR_RESOLVED" \
                 AGAM_PROMPTS_DIR="${AGAM_PROMPTS_DIR:-$AGAM_HOME/prompts}" \
                 AGAM_KG_PATH="${AGAM_KG_PATH:-$HOME/.claude/knowledge/graph.db}" \
                 AGAM_USER_ENTITY="${AGAM_USER_ENTITY:-User}" \
-                "$HOME/.claude/hooks/agam_watchdog_inner.py" < "$entry_file"
+                AGAM_LLM_CLI="$AGAM_LLM_CLI" \
+                "$HOOKS_DIR_RESOLVED/agam_watchdog_inner.py" < "$entry_file"
             ;;
         container|named-container)
             # Inside the container, ~/.claude is bind-mounted at
@@ -199,17 +248,52 @@ run_entry() {
     esac
 }
 
-for entry in "${entries[@]}"; do
+# Drain oldest-first (FIFO by enqueue mtime), bounded by AGAM_MAX_PER_RUN.
+# `ls -1tr` sorts by mtime ascending; queue filenames are <session_id>.json
+# (no spaces/newlines), so reading them line-by-line is safe. Pairing
+# oldest-first with the per-run cap means a backlog drains in order over
+# successive ticks instead of starving old entries or blowing up one tick.
+MAX_PER_RUN="${AGAM_MAX_PER_RUN:-25}"
+MAX_RETRIES="${AGAM_MAX_RETRIES:-3}"
+RETRY_DIR="$AGAM_HOME/.retries"
+mkdir -p "$RETRY_DIR"
+
+drained=0
+ok_n=0
+err_n=0
+retry_n=0
+while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if [[ $drained -ge $MAX_PER_RUN ]]; then
+        log "per-run-cap cap=$MAX_PER_RUN drained=$drained remaining=$(( ${#entries[@]} - drained ))"
+        break
+    fi
     name=$(basename "$entry")
     run_entry "$entry"
     rc=$?
+    drained=$((drained + 1))
     if [[ $rc -eq 0 ]]; then
         mv "$entry" "$AGAM_HOME/processed/$name"
+        rm -f "$RETRY_DIR/$name"
+        ok_n=$((ok_n + 1))
         log "ok $name"
     else
-        mv "$entry" "$AGAM_HOME/queue-errors/$name"
-        log "err $name rc=$rc"
+        # Bounded retry: count failures in a sidecar; leave the entry in queue/
+        # so the next tick retries it. Only dead-letter after MAX_RETRIES so a
+        # transient blip doesn't permanently exile a real session.
+        rfile="$RETRY_DIR/$name"
+        n=$(( $(cat "$rfile" 2>/dev/null || echo 0) + 1 ))
+        if [[ $n -ge $MAX_RETRIES ]]; then
+            mv "$entry" "$AGAM_HOME/queue-errors/$name"
+            rm -f "$rfile"
+            err_n=$((err_n + 1))
+            log "err $name rc=$rc attempts=$n dead-letter"
+        else
+            echo "$n" > "$rfile"
+            retry_n=$((retry_n + 1))
+            log "retry $name rc=$rc attempt=$n/$MAX_RETRIES"
+        fi
     fi
-done
+done < <(ls -1tr "$AGAM_HOME"/queue/*.json 2>/dev/null)
 
-log "drain-done"
+log "drain-done ok=$ok_n err=$err_n retry=$retry_n"

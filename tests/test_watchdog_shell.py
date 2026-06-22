@@ -371,7 +371,10 @@ def test_mixed_success_and_failure(tmp_path):
         exec_rc_map={"good": 0, "bad": 3},
     )
 
-    env = _env(home, bin_dir)
+    # MAX_RETRIES=1 -> a single failure dead-letters immediately (the pre-retry
+    # behavior this test was written for). Retry-then-dead-letter is covered
+    # separately in test_transient_failure_retries_then_dead_letters.
+    env = _env(home, bin_dir, AGAM_MAX_RETRIES="1")
     r = _run(env)
     assert r.returncode == 0, r.stderr
 
@@ -410,3 +413,71 @@ def test_container_name_override(tmp_path):
     assert docker_log.exists()
     assert "exec -i pinned-box" in docker_log.read_text()
     assert (home / "processed" / "o.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# 8. Per-run cap drains the OLDEST entries first; the rest wait for next tick.
+# ---------------------------------------------------------------------------
+def test_per_run_cap_drains_oldest_first(tmp_path):
+    home = _make_home(tmp_path)
+    # Four entries; force ascending mtimes so a is oldest, d is newest.
+    names = ["a", "b", "c", "d"]
+    for i, n in enumerate(names):
+        f = home / "queue" / f"{n}.json"
+        f.write_text(f'{{"entry={n}":1}}')
+        os.utime(f, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    bin_dir = tmp_path / "bin"
+    _write_fake_docker(
+        bin_dir,
+        ps_stdout="my-claude-x ghcr.io/anthropic/claude-code:latest",
+        exec_rc=0,
+    )
+
+    env = _env(home, bin_dir, AGAM_MAX_PER_RUN="2")
+    r = _run(env)
+    assert r.returncode == 0, r.stderr
+
+    # The two OLDEST drained; the two newest remain queued for the next tick.
+    assert (home / "processed" / "a.json").exists()
+    assert (home / "processed" / "b.json").exists()
+    assert (home / "queue" / "c.json").exists()
+    assert (home / "queue" / "d.json").exists()
+    assert not (home / "processed" / "c.json").exists()
+
+    tail = (home / "logs" / "watchdog.log").read_text()
+    assert "per-run-cap cap=2" in tail
+    assert "remaining=2" in tail
+
+
+# ---------------------------------------------------------------------------
+# 9. Transient failure retries in place, then dead-letters after MAX_RETRIES.
+# ---------------------------------------------------------------------------
+def test_transient_failure_retries_then_dead_letters(tmp_path):
+    home = _make_home(tmp_path)
+    (home / "queue" / "flap.json").write_text('{"entry=flap":1}')
+
+    bin_dir = tmp_path / "bin"
+    _write_fake_docker(
+        bin_dir,
+        ps_stdout="my-claude-x ghcr.io/anthropic/claude-code:latest",
+        exec_rc_map={"flap": 5},  # always fails
+    )
+
+    env = _env(home, bin_dir, AGAM_MAX_RETRIES="2")
+
+    # Tick 1: first failure -> stays in queue, retry counter at 1, not exiled.
+    r = _run(env)
+    assert r.returncode == 0, r.stderr
+    assert (home / "queue" / "flap.json").exists()
+    assert not (home / "queue-errors" / "flap.json").exists()
+    assert (home / ".retries" / "flap.json").read_text().strip() == "1"
+    assert "retry flap.json rc=5 attempt=1/2" in (home / "logs" / "watchdog.log").read_text()
+
+    # Tick 2: second failure hits MAX_RETRIES -> dead-letter, counter cleared.
+    r = _run(env)
+    assert r.returncode == 0, r.stderr
+    assert not (home / "queue" / "flap.json").exists()
+    assert (home / "queue-errors" / "flap.json").exists()
+    assert not (home / ".retries" / "flap.json").exists()
+    assert "dead-letter" in (home / "logs" / "watchdog.log").read_text()

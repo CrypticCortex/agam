@@ -37,7 +37,9 @@ from collections import deque
 HOME = pathlib.Path(os.path.expanduser("~"))
 
 AGAM_HOME = pathlib.Path(
-    os.environ.get("AGAM_HOME", str(HOME / ".claude" / "agam"))
+    os.environ.get("AGAM_HOME")
+    or os.environ.get("AGAM_DATA_HOME")
+    or str(HOME / ".agam")
 )
 PROMPTS = pathlib.Path(
     os.environ.get("AGAM_PROMPTS_DIR", str(AGAM_HOME / "prompts"))
@@ -258,14 +260,44 @@ def fill(template: pathlib.Path, **vars: str) -> str:
     return text
 
 
+# Which LLM CLI drives enrichment. Set by agam_watchdog.sh's host probe:
+# "claude" when on PATH, else "cursor-agent". Lets Cursor enrich the graph
+# standalone on a host with no Claude installed.
+LLM_CLI = os.environ.get("AGAM_LLM_CLI", "claude")
+
+# Graph-only mode: do the deterministic graph_update and skip the LLM layer
+# (work-log + agam-sync). Set this where the agent CLI can't write files in
+# headless mode (e.g. host `claude -p`), so we enrich the graph without burning
+# tokens on model calls that can't persist their output.
+GRAPH_ONLY = os.environ.get("AGAM_GRAPH_ONLY", "").strip() == "1"
+
+
 def run_claude(prompt: str, *, model: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run the enrichment prompt through whichever agent CLI is available.
+
+    claude: prompt on stdin, --model honored (haiku/sonnet slugs).
+    cursor-agent: prompt as a positional arg, --force for headless file writes.
+      Cursor uses its own model names, so we let it pick its default rather than
+      passing a claude-specific slug.
+    """
+    if LLM_CLI == "cursor-agent":
+        return subprocess.run(
+            ["cursor-agent", "-p", "--force", "--output-format", "text", prompt],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    # Pass the prompt as a positional argument, not stdin. Host `claude -p`
+    # rejects piped stdin in some builds ("Input must be provided ... when using
+    # --print"); the positional form works on host and in containers alike.
     return subprocess.run(
         [
-            "claude", "-p", "--disable-slash-commands",
+            "claude", "-p", prompt,
+            "--disable-slash-commands",
             "--permission-mode", "acceptEdits",
             "--model", model,
         ],
-        input=prompt,
         text=True,
         capture_output=True,
         timeout=timeout,
@@ -387,7 +419,7 @@ After completing analysis, write a JSON file to {proposals_path} with this exact
   "thisai_projects": [{"name": "Project Name", "note": "progress note"}],
   "thisai_goals": [{"name": "Goal Name", "note": "progress note"}],
   "memory": [{"filename": "x.md", "type": "user|feedback|project|reference", "description": "hook", "content": "body"}],
-  "lesson": [{"title": "Short title", "body": "[lesson] **Title.** Explanation. Source: DATE session."}],
+  "lesson": [{"title": "Short title", "severity": "high|medium|low", "body": "[lesson] **Title.** Explanation. Source: DATE session."}],
   "insight": [{"title": "Short title", "body": "[insight] **Title.** Explanation. Source: DATE session."}],
   "correction": [{"title": "Short title", "body": "[correction] **Title** (DATE). Summary."}],
   "obsolete": [{"name": "entity-name", "reason": "why no longer current"}]
@@ -412,26 +444,41 @@ def main() -> int:
     sid = entry.get("session_id", "unknown")
     transcript = entry.get("transcript_path", "")
     cwd = entry.get("cwd", "")
+    agent = entry.get("agent", "unknown")
     project = pathlib.Path(cwd).name or "unknown"
 
     log(sid, "start", transcript=transcript, cwd=cwd)
 
-    # Step a: graph-update (pure Python, no LLM)
+    # Step a: graph-update (pure Python, no LLM). This is the durable enrichment
+    # floor -- it writes entities/relationships + source-agent provenance with no
+    # model call, so it works even on a host where `claude -p` can't write files.
     graph_update = HOOKS / "graph_update.py"
+    graph_update_ok = False
     if graph_update.exists():
         try:
-            subprocess.run(
+            r = subprocess.run(
                 [str(graph_update)],
-                input=json.dumps({"session_id": sid, "transcript_path": transcript}),
+                input=json.dumps({
+                    "session_id": sid,
+                    "transcript_path": transcript,
+                    "agent": agent,
+                }),
                 text=True,
                 timeout=30,
                 check=False,
             )
-            log(sid, "graph-update-done")
+            graph_update_ok = (r.returncode == 0)
+            log(sid, "graph-update-done", rc=r.returncode)
         except subprocess.TimeoutExpired:
             log(sid, "graph-update-timeout")
     else:
         log(sid, "graph-update-missing")
+
+    # Graph-only mode stops here: deterministic enrichment done, skip the LLM
+    # layer entirely (no token spend).
+    if GRAPH_ONLY:
+        log(sid, "graph-only-done", graph_update_ok=graph_update_ok)
+        return 0 if graph_update_ok else 1
 
     today = time.strftime("%Y-%m-%d")
     now = time.strftime("%H:%M")
@@ -520,7 +567,11 @@ def main() -> int:
     # Step d: apply
     if proposals_path.exists():
         applier = TOOLS / "apply_proposals.py"
-        r = subprocess.run([str(applier), str(proposals_path)], timeout=30, capture_output=True, text=True)
+        r = subprocess.run(
+            [str(applier), str(proposals_path)],
+            timeout=30, capture_output=True, text=True,
+            env=dict(os.environ, AGAM_SOURCE_AGENT=agent),
+        )
         log(sid, "apply-done", rc=r.returncode, stdout=r.stdout.strip(), stderr=r.stderr.strip())
         try:
             proposals_path.unlink(missing_ok=True)
@@ -533,10 +584,15 @@ def main() -> int:
         subprocess.Popen([str(lint), "--quick"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log(sid, "lint-fired")
 
-    if work_log_ok and sync_ok:
-        log(sid, "done")
+    # Graph enrichment is the floor: if it succeeded, the session is processed
+    # even when the LLM layer (work-log / agam-sync) could not run (e.g. host
+    # claude -p without file-write tools). The LLM layer is best-effort on top.
+    if graph_update_ok or (work_log_ok and sync_ok):
+        log(sid, "done", graph_update_ok=graph_update_ok,
+            work_log_ok=work_log_ok, sync_ok=sync_ok)
         return 0
-    log(sid, "partial", work_log_ok=work_log_ok, sync_ok=sync_ok)
+    log(sid, "partial", graph_update_ok=graph_update_ok,
+        work_log_ok=work_log_ok, sync_ok=sync_ok)
     return 1
 
 

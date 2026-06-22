@@ -11,6 +11,7 @@ Usage:
     agam_context.py entity <name>     Deep entity context from graph + work-log + git
     agam_context.py direction         Goals, projects, stall signals
     agam_context.py learned           Lessons, corrections, insights
+    agam_context.py render-rule       Emit a Cursor .mdc digest (identity + hot graph + lessons)
 
 Environment variables:
     AGAM_HOME          Directory holding AGAM.md / THISAI.md / MUGAM.md
@@ -226,11 +227,20 @@ def _watchdog_sync_status():
 
     log_path = AGAM_HOME / ".watchdog-log"
     queue_path = AGAM_HOME / ".pending-closes.jsonl"
+    queue_dir = AGAM_HOME / "queue"
 
+    # Post-migration the queue is file-per-session under queue/; the legacy
+    # .pending-closes.jsonl may still hold rows for the container watchdog.
+    # Count both so the boot status reflects reality.
     queue_depth = 0
+    if queue_dir.exists():
+        try:
+            queue_depth += sum(1 for _ in queue_dir.glob("*.json"))
+        except OSError:
+            pass
     if queue_path.exists():
         try:
-            queue_depth = sum(1 for line in queue_path.read_text().splitlines() if line.strip())
+            queue_depth += sum(1 for line in queue_path.read_text().splitlines() if line.strip())
         except OSError:
             pass
 
@@ -469,6 +479,93 @@ def cmd_learned():
         print(f"[NOT FOUND] No 'What I've Learned' section in AGAM.md at {AGAM_MD}")
 
 
+def _load_identity_digest():
+    """Pull name + primary-goal from config.yaml (cheap, no yaml dep)."""
+    name = goal = ""
+    cfg = AGAM_HOME / "config.yaml"
+    if cfg.exists():
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            if line.startswith("name:"):
+                name = line.split(":", 1)[1].strip().strip('"')
+            elif line.startswith("primary-goal:"):
+                goal = line.split(":", 1)[1].strip().strip('"')
+    return name, goal
+
+
+def cmd_render_rule(max_entities=12):
+    """Emit a Cursor rule (.mdc) carrying identity + hot graph state + lessons.
+
+    This is Cursor's only reliable model-facing channel: a rule file with
+    ``alwaysApply: true`` is read into the model's context every prompt. It is
+    NOT per-prompt selective (Cursor hooks cannot inject), so we surface the
+    highest-signal slice: who the user is, the most recently active entities,
+    and any high-severity lessons. The Cursor stop hook regenerates this file
+    after each turn so it stays fresh.
+    """
+    lines = [
+        "---",
+        "alwaysApply: true",
+        "---",
+        "# agam memory (auto-generated -- do not edit; refreshed by agam after each turn)",
+    ]
+    name, goal = _load_identity_digest()
+    if name or goal:
+        lines.append("")
+        if name:
+            lines.append(f"User: {name}")
+        if goal:
+            lines.append(f"Primary goal: {goal}")
+
+    db = get_db()
+    if db:
+        def _source_agent(name):
+            """Provenance tag for an entity, e.g. ' (cursor)'. Empty if unknown."""
+            try:
+                r = db.execute(
+                    """SELECT p.value FROM properties p
+                       JOIN entities e ON p.entity_id = e.id
+                       WHERE e.name = ? AND p.key = 'source-agent' LIMIT 1""",
+                    (name,),
+                ).fetchone()
+            except sqlite3.Error:
+                return ""
+            val = (r["value"] if r and hasattr(r, "keys") else (r[0] if r else "")) or ""
+            return f" ({val})" if val and val != "unknown" else ""
+
+        ents = recently_active_entities(db, max_entities)
+        if ents:
+            lines.append("")
+            lines.append("## Hot context (recent knowledge-graph state)")
+            for e in ents:
+                desc = (e.get("description") or "")[:100]
+                lines.append(f"- {e['name']} [{e['type']}]{_source_agent(e['name'])}: {desc}")
+        try:
+            lessons = db.execute(
+                """SELECT e.name, e.description
+                   FROM entities e JOIN properties p ON e.id = p.entity_id
+                   WHERE e.type = 'lesson' AND p.key = 'severity'
+                         AND p.value = 'high'
+                   LIMIT 5"""
+            ).fetchall()
+        except sqlite3.Error:
+            lessons = []
+        if lessons:
+            lines.append("")
+            lines.append("## Active lessons")
+            for row in lessons:
+                nm = row["name"] if hasattr(row, "keys") else row[0]
+                desc = (row["description"] if hasattr(row, "keys") else row[1]) or ""
+                lines.append(f"- {nm}{_source_agent(nm)}: {desc[:100]}")
+        db.close()
+
+    lines.append("")
+    lines.append(
+        "(Recall on Cursor is advisory -- per-prompt injection is unavailable. "
+        "Treat the above as your lived experience and cite these entities when relevant.)"
+    )
+    print(truncate("\n".join(lines)))
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -478,6 +575,8 @@ def main():
 
     if cmd == "boot":
         cmd_boot()
+    elif cmd == "render-rule":
+        cmd_render_rule()
     elif cmd == "entity":
         if len(sys.argv) < 3:
             print("Usage: agam_context.py entity <name>")
