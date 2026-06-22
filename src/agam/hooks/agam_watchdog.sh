@@ -21,6 +21,13 @@
 #   AGAM_WATCHDOG_MODE     host | container (legacy alias)
 #   AGAM_CONTAINER_PATTERN regex (default claude-code)
 #   AGAM_CONTAINER_NAME    exact name override
+#   AGAM_MAX_PER_RUN       max entries drained per tick (default 25). Bounds
+#                          one pass so a backlog after downtime can't fire an
+#                          unbounded number of enrichment runs at once.
+#   AGAM_MAX_RETRIES       attempts before an entry is dead-lettered to
+#                          queue-errors/ (default 3). A transient failure
+#                          (e.g. container mid-restart) is retried next tick
+#                          instead of being exiled permanently.
 set -u
 
 AGAM_HOME="${AGAM_HOME:-${AGAM_DATA_HOME:-$HOME/.agam}}"
@@ -241,17 +248,52 @@ run_entry() {
     esac
 }
 
-for entry in "${entries[@]}"; do
+# Drain oldest-first (FIFO by enqueue mtime), bounded by AGAM_MAX_PER_RUN.
+# `ls -1tr` sorts by mtime ascending; queue filenames are <session_id>.json
+# (no spaces/newlines), so reading them line-by-line is safe. Pairing
+# oldest-first with the per-run cap means a backlog drains in order over
+# successive ticks instead of starving old entries or blowing up one tick.
+MAX_PER_RUN="${AGAM_MAX_PER_RUN:-25}"
+MAX_RETRIES="${AGAM_MAX_RETRIES:-3}"
+RETRY_DIR="$AGAM_HOME/.retries"
+mkdir -p "$RETRY_DIR"
+
+drained=0
+ok_n=0
+err_n=0
+retry_n=0
+while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if [[ $drained -ge $MAX_PER_RUN ]]; then
+        log "per-run-cap cap=$MAX_PER_RUN drained=$drained remaining=$(( ${#entries[@]} - drained ))"
+        break
+    fi
     name=$(basename "$entry")
     run_entry "$entry"
     rc=$?
+    drained=$((drained + 1))
     if [[ $rc -eq 0 ]]; then
         mv "$entry" "$AGAM_HOME/processed/$name"
+        rm -f "$RETRY_DIR/$name"
+        ok_n=$((ok_n + 1))
         log "ok $name"
     else
-        mv "$entry" "$AGAM_HOME/queue-errors/$name"
-        log "err $name rc=$rc"
+        # Bounded retry: count failures in a sidecar; leave the entry in queue/
+        # so the next tick retries it. Only dead-letter after MAX_RETRIES so a
+        # transient blip doesn't permanently exile a real session.
+        rfile="$RETRY_DIR/$name"
+        n=$(( $(cat "$rfile" 2>/dev/null || echo 0) + 1 ))
+        if [[ $n -ge $MAX_RETRIES ]]; then
+            mv "$entry" "$AGAM_HOME/queue-errors/$name"
+            rm -f "$rfile"
+            err_n=$((err_n + 1))
+            log "err $name rc=$rc attempts=$n dead-letter"
+        else
+            echo "$n" > "$rfile"
+            retry_n=$((retry_n + 1))
+            log "retry $name rc=$rc attempt=$n/$MAX_RETRIES"
+        fi
     fi
-done
+done < <(ls -1tr "$AGAM_HOME"/queue/*.json 2>/dev/null)
 
-log "drain-done"
+log "drain-done ok=$ok_n err=$err_n retry=$retry_n"
