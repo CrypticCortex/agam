@@ -11,7 +11,11 @@ from unittest import mock
 
 import pytest
 
-from agam.settings_merger import merge_hooks, merge_hooks_into_settings
+from agam.settings_merger import (
+    _guarded,
+    merge_hooks,
+    merge_hooks_into_settings,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +209,112 @@ def test_merge_hooks_into_settings_creates_file_when_missing(tmp_path: Path):
     assert any("Edit" in m and "Write" in m and "MultiEdit" in m for m in pre_matchers), (
         f"PreToolUse missing Edit|Write|MultiEdit matcher; got: {pre_matchers}"
     )
+
+
+def test_agam_commands_are_guarded_against_missing_files(tmp_path: Path):
+    # A registered command pointing at an absent script must NOT error on
+    # every event (the devcontainer-inherits-host-settings case). Each Agam
+    # command is wrapped so a missing file short-circuits to a no-op, while
+    # exec preserves the real exit code when the script is present (blocking
+    # PreToolUse hooks must still be able to block).
+    settings_path = tmp_path / "settings.json"
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    merge_hooks_into_settings(settings_path, hooks_dir)
+    disk = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    cmds = [
+        inner["command"]
+        for blocks in disk["hooks"].values()
+        for block in blocks
+        for inner in block["hooks"]
+    ]
+    assert cmds, "expected agam hooks to be registered"
+    for c in cmds:
+        assert c.startswith("[ -x "), f"command not guarded: {c}"
+        assert "exec " in c and c.endswith("|| true"), c
+        # Guard and exec must point at the same absolute script path.
+        assert str(hooks_dir) in c, c
+
+
+def test_guarded_shell_escapes_metacharacters():
+    # A path containing shell metacharacters must not be expandable or
+    # word-splittable by the shell that runs the hook. shlex.quote handles
+    # $VAR, $(...), and spaces.
+    cmd = _guarded(Path("/home/$(touch pwned)/x y/hook.py"))
+    # The path is single-quoted so the shell treats it verbatim -- no
+    # command substitution, no word-splitting on the space.
+    assert "'/home/$(touch pwned)/x y/hook.py'" in cmd
+    # No unquoted $(...) that the shell would execute.
+    assert "$(touch pwned)" not in cmd.replace(
+        "'/home/$(touch pwned)/x y/hook.py'", ""
+    )
+    assert cmd.startswith("[ -x ") and cmd.endswith("|| true")
+
+
+def test_legacy_bare_path_entries_are_superseded(tmp_path: Path):
+    # A pre-guard install left a bare-path agam command that errors on every
+    # event. Re-merging must REPLACE it with the guarded form, not append a
+    # second entry beside the still-broken one.
+    settings_path = tmp_path / "settings.json"
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    legacy_cmd = str(hooks_dir / "graph_recall.py")
+    user_settings = {
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": legacy_cmd}],
+                }
+            ]
+        }
+    }
+    settings_path.write_text(json.dumps(user_settings), encoding="utf-8")
+
+    merge_hooks_into_settings(settings_path, hooks_dir)
+    disk = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    ups_cmds = [
+        inner["command"]
+        for block in disk["hooks"]["UserPromptSubmit"]
+        for inner in block["hooks"]
+    ]
+    # The bare command is gone; exactly one guarded entry remains that
+    # still references the script path.
+    assert legacy_cmd not in ups_cmds
+    assert len(ups_cmds) == 1
+    only = ups_cmds[0]
+    assert only.startswith("[ -x ") and only.endswith("|| true")
+    assert legacy_cmd in only and "exec " in only
+
+
+def test_strip_does_not_touch_user_hooks(tmp_path: Path):
+    # Stripping legacy agam entries must never remove a user's own hook,
+    # even one that lives in the same hooks dir.
+    settings_path = tmp_path / "settings.json"
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    user_cmd = str(hooks_dir / "my-own-hook.py")
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"matcher": "", "hooks": [{"command": user_cmd}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    merge_hooks_into_settings(settings_path, hooks_dir)
+    disk = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    ups_cmds = [
+        inner["command"]
+        for block in disk["hooks"]["UserPromptSubmit"]
+        for inner in block["hooks"]
+    ]
+    assert user_cmd in ups_cmds
 
 
 def test_merge_hooks_into_settings_is_idempotent(tmp_path: Path):
