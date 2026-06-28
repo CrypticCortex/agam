@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+import types
 
 import pytest
 
@@ -83,6 +85,98 @@ def test_cli_init_target_cursor(monkeypatch):
     rc = cli.main(["init", "--target", "cursor"])
     assert rc == 0
     assert called[0]["targets"] == ["cursor"]
+
+
+def test_cli_init_detected_both_prompts_for_explicit_target_choice(monkeypatch, tmp_path):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    called: list[dict] = []
+    seen_choices: list[str] = []
+
+    class FakeAgent:
+        def __init__(self, name: str):
+            self.name = name
+
+        def detect_evidence(self, home):
+            return f"{self.name} present"
+
+    class FakeChoice:
+        def __init__(self, title, value=None, checked=False):
+            self.title = title
+            self.value = value
+            self.checked = checked
+
+    class FakeQuestion:
+        def __init__(self, choices):
+            seen_choices.extend(c.title for c in choices)
+
+        def ask(self):
+            return ["cursor"]
+
+    fake_questionary = types.SimpleNamespace(
+        Choice=FakeChoice,
+        select=lambda _message, choices: FakeQuestion(choices),
+    )
+
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setitem(sys.modules, "questionary", fake_questionary)
+    monkeypatch.setattr(
+        "agam.agents.detect_agents",
+        lambda home: [FakeAgent("claude"), FakeAgent("cursor")],
+    )
+    monkeypatch.setattr(
+        "agam.installer.run_install",
+        lambda answers, **kw: called.append(kw) or MockResult(),
+    )
+
+    rc = cli.main(["init"])
+    assert rc == 0
+    assert called[0]["targets"] == ["cursor"]
+    assert seen_choices == [
+        "Claude only",
+        "Cursor only",
+        "Both Claude + Cursor (recommended)",
+    ]
+
+
+def test_cli_init_cancelled_target_prompt_aborts(monkeypatch, tmp_path):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    called: list[dict] = []
+
+    class FakeAgent:
+        def __init__(self, name: str):
+            self.name = name
+
+        def detect_evidence(self, home):
+            return f"{self.name} present"
+
+    class FakeChoice:
+        def __init__(self, title, value=None):
+            self.title = title
+            self.value = value
+
+    fake_questionary = types.SimpleNamespace(
+        Choice=FakeChoice,
+        select=lambda *_args, **_kw: types.SimpleNamespace(ask=lambda: None),
+    )
+
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setitem(sys.modules, "questionary", fake_questionary)
+    monkeypatch.setattr(
+        "agam.agents.detect_agents",
+        lambda home: [FakeAgent("claude"), FakeAgent("cursor")],
+    )
+    monkeypatch.setattr(
+        "agam.installer.run_install",
+        lambda answers, **kw: called.append(kw) or MockResult(),
+    )
+
+    rc = cli.main(["init"])
+    assert rc == 1
+    assert not called
 
 
 def test_cli_init_with_answers_yaml(monkeypatch, tmp_path):
@@ -462,6 +556,193 @@ def test_cli_uninstall_confirm_moves_data_dirs(monkeypatch, tmp_path, capsys):
     assert not agam_dir.exists()
     backups = list((tmp_path / ".claude").glob("agam.uninstalled-*"))
     assert len(backups) == 1, f"expected one backup dir, got {backups}"
+
+
+def test_cli_uninstall_target_cursor_cleans_cursor_only(monkeypatch, tmp_path):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cursor = tmp_path / ".cursor"
+    (cursor / "hooks").mkdir(parents=True)
+    (cursor / "tools" / "agam").mkdir(parents=True)
+    (cursor / "hooks" / "cursor_stop.py").write_text("# agam\n")
+    (cursor / "hooks" / "cursor_session_end.py").write_text("# agam\n")
+    (cursor / "tools" / "agam" / "pending_queue.py").write_text("# agam\n")
+    (cursor / "hooks.json").write_text(
+        '{"version":1,"hooks":{"stop":['
+        '{"command":"/tmp/cursor_stop.py"},'
+        '{"command":"/tmp/keep-me.sh"}'
+        ']}}\n'
+    )
+    (tmp_path / ".agam").mkdir()
+    claude_agam = tmp_path / ".claude" / "agam"
+    claude_agam.mkdir(parents=True)
+    (claude_agam / "AGAM.md").write_text("keep\n")
+
+    rc = cli.main(["uninstall", "--target", "cursor", "--confirm"])
+    assert rc == 0
+    assert not (cursor / "hooks" / "cursor_stop.py").exists()
+    assert not (cursor / "hooks" / "cursor_session_end.py").exists()
+    assert not (cursor / "tools" / "agam").exists()
+    assert "/tmp/cursor_stop.py" not in (cursor / "hooks.json").read_text()
+    assert "/tmp/keep-me.sh" in (cursor / "hooks.json").read_text()
+    assert claude_agam.exists()
+    assert (tmp_path / ".agam").exists()
+
+
+def test_cli_uninstall_claude_cleans_agam_env_vars(monkeypatch, tmp_path):
+    import json
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({
+        "env": {
+            "AGAM_DATA_HOME": "/tmp/agam",
+            "AGAM_KG_PATH": "/tmp/graph.db",
+            "AGAM_USER_ENTITY": "User",
+            "KEEP_ME": "1",
+        },
+        "hooks": {
+            "Stop": [
+                {"hooks": [{"command": "/tmp/graph_recall.py"}]},
+                {"hooks": [{"command": "/tmp/keep.sh"}]},
+            ],
+        },
+    }))
+
+    rc = cli.main(["uninstall", "--target", "claude", "--confirm"])
+    assert rc == 0
+    cleaned = json.loads(settings.read_text())
+    assert "AGAM_DATA_HOME" not in cleaned["env"]
+    assert "AGAM_KG_PATH" not in cleaned["env"]
+    assert "AGAM_USER_ENTITY" not in cleaned["env"]
+    assert cleaned["env"]["KEEP_ME"] == "1"
+    assert "/tmp/keep.sh" in json.dumps(cleaned)
+    assert "graph_recall" not in json.dumps(cleaned)
+
+
+def test_cli_uninstall_both_moves_shared_home_and_cleans_both(monkeypatch, tmp_path):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shared = tmp_path / ".agam"
+    shared.mkdir()
+    (shared / "AGAM.md").write_text("shared\n")
+    claude_hook = tmp_path / ".claude" / "hooks" / "graph_recall.py"
+    claude_hook.parent.mkdir(parents=True)
+    claude_hook.write_text("# agam\n")
+    cursor_hook = tmp_path / ".cursor" / "hooks" / "cursor_stop.py"
+    cursor_hook.parent.mkdir(parents=True)
+    cursor_hook.write_text("# agam\n")
+    cursor_hooks = tmp_path / ".cursor" / "hooks.json"
+    cursor_hooks.write_text(
+        '{"version":1,"hooks":{"stop":['
+        '{"command":"/tmp/cursor_stop.py"},'
+        '{"command":"/tmp/keep-me.sh"}'
+        ']}}\n'
+    )
+
+    rc = cli.main([
+        "uninstall",
+        "--target",
+        "claude",
+        "--target",
+        "cursor",
+        "--confirm",
+    ])
+    assert rc == 0
+    assert not shared.exists()
+    assert len(list(tmp_path.glob(".agam.uninstalled-*"))) == 1
+    assert not claude_hook.exists()
+    assert not cursor_hook.exists()
+    assert "/tmp/cursor_stop.py" not in cursor_hooks.read_text()
+    assert "/tmp/keep-me.sh" in cursor_hooks.read_text()
+
+
+def test_cli_uninstall_cancel_does_not_remove_anything(monkeypatch, tmp_path):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    claude_hook = tmp_path / ".claude" / "hooks" / "graph_recall.py"
+    claude_hook.parent.mkdir(parents=True)
+    claude_hook.write_text("# agam\n")
+    cursor_hook = tmp_path / ".cursor" / "hooks" / "cursor_stop.py"
+    cursor_hook.parent.mkdir(parents=True)
+    cursor_hook.write_text("# agam\n")
+
+    class FakeChoice:
+        def __init__(self, title, value=None):
+            self.title = title
+            self.value = value
+
+    fake_questionary = types.SimpleNamespace(
+        Choice=FakeChoice,
+        select=lambda *_args, **_kw: types.SimpleNamespace(ask=lambda: None),
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setitem(sys.modules, "questionary", fake_questionary)
+
+    rc = cli.main(["uninstall", "--confirm"])
+    assert rc == 0
+    assert claude_hook.exists()
+    assert cursor_hook.exists()
+
+
+def test_cli_uninstall_shared_home_only_is_not_removed_by_default(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shared = tmp_path / ".agam"
+    shared.mkdir()
+    (shared / "AGAM.md").write_text("shared\n")
+
+    rc = cli.main(["uninstall"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "nothing to remove" in out
+    assert shared.exists()
+
+
+def test_cli_uninstall_explicit_target_does_not_remove_orphan_shared_home(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shared = tmp_path / ".agam"
+    shared.mkdir()
+    (shared / "AGAM.md").write_text("shared\n")
+
+    rc = cli.main(["uninstall", "--target", "cursor", "--confirm"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "nothing to remove" in out
+    assert shared.exists()
+
+
+def test_cli_uninstall_ignores_non_agam_agent_configs(monkeypatch, tmp_path, capsys):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    claude_settings = tmp_path / ".claude" / "settings.json"
+    claude_settings.parent.mkdir()
+    claude_settings.write_text('{"hooks":{"Stop":[{"hooks":[]}]}}\n')
+    cursor_hooks = tmp_path / ".cursor" / "hooks.json"
+    cursor_hooks.parent.mkdir()
+    cursor_hooks.write_text(
+        '{"version":1,"hooks":{"stop":[{"command":"/tmp/keep-me.sh"}]}}\n'
+    )
+
+    rc = cli.main(["uninstall"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "nothing to remove" in out
+    assert claude_settings.exists()
+    assert cursor_hooks.exists()
 
 
 def test_cli_upgrade_preserves_identity_and_kg(monkeypatch, tmp_path):

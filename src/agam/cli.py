@@ -77,6 +77,14 @@ def _load_answers_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _dedupe_targets(targets: list[str]) -> list[str]:
+    out: list[str] = []
+    for target in targets:
+        if target not in out:
+            out.append(target)
+    return out
+
+
 def _resolve_targets(args: argparse.Namespace, answers: dict[str, Any] | None) -> list[str]:
     """Decide which agents to wire: explicit flag/answers, else auto-detect.
 
@@ -88,33 +96,55 @@ def _resolve_targets(args: argparse.Namespace, answers: dict[str, Any] | None) -
     from agam.agents import detect_agents
 
     if getattr(args, "target", None):
-        return list(args.target)
+        return _dedupe_targets(list(args.target))
     if answers and isinstance(answers.get("targets"), list) and answers["targets"]:
-        return [str(t) for t in answers["targets"]]
+        return _dedupe_targets([str(t) for t in answers["targets"]])
 
     home = _home()
-    detected = [a.name for a in detect_agents(home)]
+    detected_agents = detect_agents(home)
+    detected = [a.name for a in detected_agents]
     if not detected:
+        print("[agam init] no supported agent detected; defaulting to Claude.")
         return ["claude"]
 
     # Interactive refine when a real wizard is in play (no scripted answers).
-    if answers is None:
+    # Make the install scope explicit when both agents are present: the old
+    # checkbox preselected everything, which made Cursor opt-out by accident.
+    if answers is None and sys.stdin.isatty():
         try:
             import questionary  # type: ignore[import-not-found]
 
             print("[agam init] detected agents:")
-            for a in detect_agents(home):
+            for a in detected_agents:
                 print(f"  - {a.name}: {a.detect_evidence(home)}")
-            chosen = questionary.checkbox(
-                "Install agam for which agents?",
-                choices=[
-                    questionary.Choice(name, checked=True) for name in detected
-                ],
-            ).ask()
+            if set(detected) >= {"claude", "cursor"}:
+                chosen = questionary.select(
+                    "Install agam for:",
+                    choices=[
+                        questionary.Choice("Claude only", value=["claude"]),
+                        questionary.Choice("Cursor only", value=["cursor"]),
+                        questionary.Choice(
+                            "Both Claude + Cursor (recommended)",
+                            value=["claude", "cursor"],
+                        ),
+                    ],
+                ).ask()
+            else:
+                print(f"[agam init] wiring detected agent: {', '.join(detected)}")
+                return detected
+            if chosen is None:
+                return []
             if chosen:
-                return chosen
+                return _dedupe_targets(list(chosen))
         except Exception:  # noqa: BLE001 -- non-interactive / no questionary
             pass
+    if len(detected) > 1:
+        print(
+            f"[agam init] detected {','.join(detected)}; wiring all. "
+            "Use --target claude or --target cursor to limit."
+        )
+    else:
+        print(f"[agam init] detected {detected[0]}; wiring it.")
     return detected
 
 
@@ -128,6 +158,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
         answers = _load_answers_yaml(Path(args.answers))
 
     targets = _resolve_targets(args, answers)
+    if not targets:
+        print("[agam init] cancelled.", file=sys.stderr)
+        return 1
 
     try:
         result = installer.run_install(answers, targets=targets)
@@ -1130,6 +1163,105 @@ def _cmd_upgrade(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _file_mentions_any(path: Path, markers: tuple[str, ...]) -> bool:
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(marker in text for marker in markers)
+
+
+def _detect_uninstall_targets(
+    *,
+    home: Path,
+    claude: Path,
+    claude_hook_files: list[Path],
+    cursor_hook_files: list[Path],
+) -> list[str]:
+    """Best-effort detection of which agent wirings are installed."""
+    cursor = home / ".cursor"
+    out: list[str] = []
+    if (
+        (claude / "agam").exists()
+        or (claude / "knowledge").exists()
+        or (claude / "tools" / "agam").exists()
+        or any(p.exists() for p in claude_hook_files)
+        or _file_mentions_any(
+            claude / "settings.json",
+            (
+                "graph_recall",
+                "graph_update",
+                "session_close",
+                "lesson_activate",
+                "agam_watchdog",
+                "AGAM_DATA_HOME",
+                "AGAM_KG_PATH",
+                "AGAM_USER_ENTITY",
+            ),
+        )
+    ):
+        out.append("claude")
+    if (
+        (cursor / "tools" / "agam").exists()
+        or any(p.exists() for p in cursor_hook_files)
+        or _file_mentions_any(
+            cursor / "hooks.json",
+            ("cursor_stop.py", "cursor_session_end.py", "/tools/agam/"),
+        )
+    ):
+        out.append("cursor")
+    return out
+
+
+def _resolve_uninstall_targets(
+    args: argparse.Namespace,
+    *,
+    installed: list[str],
+) -> list[str]:
+    """Decide which agent wiring to remove."""
+    explicit = getattr(args, "target", None)
+    if explicit:
+        return _dedupe_targets(list(explicit))
+    if not installed:
+        return []
+    if len(installed) == 1:
+        print(f"[agam uninstall] detected installed agent: {installed[0]}")
+        return installed
+    if not sys.stdin.isatty():
+        print(
+            f"[agam uninstall] detected {','.join(installed)}; uninstalling all. "
+            "Use --target claude or --target cursor to limit."
+        )
+        return installed
+    try:
+        import questionary  # type: ignore[import-not-found]
+
+        chosen = questionary.select(
+            "Uninstall Agam for:",
+            choices=[
+                questionary.Choice("Claude only", value=["claude"]),
+                questionary.Choice("Cursor only", value=["cursor"]),
+                questionary.Choice(
+                    "Both Claude + Cursor (recommended)",
+                    value=["claude", "cursor"],
+                ),
+            ],
+        ).ask()
+        if chosen is None:
+            return []
+        if chosen:
+            return _dedupe_targets(list(chosen))
+    except Exception:  # noqa: BLE001 -- non-interactive / no questionary
+        pass
+    print(
+        f"[agam uninstall] detected {','.join(installed)}; uninstalling all. "
+        "Use --target claude or --target cursor to limit."
+    )
+    return installed
+
+
 def _cmd_uninstall(args: argparse.Namespace) -> int:
     """Uninstall Agam from this machine.
 
@@ -1148,6 +1280,7 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
 
     home = _home()
     claude = home / ".claude"
+    cursor = home / ".cursor"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
     # File set Agam owns. Mirror of the installer's writes. Identity files
@@ -1171,33 +1304,84 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
         claude / "hooks" / "lesson-activate.py",
         claude / "hooks" / "lesson-activate-post.py",
     ]
+    cursor_hook_files = [
+        cursor / "hooks" / "cursor_stop.py",
+        cursor / "hooks" / "cursor_session_end.py",
+    ]
     tools_dir = claude / "tools" / "agam"
+    cursor_tools_dir = cursor / "tools" / "agam"
     agam_dir = claude / "agam"
     kg_dir = claude / "knowledge"
+    shared_data_dirs = [
+        home / ".agam",
+        claude / "cursor-agam",
+    ]
     settings_path = claude / "settings.json"
+    cursor_hooks_path = cursor / "hooks.json"
     plist_path = home / "Library" / "LaunchAgents" / "com.agam.watchdog.plist"
 
+    installed = _detect_uninstall_targets(
+        home=home,
+        claude=claude,
+        claude_hook_files=hook_files,
+        cursor_hook_files=cursor_hook_files,
+    )
+    targets = _resolve_uninstall_targets(args, installed=installed)
+    target_set = set(targets)
+    installed_set = set(installed)
+    remaining_after = installed_set - target_set
+    remove_shared = bool(target_set & installed_set) and not remaining_after
+
     plan: list[tuple[str, Path]] = []
-    if not args.purge:
-        # Soft uninstall: rename data dirs.
-        if agam_dir.exists():
-            plan.append(("move", agam_dir))
-        if kg_dir.exists():
-            plan.append(("move", kg_dir))
-    else:
-        if agam_dir.exists():
-            plan.append(("delete", agam_dir))
-        if kg_dir.exists():
-            plan.append(("delete", kg_dir))
-    for h in hook_files:
-        if h.exists():
-            plan.append(("delete", h))
-    if tools_dir.exists():
-        plan.append(("delete", tools_dir))
-    if plist_path.exists():
+    if "claude" in target_set:
+        if not args.purge:
+            # Soft uninstall: rename legacy Claude data dirs.
+            if agam_dir.exists():
+                plan.append(("move", agam_dir))
+            if kg_dir.exists():
+                plan.append(("move", kg_dir))
+        else:
+            if agam_dir.exists():
+                plan.append(("delete", agam_dir))
+            if kg_dir.exists():
+                plan.append(("delete", kg_dir))
+        for h in hook_files:
+            if h.exists():
+                plan.append(("delete", h))
+        if tools_dir.exists():
+            plan.append(("delete", tools_dir))
+        if _file_mentions_any(
+            settings_path,
+            (
+                "graph_recall",
+                "graph_update",
+                "session_close",
+                "lesson_activate",
+                "agam_watchdog",
+                "AGAM_DATA_HOME",
+                "AGAM_KG_PATH",
+                "AGAM_USER_ENTITY",
+            ),
+        ):
+            plan.append(("clean-settings", settings_path))
+    if "cursor" in target_set:
+        for h in cursor_hook_files:
+            if h.exists():
+                plan.append(("delete", h))
+        if cursor_tools_dir.exists():
+            plan.append(("delete", cursor_tools_dir))
+        if _file_mentions_any(
+            cursor_hooks_path,
+            ("cursor_stop.py", "cursor_session_end.py", "/tools/agam/"),
+        ):
+            plan.append(("clean-cursor-hooks", cursor_hooks_path))
+    if remove_shared:
+        for data_dir in shared_data_dirs:
+            if not data_dir.exists():
+                continue
+            plan.append(("delete" if args.purge else "move", data_dir))
+    if remove_shared and plist_path.exists():
         plan.append(("delete-plist", plist_path))
-    if settings_path.exists():
-        plan.append(("clean-settings", settings_path))
 
     if not plan:
         print("[agam uninstall] nothing to remove. Agam isn't installed here.")
@@ -1211,6 +1395,7 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
                 "delete": "delete",
                 "delete-plist": "unload + delete launchd plist",
                 "clean-settings": "remove Agam hook entries from settings.json",
+                "clean-cursor-hooks": "remove Agam hook entries from hooks.json",
             }[action]
             print(f"  {verb}: {p}")
         if args.purge:
@@ -1283,14 +1468,64 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
                             hooks[event] = kept
                         else:
                             del hooks[event]
-                    # Also remove AGAM_USER_ENTITY from env block (Agam-owned).
+                    # Also remove Agam-owned env vars.
                     env_block = settings.get("env", {})
                     if isinstance(env_block, dict):
-                        env_block.pop("AGAM_USER_ENTITY", None)
+                        for key in (
+                            "AGAM_DATA_HOME",
+                            "AGAM_HOME",
+                            "AGAM_KG_PATH",
+                            "AGAM_TOOLS_DIR",
+                            "AGAM_HOOKS_DIR",
+                            "AGAM_USER_ENTITY",
+                        ):
+                            env_block.pop(key, None)
                 # Atomic write.
                 import tempfile as _tf
                 fd, tmpname = _tf.mkstemp(
                     prefix=".settings-uninstall-",
+                    suffix=".json.tmp",
+                    dir=str(p.parent),
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json.dump(settings, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                os.replace(tmpname, p)
+                print(f"[agam uninstall] cleaned: {p}")
+            elif action == "clean-cursor-hooks":
+                settings = _json.loads(p.read_text(encoding="utf-8"))
+                hooks = settings.get("hooks", {})
+                if isinstance(hooks, dict):
+                    for event, entries in list(hooks.items()):
+                        if not isinstance(entries, list):
+                            continue
+                        kept = [
+                            entry for entry in entries
+                            if not (
+                                isinstance(entry, dict)
+                                and isinstance(entry.get("command"), str)
+                                and any(
+                                    marker in entry["command"]
+                                    for marker in (
+                                        "cursor_stop.py",
+                                        "cursor_session_end.py",
+                                        "/tools/agam/",
+                                    )
+                                )
+                            )
+                        ]
+                        if kept:
+                            hooks[event] = kept
+                        else:
+                            del hooks[event]
+                env_block = settings.get("env", {})
+                if isinstance(env_block, dict):
+                    for key in ("AGAM_DATA_HOME", "AGAM_KG_PATH", "AGAM_TOOLS_DIR"):
+                        env_block.pop(key, None)
+                # Atomic write.
+                import tempfile as _tf
+                fd, tmpname = _tf.mkstemp(
+                    prefix=".hooks-uninstall-",
                     suffix=".json.tmp",
                     dir=str(p.parent),
                 )
@@ -1359,18 +1594,18 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agam",
-        description="Persistent knowledge-graph context for Claude Code.",
+        description="Persistent knowledge-graph context for Claude Code and Cursor.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # -- init
     p_init = sub.add_parser(
-        "init", help="Install Agam scaffolding into ~/.claude/."
+        "init", help="Install Agam shared brain and agent wiring."
     )
     p_init.add_argument(
         "--force",
         action="store_true",
-        help="Back up and overwrite an existing ~/.claude/agam/.",
+        help="Back up and overwrite an existing Agam install.",
     )
     p_init.add_argument(
         "--answers",
@@ -1532,6 +1767,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--purge",
         action="store_true",
         help="Permanently delete data instead of moving to .uninstalled-<ts>/.",
+    )
+    p_un.add_argument(
+        "--target",
+        action="append",
+        choices=["claude", "cursor"],
+        default=None,
+        help="Agent wiring to remove (repeatable). Omit to auto-detect + prompt.",
     )
     p_un.set_defaults(func=_cmd_uninstall)
 
