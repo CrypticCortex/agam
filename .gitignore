@@ -11,3 +11,4 @@ build/
 # Local development artifacts (plans, scratch notes). Not shipped.
 docs/plans/
 docs/scratch/
+.worktrees/
