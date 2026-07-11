@@ -29,6 +29,9 @@ from pathlib import Path
 from typing import Any
 
 
+SUPPORTED_AGENT_TARGETS = ("claude", "cursor", "codex")
+
+
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
@@ -85,6 +88,10 @@ def _dedupe_targets(targets: list[str]) -> list[str]:
     return out
 
 
+def _target_hint() -> str:
+    return " or ".join(f"--target {name}" for name in SUPPORTED_AGENT_TARGETS)
+
+
 def _resolve_targets(args: argparse.Namespace, answers: dict[str, Any] | None) -> list[str]:
     """Decide which agents to wire: explicit flag/answers, else auto-detect.
 
@@ -117,7 +124,7 @@ def _resolve_targets(args: argparse.Namespace, answers: dict[str, Any] | None) -
             print("[agam init] detected agents:")
             for a in detected_agents:
                 print(f"  - {a.name}: {a.detect_evidence(home)}")
-            if set(detected) >= {"claude", "cursor"}:
+            if set(detected) == {"claude", "cursor"} and len(detected) == 2:
                 chosen = questionary.select(
                     "Install agam for:",
                     choices=[
@@ -129,19 +136,28 @@ def _resolve_targets(args: argparse.Namespace, answers: dict[str, Any] | None) -
                         ),
                     ],
                 ).ask()
+            elif len(detected) > 1:
+                chosen = questionary.checkbox(
+                    "Install agam for:",
+                    choices=[
+                        questionary.Choice(
+                            agent.name.title(), value=agent.name, checked=True
+                        )
+                        for agent in detected_agents
+                    ],
+                ).ask()
             else:
                 print(f"[agam init] wiring detected agent: {', '.join(detected)}")
                 return detected
             if chosen is None:
                 return []
-            if chosen:
-                return _dedupe_targets(list(chosen))
+            return _dedupe_targets(list(chosen))
         except Exception:  # noqa: BLE001 -- non-interactive / no questionary
             pass
     if len(detected) > 1:
         print(
             f"[agam init] detected {','.join(detected)}; wiring all. "
-            "Use --target claude or --target cursor to limit."
+            f"Use {_target_hint()} to limit."
         )
     else:
         print(f"[agam init] detected {detected[0]}; wiring it.")
@@ -469,12 +485,11 @@ def _format_size(n_bytes: int) -> str:
 
 
 def _cmd_status(_args: argparse.Namespace) -> int:
-    from agam import bootstrap
+    from agam import bootstrap, paths as agam_paths
 
-    home = _home()
-    agam_dir = home / ".claude" / "agam"
-    kg_path = home / ".claude" / "knowledge" / "graph.db"
-    queue_dir = home / ".claude" / ".agam-queue"
+    agam_dir = agam_paths.identity_dir()
+    kg_path = agam_paths.kg_path()
+    queue_dir = agam_paths.queue_dir()
     state = _state_path()
 
     print(f"Agam home:    {agam_dir}")
@@ -543,6 +558,86 @@ def _check(label: str, ok: bool | None, detail: str = "", fix: str = "") -> bool
     return ok is True
 
 
+def _hook_commands(path: Path) -> list[str]:
+    """Return flat and nested command handlers from an agent hook config."""
+    import json
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"{path} root must be a JSON object")
+    hooks = payload.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise TypeError(f"{path} hooks must be a JSON object")
+    commands: list[str] = []
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            command = entry.get("command")
+            if isinstance(command, str):
+                commands.append(command)
+            inner = entry.get("hooks", [])
+            if not isinstance(inner, list):
+                continue
+            for handler in inner:
+                if not isinstance(handler, dict):
+                    continue
+                command = handler.get("command")
+                if isinstance(command, str):
+                    commands.append(command)
+    return commands
+
+
+def _configured_watchdog_cli(home: Path) -> tuple[str, str] | None:
+    """Return a valid absolute host CLI configured for the watchdog.
+
+    Interactive shells and launchd commonly have different PATH values. Check
+    the explicit environment first, then the installed plist that launchd will
+    actually use, and accept only supported, executable absolute paths.
+    """
+    import plistlib
+
+    supported = {"claude", "cursor-agent", "codex"}
+    candidates: list[tuple[str, str]] = [
+        (
+            os.environ.get("AGAM_LLM_CLI_PIN", "").strip(),
+            os.environ.get("AGAM_LLM_CLI_PATH", "").strip(),
+        )
+    ]
+    plist_path = (
+        home / "Library" / "LaunchAgents" / "com.agam.watchdog.plist"
+    )
+    if plist_path.exists():
+        try:
+            plist = plistlib.loads(plist_path.read_bytes())
+            env = plist.get("EnvironmentVariables", {})
+            if isinstance(env, dict):
+                candidates.append(
+                    (
+                        str(env.get("AGAM_LLM_CLI_PIN", "")).strip(),
+                        str(env.get("AGAM_LLM_CLI_PATH", "")).strip(),
+                    )
+                )
+        except (OSError, plistlib.InvalidFileException, TypeError, ValueError):
+            pass
+
+    for pin, raw_path in candidates:
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        cli = pin or path.name
+        if (
+            cli in supported
+            and path.is_absolute()
+            and path.is_file()
+            and os.access(path, os.X_OK)
+        ):
+            return cli, str(path)
+    return None
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     """Run a battery of checks that diagnose common install failures.
 
@@ -550,15 +645,15 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     fail the exit code -- they exist for things like "no claude-code
     container running" which is fine for users on host-mode Claude Code.
     """
-    import json as _json
     import platform
     import subprocess
+    from agam import paths as agam_paths
 
     home = _home()
     fails = 0
 
     # 1. Identity files
-    agam_dir = home / ".claude" / "agam"
+    agam_dir = agam_paths.identity_dir()
     for f in ("AGAM.md", "THISAI.md", "MUGAM.md", "config.yaml"):
         if not _check(
             f"identity file: {f}",
@@ -569,7 +664,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             fails += 1
 
     # 2. KG present + readable
-    kg_path = home / ".claude" / "knowledge" / "graph.db"
+    kg_path = agam_paths.kg_path()
     kg_ok = False
     kg_count = 0
     if kg_path.exists():
@@ -599,93 +694,122 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         _check("KG file present", False, str(kg_path), "agam init")
         fails += 1
 
-    # 3. Hooks registered in settings.json
-    settings_path = home / ".claude" / "settings.json"
-    if settings_path.exists():
-        try:
-            settings = _json.loads(settings_path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
+    # 3. At least one selected agent has complete Agam hook wiring. Claude and
+    # Codex use nested command handlers; Cursor uses flat command entries, so
+    # the collector accepts both without assuming one provider's schema.
+    hook_specs = (
+        (
+            "Claude",
+            home / ".claude" / "settings.json",
+            home / ".claude" / "hooks",
+            ("graph_recall.py", "graph_update.py", "session_close.py"),
+        ),
+        (
+            "Cursor",
+            home / ".cursor" / "hooks.json",
+            home / ".cursor" / "hooks",
+            ("cursor_stop.py", "cursor_session_end.py"),
+        ),
+        (
+            "Codex",
+            home / ".codex" / "hooks.json",
+            home / ".codex" / "hooks" / "agam",
+            (
+                "graph_recall.py",
+                "codex_stop.py",
+                "lesson_activate.py",
+                "lesson_activate_post.py",
+            ),
+        ),
+    )
+    wired_agents = 0
+    for agent_name, config_path, hooks_dir, required_files in hook_specs:
+        owned_files = tuple(hooks_dir / name for name in required_files)
+        config_mentions_agam = _file_mentions_any(
+            config_path,
+            tuple(str(path) for path in owned_files),
+        )
+        if not config_mentions_agam and not any(path.exists() for path in owned_files):
+            continue
+        wired_agents += 1
+        if not config_path.exists():
             _check(
-                "settings.json parseable",
+                f"{agent_name} hook config present",
+                False,
+                str(config_path),
+                f"agam init --target {agent_name.lower()}",
+            )
+            fails += 1
+            continue
+        try:
+            commands = _hook_commands(config_path)
+        except Exception as exc:  # noqa: BLE001 -- doctor reports parse errors
+            _check(
+                f"{agent_name} hook config parseable",
                 False,
                 str(exc),
-                "inspect ~/.claude/settings.json manually",
+                f"inspect {config_path}",
             )
             fails += 1
-            settings = {}
-        # Walk every hook entry and look for any command path containing the
-        # canonical agam hook filenames. Substring match handles installer
-        # path variations (~/.claude vs absolute).
-        hook_section = settings.get("hooks", {})
-        all_commands: list[str] = []
-        if isinstance(hook_section, dict):
-            for entries in hook_section.values():
-                if not isinstance(entries, list):
-                    continue
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    for inner in entry.get("hooks", []):
-                        if isinstance(inner, dict):
-                            cmd = inner.get("command", "")
-                            if isinstance(cmd, str):
-                                all_commands.append(cmd)
-        required_markers = ("graph_recall", "graph_update", "session_close")
-        missing = [m for m in required_markers if not any(m in c for c in all_commands)]
+            continue
+        missing = [
+            name
+            for name, path in zip(required_files, owned_files)
+            if not path.exists() or not any(str(path) in command for command in commands)
+        ]
         if missing:
             _check(
-                "Agam hooks registered in settings.json",
+                f"{agent_name} Agam hooks registered",
                 False,
                 detail=f"missing: {', '.join(missing)}",
-                fix="agam init --force",
+                fix=f"agam init --target {agent_name.lower()}",
             )
             fails += 1
         else:
             _check(
-                "Agam hooks registered in settings.json",
+                f"{agent_name} Agam hooks registered",
                 True,
-                detail=f"{len(all_commands)} hook commands found",
+                detail=f"{len(required_files)} managed hooks at {hooks_dir}",
             )
-        # AGAM_USER_ENTITY env var present
-        user_entity = settings.get("env", {}).get("AGAM_USER_ENTITY") if isinstance(settings.get("env"), dict) else None
-        if user_entity:
-            _check("AGAM_USER_ENTITY set", True, detail=user_entity)
-        else:
-            _check(
-                "AGAM_USER_ENTITY set",
-                None,
-                detail="hooks will tag relations with the literal 'User'",
-                fix="agam init --force (re-runs the wizard with name capture)",
-            )
-    else:
+    if wired_agents == 0:
         _check(
-            "settings.json present",
+            "agent hook wiring present",
             False,
-            str(settings_path),
-            fix="agam init (will create settings.json with Agam hooks merged in)",
+            "no Agam-managed Claude, Cursor, or Codex hooks detected",
+            "agam init",
         )
         fails += 1
 
-    # 4. Claude CLI present on PATH. We don't check for a credentials.json
-    # file: on macOS host, Claude Code stores OAuth in Keychain and that
-    # file may never exist. Auth correctness is verified by the invoker
-    # cascade below when it actually calls ``claude -p``; this check just
-    # answers "is the binary reachable?"
-    claude_path = shutil.which("claude")
-    if claude_path:
-        _check("Claude Code CLI on PATH", True, detail=claude_path)
+    # 4. Supported host CLIs. Authentication is intentionally left to the
+    # selected CLI; this check only establishes launch-time reachability.
+    host_clis = {
+        "claude": shutil.which("claude"),
+        "cursor-agent": shutil.which("cursor-agent"),
+        "codex": shutil.which("codex"),
+    }
+    reachable = {name: path for name, path in host_clis.items() if path}
+    configured_cli = _configured_watchdog_cli(home)
+    watchdog_clis = dict(reachable)
+    if configured_cli is not None:
+        cli_name, cli_path = configured_cli
+        watchdog_clis.setdefault(cli_name, cli_path)
+    if watchdog_clis:
+        _check(
+            "supported watchdog agent CLI reachable",
+            True,
+            detail=", ".join(
+                f"{name}={path}" for name, path in watchdog_clis.items()
+            ),
+        )
     else:
         _check(
-            "Claude Code CLI on PATH",
-            False,
-            detail="`claude` not found",
-            fix="install Claude Code: https://claude.ai/code",
+            "supported watchdog agent CLI reachable",
+            None,
+            "none found on PATH or through the configured absolute launchd path",
+            "install a supported CLI or start a Claude Code container",
         )
-        fails += 1
 
-    # 5. Invoker cascade -- which paths Agam can use to call claude -p.
-    # At least one must be ok for bootstrap + watchdog auto-learning.
-    # graph_recall / graph_update / lesson hooks work without any invoker.
+    # 5. Claude container/host probes plus the agent-neutral watchdog paths.
     try:
         from agam.invoker import probe_all
         invoker_results = probe_all()
@@ -693,22 +817,28 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         invoker_results = []
         _check("Invoker cascade", False, str(exc), "report this as a bug")
         fails += 1
-    any_ok = any(r.ok for _, r in invoker_results)
+    claude_invoker_ok = any(r.ok for _, r in invoker_results)
     for inv, r in invoker_results:
         if r.ok:
             _check(f"invoker: {inv.name}", True, detail=r.detail)
         else:
             # WARN per invoker -- only the absence of EVERY invoker is a FAIL.
             _check(f"invoker: {inv.name}", None, detail=r.detail)
-    if invoker_results and not any_ok:
+    watchdog_ok = claude_invoker_ok or bool(watchdog_clis)
+    if not watchdog_ok:
         _check(
-            "at least one invoker healthy",
+            "at least one watchdog invoker healthy",
             False,
-            detail="bootstrap + watchdog auto-learning will not work",
-            fix="install Claude Code on host (`claude` on PATH) or start a "
-                "claude-code container",
+            detail="background auto-learning will not run",
+            fix="install claude, cursor-agent, or codex; or start a Claude Code container",
         )
         fails += 1
+    elif not (host_clis["claude"] or claude_invoker_ok):
+        _check(
+            "historical Claude transcript bootstrap available",
+            None,
+            "Codex/Cursor can run ongoing enrichment, but bootstrap still requires Claude",
+        )
 
     # 6. macOS launchd plist loaded
     if platform.system() == "Darwin":
@@ -758,7 +888,11 @@ def _kg_path() -> Path:
     env = os.environ.get("AGAM_KG_PATH")
     if env:
         return Path(env)
-    return _home() / ".claude" / "knowledge" / "graph.db"
+    neutral = _home() / ".agam" / "knowledge" / "graph.db"
+    legacy = _home() / ".claude" / "knowledge" / "graph.db"
+    # Prefer the agent-neutral graph. Fall back only for pre-migration installs
+    # so maintenance commands remain safe during an upgrade.
+    return neutral if neutral.exists() or not legacy.exists() else legacy
 
 
 def backfill_source_agent(kg_path: Path, agent: str) -> int:
@@ -963,7 +1097,8 @@ def _cmd_digest(args: argparse.Namespace) -> int:
     cutoff_iso = cutoff.isoformat()
     cutoff_naive = cutoff.replace(tzinfo=None).isoformat()
 
-    home = _home()
+    from agam import paths as agam_paths
+
     kg = _kg_path()
     print(f"Agam digest (last {since_days} day{'s' if since_days != 1 else ''})")
     print("=" * 60)
@@ -1006,7 +1141,7 @@ def _cmd_digest(args: argparse.Namespace) -> int:
         print("\nKnowledge graph: not present (run `agam init`)")
 
     # ----- AGAM.md learnings ---------------------------------------------
-    agam_md = home / ".claude" / "agam" / "AGAM.md"
+    agam_md = agam_paths.identity_dir() / "AGAM.md"
     if agam_md.exists():
         try:
             text = agam_md.read_text(encoding="utf-8")
@@ -1024,7 +1159,7 @@ def _cmd_digest(args: argparse.Namespace) -> int:
             pass
 
     # ----- watchdog activity ---------------------------------------------
-    processed = home / ".claude" / "agam" / ".processed-sessions.jsonl"
+    processed = agam_paths.identity_dir() / ".processed-sessions.jsonl"
     if processed.exists():
         try:
             n_total = 0
@@ -1179,9 +1314,11 @@ def _detect_uninstall_targets(
     claude: Path,
     claude_hook_files: list[Path],
     cursor_hook_files: list[Path],
+    codex_hook_files: list[Path],
 ) -> list[str]:
     """Best-effort detection of which agent wirings are installed."""
     cursor = home / ".cursor"
+    codex = home / ".codex"
     out: list[str] = []
     if (
         (claude / "agam").exists()
@@ -1212,6 +1349,15 @@ def _detect_uninstall_targets(
         )
     ):
         out.append("cursor")
+    if (
+        (codex / "tools" / "agam").exists()
+        or any(p.exists() for p in codex_hook_files)
+        or _file_mentions_any(
+            codex / "hooks.json",
+            tuple(str(path) for path in codex_hook_files),
+        )
+    ):
+        out.append("codex")
     return out
 
 
@@ -1232,32 +1378,40 @@ def _resolve_uninstall_targets(
     if not sys.stdin.isatty():
         print(
             f"[agam uninstall] detected {','.join(installed)}; uninstalling all. "
-            "Use --target claude or --target cursor to limit."
+            f"Use {_target_hint()} to limit."
         )
         return installed
     try:
         import questionary  # type: ignore[import-not-found]
 
-        chosen = questionary.select(
-            "Uninstall Agam for:",
-            choices=[
-                questionary.Choice("Claude only", value=["claude"]),
-                questionary.Choice("Cursor only", value=["cursor"]),
-                questionary.Choice(
-                    "Both Claude + Cursor (recommended)",
-                    value=["claude", "cursor"],
-                ),
-            ],
-        ).ask()
+        if set(installed) == {"claude", "cursor"} and len(installed) == 2:
+            chosen = questionary.select(
+                "Uninstall Agam for:",
+                choices=[
+                    questionary.Choice("Claude only", value=["claude"]),
+                    questionary.Choice("Cursor only", value=["cursor"]),
+                    questionary.Choice(
+                        "Both Claude + Cursor (recommended)",
+                        value=["claude", "cursor"],
+                    ),
+                ],
+            ).ask()
+        else:
+            chosen = questionary.checkbox(
+                "Uninstall Agam for:",
+                choices=[
+                    questionary.Choice(name.title(), value=name)
+                    for name in installed
+                ],
+            ).ask()
         if chosen is None:
             return []
-        if chosen:
-            return _dedupe_targets(list(chosen))
+        return _dedupe_targets(list(chosen))
     except Exception:  # noqa: BLE001 -- non-interactive / no questionary
         pass
     print(
         f"[agam uninstall] detected {','.join(installed)}; uninstalling all. "
-        "Use --target claude or --target cursor to limit."
+        f"Use {_target_hint()} to limit."
     )
     return installed
 
@@ -1281,6 +1435,7 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
     home = _home()
     claude = home / ".claude"
     cursor = home / ".cursor"
+    codex = home / ".codex"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
     # File set Agam owns. Mirror of the installer's writes. Identity files
@@ -1308,8 +1463,15 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
         cursor / "hooks" / "cursor_stop.py",
         cursor / "hooks" / "cursor_session_end.py",
     ]
+    codex_hook_files = [
+        codex / "hooks" / "agam" / "graph_recall.py",
+        codex / "hooks" / "agam" / "codex_stop.py",
+        codex / "hooks" / "agam" / "lesson_activate.py",
+        codex / "hooks" / "agam" / "lesson_activate_post.py",
+    ]
     tools_dir = claude / "tools" / "agam"
     cursor_tools_dir = cursor / "tools" / "agam"
+    codex_tools_dir = codex / "tools" / "agam"
     agam_dir = claude / "agam"
     kg_dir = claude / "knowledge"
     shared_data_dirs = [
@@ -1318,6 +1480,7 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
     ]
     settings_path = claude / "settings.json"
     cursor_hooks_path = cursor / "hooks.json"
+    codex_hooks_path = codex / "hooks.json"
     plist_path = home / "Library" / "LaunchAgents" / "com.agam.watchdog.plist"
 
     installed = _detect_uninstall_targets(
@@ -1325,6 +1488,7 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
         claude=claude,
         claude_hook_files=hook_files,
         cursor_hook_files=cursor_hook_files,
+        codex_hook_files=codex_hook_files,
     )
     targets = _resolve_uninstall_targets(args, installed=installed)
     target_set = set(targets)
@@ -1375,6 +1539,17 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
             ("cursor_stop.py", "cursor_session_end.py", "/tools/agam/"),
         ):
             plan.append(("clean-cursor-hooks", cursor_hooks_path))
+    if "codex" in target_set:
+        for h in codex_hook_files:
+            if h.exists():
+                plan.append(("delete", h))
+        if codex_tools_dir.exists():
+            plan.append(("delete", codex_tools_dir))
+        if _file_mentions_any(
+            codex_hooks_path,
+            tuple(str(path) for path in codex_hook_files),
+        ):
+            plan.append(("clean-codex-hooks", codex_hooks_path))
     if remove_shared:
         for data_dir in shared_data_dirs:
             if not data_dir.exists():
@@ -1396,6 +1571,7 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
                 "delete-plist": "unload + delete launchd plist",
                 "clean-settings": "remove Agam hook entries from settings.json",
                 "clean-cursor-hooks": "remove Agam hook entries from hooks.json",
+                "clean-codex-hooks": "remove Agam hook entries from hooks.json",
             }[action]
             print(f"  {verb}: {p}")
         if args.purge:
@@ -1484,6 +1660,53 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
                 import tempfile as _tf
                 fd, tmpname = _tf.mkstemp(
                     prefix=".settings-uninstall-",
+                    suffix=".json.tmp",
+                    dir=str(p.parent),
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json.dump(settings, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                os.replace(tmpname, p)
+                print(f"[agam uninstall] cleaned: {p}")
+            elif action == "clean-codex-hooks":
+                settings = _json.loads(p.read_text(encoding="utf-8"))
+                hooks = settings.get("hooks", {})
+                if isinstance(hooks, dict):
+                    for event, entries in list(hooks.items()):
+                        if not isinstance(entries, list):
+                            continue
+                        kept_blocks = []
+                        for entry in entries:
+                            if not isinstance(entry, dict):
+                                kept_blocks.append(entry)
+                                continue
+                            inner = entry.get("hooks")
+                            if not isinstance(inner, list):
+                                kept_blocks.append(entry)
+                                continue
+                            kept_inner = [
+                                item
+                                for item in inner
+                                if not (
+                                    isinstance(item, dict)
+                                    and isinstance(item.get("command"), str)
+                                    and any(
+                                        str(path) in item["command"]
+                                        for path in codex_hook_files
+                                    )
+                                )
+                            ]
+                            if kept_inner:
+                                new_entry = dict(entry)
+                                new_entry["hooks"] = kept_inner
+                                kept_blocks.append(new_entry)
+                        if kept_blocks:
+                            hooks[event] = kept_blocks
+                        else:
+                            del hooks[event]
+                import tempfile as _tf
+                fd, tmpname = _tf.mkstemp(
+                    prefix=".hooks-uninstall-",
                     suffix=".json.tmp",
                     dir=str(p.parent),
                 )
@@ -1594,7 +1817,9 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agam",
-        description="Persistent knowledge-graph context for Claude Code and Cursor.",
+        description=(
+            "Persistent knowledge-graph context for Claude Code, Cursor, and Codex."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1616,7 +1841,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument(
         "--target",
         action="append",
-        choices=["claude", "cursor"],
+        choices=list(SUPPORTED_AGENT_TARGETS),
         default=None,
         help="Agent(s) to wire (repeatable). Omit to auto-detect + prompt.",
     )
@@ -1697,7 +1922,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tag.add_argument(
         "--agent",
         required=True,
-        choices=["claude", "cursor"],
+        choices=list(SUPPORTED_AGENT_TARGETS),
         help="Agent to attribute untagged entities to.",
     )
     p_tag.set_defaults(func=_cmd_tag_source)
@@ -1771,7 +1996,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_un.add_argument(
         "--target",
         action="append",
-        choices=["claude", "cursor"],
+        choices=list(SUPPORTED_AGENT_TARGETS),
         default=None,
         help="Agent wiring to remove (repeatable). Omit to auto-detect + prompt.",
     )

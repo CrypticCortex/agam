@@ -41,6 +41,8 @@
     <string>{{AGAM_GRAPH_ONLY}}</string>
     <key>AGAM_LLM_CLI_PIN</key>
     <string>{{AGAM_LLM_CLI_PIN}}</string>
+    <key>AGAM_LLM_CLI_PATH</key>
+    <string>{{AGAM_LLM_CLI_PATH}}</string>
     <key>PATH</key>
     <string>{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
   </dict>

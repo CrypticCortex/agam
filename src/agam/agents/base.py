@@ -46,15 +46,16 @@ def detect_agents(home: Path) -> list[AgentTarget]:
     """Return the AgentTargets that appear present on this machine.
 
     An agent counts as present if its config dir exists OR its CLI is on PATH.
-    Ordered claude-first (the historical default) then cursor.
+    Ordered Claude-first (the historical default), then Cursor and Codex.
     """
     # Imported here to avoid a circular import at module load.
     from .claude import ClaudeAgent
+    from .codex import CodexAgent
     from .cursor import CursorAgent
 
     home = Path(home)
     present: list[AgentTarget] = []
-    for agent in (ClaudeAgent(), CursorAgent()):
+    for agent in (ClaudeAgent(), CursorAgent(), CodexAgent()):
         if agent.is_present(home):
             present.append(agent)
     return present

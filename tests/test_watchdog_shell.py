@@ -116,6 +116,29 @@ def _make_home(tmp_path: pathlib.Path) -> pathlib.Path:
     return home
 
 
+def _write_fake_cli(bin_dir: pathlib.Path, name: str) -> pathlib.Path:
+    """Plant a no-op agent CLI so the shell probe can discover it."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / name
+    fake.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return fake
+
+
+def _write_host_inner(hooks_dir: pathlib.Path, log_path: pathlib.Path) -> None:
+    """Plant an inner watchdog that records the selected host CLI."""
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    inner = hooks_dir / "agam_watchdog_inner.py"
+    inner.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "AGAM_LLM_CLI=$AGAM_LLM_CLI" >> "{log_path}"\n'
+        f'echo "AGAM_LLM_CLI_PATH=$AGAM_LLM_CLI_PATH" >> "{log_path}"\n'
+        f'cat >> "{log_path}"\n'
+        "exit 0\n"
+    )
+    inner.chmod(inner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def _run(env, script=SCRIPT, timeout=30):
     return subprocess.run(
         ["bash", str(script)],
@@ -240,6 +263,104 @@ def test_host_mode_skips_docker_and_invokes_host_inner(tmp_path):
     tail = (home / "logs" / "watchdog.log").read_text()
     assert "drain-start invoker=host" in tail
     assert "ok h.json" in tail
+
+
+def test_host_auto_falls_back_to_codex_when_other_clis_absent(tmp_path):
+    home = _make_home(tmp_path)
+    (home / "queue" / "codex.json").write_text('{"sid":"codex"}')
+
+    bin_dir = tmp_path / "bin"
+    _write_fake_docker(bin_dir, ps_stdout="")
+    _write_fake_cli(bin_dir, "codex")
+    inner_log = tmp_path / "inner-codex.log"
+    hooks_dir = tmp_path / "hooks"
+    _write_host_inner(hooks_dir, inner_log)
+
+    env = _env(home, bin_dir, AGAM_HOOKS_DIR=str(hooks_dir))
+    # Exclude the developer machine's installed agent CLIs while retaining the
+    # basic POSIX commands used by the shell script.
+    env["PATH"] = f"{bin_dir}:/bin:/usr/bin"
+    r = _run(env)
+
+    assert r.returncode == 0, r.stderr
+    assert "AGAM_LLM_CLI=codex" in inner_log.read_text()
+    assert (home / "processed" / "codex.json").exists()
+
+
+def test_host_prefers_cursor_agent_over_codex_without_pin(tmp_path):
+    home = _make_home(tmp_path)
+    (home / "queue" / "cursor.json").write_text('{"sid":"cursor"}')
+
+    bin_dir = tmp_path / "bin"
+    _write_fake_cli(bin_dir, "cursor-agent")
+    _write_fake_cli(bin_dir, "codex")
+    inner_log = tmp_path / "inner-cursor.log"
+    hooks_dir = tmp_path / "hooks"
+    _write_host_inner(hooks_dir, inner_log)
+
+    env = _env(
+        home,
+        bin_dir,
+        AGAM_WATCHDOG_MODE="host",
+        AGAM_HOOKS_DIR=str(hooks_dir),
+    )
+    env["PATH"] = f"{bin_dir}:/bin:/usr/bin"
+    r = _run(env)
+
+    assert r.returncode == 0, r.stderr
+    assert "AGAM_LLM_CLI=cursor-agent" in inner_log.read_text()
+
+
+def test_codex_pin_overrides_default_host_cli_preference(tmp_path):
+    home = _make_home(tmp_path)
+    (home / "queue" / "pinned.json").write_text('{"sid":"pinned"}')
+
+    bin_dir = tmp_path / "bin"
+    for cli in ("claude", "cursor-agent", "codex"):
+        _write_fake_cli(bin_dir, cli)
+    inner_log = tmp_path / "inner-pinned.log"
+    hooks_dir = tmp_path / "hooks"
+    _write_host_inner(hooks_dir, inner_log)
+
+    env = _env(
+        home,
+        bin_dir,
+        AGAM_WATCHDOG_MODE="host",
+        AGAM_HOOKS_DIR=str(hooks_dir),
+        AGAM_LLM_CLI_PIN="codex",
+    )
+    env["PATH"] = f"{bin_dir}:/bin:/usr/bin"
+    r = _run(env)
+
+    assert r.returncode == 0, r.stderr
+    assert "AGAM_LLM_CLI=codex" in inner_log.read_text()
+
+
+def test_absolute_codex_path_works_outside_launchd_path(tmp_path):
+    home = _make_home(tmp_path)
+    (home / "queue" / "absolute.json").write_text('{"sid":"absolute"}')
+
+    custom_bin = tmp_path / "custom-toolchain"
+    codex = _write_fake_cli(custom_bin, "codex")
+    bin_dir = tmp_path / "bin"
+    inner_log = tmp_path / "inner-absolute.log"
+    hooks_dir = tmp_path / "hooks"
+    _write_host_inner(hooks_dir, inner_log)
+
+    env = _env(
+        home,
+        bin_dir,
+        AGAM_WATCHDOG_MODE="host",
+        AGAM_HOOKS_DIR=str(hooks_dir),
+        AGAM_LLM_CLI_PATH=str(codex),
+    )
+    env["PATH"] = f"{bin_dir}:/bin:/usr/bin"
+    r = _run(env)
+
+    assert r.returncode == 0, r.stderr
+    logged = inner_log.read_text()
+    assert "AGAM_LLM_CLI=codex" in logged
+    assert f"AGAM_LLM_CLI_PATH={codex}" in logged
 
 
 # ---------------------------------------------------------------------------
@@ -469,15 +590,58 @@ def test_transient_failure_retries_then_dead_letters(tmp_path):
     # Tick 1: first failure -> stays in queue, retry counter at 1, not exiled.
     r = _run(env)
     assert r.returncode == 0, r.stderr
-    assert (home / "queue" / "flap.json").exists()
+    queued = list((home / "queue").glob("flap.retry-claim.*.json"))
+    assert len(queued) == 1
     assert not (home / "queue-errors" / "flap.json").exists()
-    assert (home / ".retries" / "flap.json").read_text().strip() == "1"
+    retry_sidecar = home / ".retries" / queued[0].name
+    assert retry_sidecar.read_text().strip() == "1"
     assert "retry flap.json rc=5 attempt=1/2" in (home / "logs" / "watchdog.log").read_text()
 
     # Tick 2: second failure hits MAX_RETRIES -> dead-letter, counter cleared.
     r = _run(env)
     assert r.returncode == 0, r.stderr
-    assert not (home / "queue" / "flap.json").exists()
-    assert (home / "queue-errors" / "flap.json").exists()
-    assert not (home / ".retries" / "flap.json").exists()
+    assert not list((home / "queue").glob("flap*.json"))
+    deadletters = list((home / "queue-errors").glob("flap*.json"))
+    assert len(deadletters) == 1
+    assert not list((home / ".retries").glob("flap*.json"))
     assert "dead-letter" in (home / "logs" / "watchdog.log").read_text()
+
+
+def test_concurrent_reenqueue_survives_successful_claim(tmp_path):
+    """A new generation enqueued during processing must remain in queue/."""
+    home = _make_home(tmp_path)
+    (home / "queue" / "race.json").write_text('{"generation":"old"}\n')
+
+    bin_dir = tmp_path / "bin"
+    _write_fake_cli(bin_dir, "claude")
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    seen = tmp_path / "seen.json"
+    inner = hooks_dir / "agam_watchdog_inner.py"
+    inner.write_text(
+        "#!/usr/bin/env bash\n"
+        "input=$(cat)\n"
+        f'printf "%s\\n" "$input" > "{seen}"\n'
+        'if echo "$input" | grep -q \'"generation":"old"\'; then\n'
+        '  tmp="$AGAM_HOME/queue/.race.json.tmp"\n'
+        '  printf \'{"generation":"new"}\\n\' > "$tmp"\n'
+        '  mv "$tmp" "$AGAM_HOME/queue/race.json"\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    inner.chmod(inner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    env = _env(
+        home,
+        bin_dir,
+        AGAM_WATCHDOG_MODE="host",
+        AGAM_HOOKS_DIR=str(hooks_dir),
+    )
+    env["PATH"] = f"{bin_dir}:/bin:/usr/bin"
+    r = _run(env)
+
+    assert r.returncode == 0, r.stderr
+    assert '"generation":"old"' in seen.read_text()
+    assert (home / "processed" / "race.json").read_text().strip() == '{"generation":"old"}'
+    assert (home / "queue" / "race.json").read_text().strip() == '{"generation":"new"}'
+    assert not list((home / "processing").glob("claim.*"))

@@ -4,12 +4,12 @@ set -u
 
 # --- begin prereq checks ---
 command -v uv >/dev/null || { echo "ERR: install uv first -- https://docs.astral.sh/uv/"; exit 1; }
-command -v claude >/dev/null || echo "WARN: claude CLI not on host PATH. That's fine if you run Claude Code inside a devcontainer -- the watchdog will docker-exec into it. To set the container name override later: export AGAM_CONTAINER_NAME=<your-container>. To install claude on the host too: https://claude.ai/code"
-command -v docker >/dev/null || echo "WARN: docker not found. Watchdog + bootstrap require a running claude-code container. Install Docker Desktop to enable these."
+command -v claude >/dev/null || command -v cursor-agent >/dev/null || command -v codex >/dev/null || echo "WARN: no supported agent CLI found on the host (claude, cursor-agent, or codex). That's fine if Claude Code runs in a devcontainer; otherwise install and authenticate at least one supported CLI before background enrichment."
+command -v docker >/dev/null || echo "WARN: docker not found. This is only required for container-based Claude enrichment; host Claude, Cursor, and Codex modes do not require it."
 [[ "$(uname)" == "Darwin" ]] || { echo "ERR: macOS only for v1."; exit 1; }
-# Auth is NOT checked here. install.sh writes files; the actual claude -p
-# calls happen later (agam bootstrap, watchdog) and surface real auth errors
-# with claude's own message. Use `agam doctor` after install to verify.
+# Auth is NOT checked here. install.sh writes files; actual agent calls happen
+# later (bootstrap/watchdog) and surface the selected CLI's own auth errors.
+# Use `agam doctor` after install to verify.
 # --- end prereq checks ---
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -94,6 +94,28 @@ _TOOL_USE_INPUT_CAP = 800
 _CONTEXT_WINDOW_SIZE = 10
 
 
+def _parse_iso_timestamp(value: object) -> datetime.datetime | None:
+    """Parse an ISO timestamp as an aware UTC datetime.
+
+    Codex rollout snapshots use ``Z`` while other producers may use an
+    explicit offset (including ``+00:00``). Older Agam/Claude transcripts
+    can contain zone-less ISO values; interpret those as UTC so classification
+    is deterministic and does not depend on the watchdog host's timezone.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    timestamp = value.strip()
+    if timestamp[-1:] in {"Z", "z"}:
+        timestamp = timestamp[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
 def _compact_block(block: dict) -> dict | None:
     """Compact a single message.content[] block. Return None to drop it."""
     btype = block.get("type", "")
@@ -208,6 +230,7 @@ def _slice_transcript_for_sonnet(
         return jsonl_path, 0, 0
 
     cutoff_str = since_iso if since_iso and since_iso != "SESSION-START" else None
+    cutoff_at = _parse_iso_timestamp(cutoff_str)
     if size <= max_bytes and cutoff_str is None:
         return jsonl_path, 0, 0
 
@@ -232,8 +255,12 @@ def _slice_transcript_for_sonnet(
                 if compacted is None:
                     continue
                 line = json.dumps(compacted) + "\n"
-                ts = compacted.get("timestamp", "")
-                if cutoff_str and ts and ts < cutoff_str:
+                event_at = _parse_iso_timestamp(compacted.get("timestamp"))
+                if (
+                    cutoff_at is not None
+                    and event_at is not None
+                    and event_at < cutoff_at
+                ):
                     window.append(line)
                 else:
                     delta_lines.append(line)
@@ -261,9 +288,9 @@ def fill(template: pathlib.Path, **vars: str) -> str:
 
 
 # Which LLM CLI drives enrichment. Set by agam_watchdog.sh's host probe:
-# "claude" when on PATH, else "cursor-agent". Lets Cursor enrich the graph
-# standalone on a host with no Claude installed.
+# claude, cursor-agent, or codex (in that default preference order).
 LLM_CLI = os.environ.get("AGAM_LLM_CLI", "claude")
+LLM_CLI_PATH = os.environ.get("AGAM_LLM_CLI_PATH", "").strip()
 
 # Graph-only mode: do the deterministic graph_update and skip the LLM layer
 # (work-log + agam-sync). Set this where the agent CLI can't write files in
@@ -272,28 +299,148 @@ LLM_CLI = os.environ.get("AGAM_LLM_CLI", "claude")
 GRAPH_ONLY = os.environ.get("AGAM_GRAPH_ONLY", "").strip() == "1"
 
 
-def run_claude(prompt: str, *, model: str, timeout: int) -> subprocess.CompletedProcess:
-    """Run the enrichment prompt through whichever agent CLI is available.
+WORK_LOG_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "body": {"type": "string"},
+    },
+    "required": ["body"],
+    "additionalProperties": False,
+}
 
-    claude: prompt on stdin, --model honored (haiku/sonnet slugs).
-    cursor-agent: prompt as a positional arg, --force for headless file writes.
-      Cursor uses its own model names, so we let it pick its default rather than
-      passing a claude-specific slug.
+
+def _object_array(properties: dict) -> dict:
+    """Return a strict structured-output schema for an array of objects."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": properties,
+            "required": list(properties),
+            "additionalProperties": False,
+        },
+    }
+
+
+PROPOSALS_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "signals": {"type": "array", "items": {"type": "string"}},
+        "thisai_projects": _object_array({
+            "name": {"type": "string"},
+            "note": {"type": "string"},
+        }),
+        "thisai_goals": _object_array({
+            "name": {"type": "string"},
+            "note": {"type": "string"},
+        }),
+        "memory": _object_array({
+            "filename": {"type": "string"},
+            "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+            "description": {"type": "string"},
+            "content": {"type": "string"},
+        }),
+        "lesson": _object_array({
+            "title": {"type": "string"},
+            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+            "body": {"type": "string"},
+        }),
+        "insight": _object_array({
+            "title": {"type": "string"},
+            "body": {"type": "string"},
+        }),
+        "correction": _object_array({
+            "title": {"type": "string"},
+            "body": {"type": "string"},
+        }),
+        "obsolete": _object_array({
+            "name": {"type": "string"},
+            "reason": {"type": "string"},
+        }),
+    },
+    "required": [
+        "signals", "thisai_projects", "thisai_goals", "memory", "lesson",
+        "insight", "correction", "obsolete",
+    ],
+    "additionalProperties": False,
+}
+
+
+def _run_codex(
+    prompt: str,
+    *,
+    timeout: int,
+    output_schema: dict | None,
+) -> subprocess.CompletedProcess:
+    """Run a non-persistent, read-only Codex enrichment turn.
+
+    Hooks are disabled so the watchdog's own model call cannot enqueue another
+    watchdog item. The prompt is sent on stdin instead of argv, and the final
+    response is constrained with a temporary JSON Schema when supplied.
     """
-    if LLM_CLI == "cursor-agent":
+    schema_path: pathlib.Path | None = None
+    args = [
+        LLM_CLI_PATH or "codex", "exec",
+        "--ephemeral",
+        "--disable", "hooks",
+        "--sandbox", "read-only",
+        "--skip-git-repo-check",
+        "--color", "never",
+        "--cd", str(AGAM_HOME),
+    ]
+    if output_schema is not None:
+        fd, name = tempfile.mkstemp(prefix="agam-codex-schema-", suffix=".json")
+        schema_path = pathlib.Path(name)
+        with os.fdopen(fd, "w") as f:
+            json.dump(output_schema, f)
+        args.extend(["--output-schema", str(schema_path)])
+    args.append("-")
+    try:
         return subprocess.run(
-            ["cursor-agent", "-p", "--force", "--output-format", "text", prompt],
+            args,
+            input=prompt,
             text=True,
             capture_output=True,
             timeout=timeout,
             check=False,
         )
+    finally:
+        if schema_path is not None:
+            schema_path.unlink(missing_ok=True)
+
+
+def run_claude(
+    prompt: str,
+    *,
+    model: str,
+    timeout: int,
+    output_schema: dict | None = None,
+) -> subprocess.CompletedProcess:
+    """Run the enrichment prompt through whichever agent CLI is available.
+
+    claude: prompt as a positional argument, --model honored (haiku/sonnet slugs).
+    cursor-agent: prompt as a positional arg, --force for headless file writes.
+      Cursor uses its own model names, so we let it pick its default rather than
+      passing a claude-specific slug.
+    codex: prompt on stdin, default Codex model, read-only ephemeral execution,
+      hooks disabled, and optional structured final output.
+    """
+    if LLM_CLI == "cursor-agent":
+        return subprocess.run(
+            [LLM_CLI_PATH or "cursor-agent", "-p", "--force", "--output-format", "text", prompt],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    if LLM_CLI == "codex":
+        return _run_codex(prompt, timeout=timeout, output_schema=output_schema)
     # Pass the prompt as a positional argument, not stdin. Host `claude -p`
     # rejects piped stdin in some builds ("Input must be provided ... when using
     # --print"); the positional form works on host and in containers alike.
     return subprocess.run(
         [
-            "claude", "-p", prompt,
+            LLM_CLI_PATH or "claude", "-p", prompt,
             "--disable-slash-commands",
             "--permission-mode", "acceptEdits",
             "--model", model,
@@ -303,6 +450,43 @@ def run_claude(prompt: str, *, model: str, timeout: int) -> subprocess.Completed
         timeout=timeout,
         check=False,
     )
+
+
+def _decode_codex_object(stdout: str) -> dict | None:
+    """Decode Codex's schema-constrained final stdout defensively."""
+    try:
+        value = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _materialize_codex_work_log(stdout: str, target: pathlib.Path) -> bool:
+    """Write Codex's structured journal body for the existing append path."""
+    value = _decode_codex_object(stdout)
+    body = value.get("body") if value is not None else None
+    if not isinstance(body, str) or not body.strip():
+        return False
+    try:
+        target.write_text(body.strip())
+        return True
+    except OSError:
+        return False
+
+
+def _materialize_codex_proposals(stdout: str, target: pathlib.Path) -> bool:
+    """Write validated structured proposals for the existing applier."""
+    value = _decode_codex_object(stdout)
+    expected = set(PROPOSALS_OUTPUT_SCHEMA["properties"])
+    if value is None or set(value) != expected:
+        return False
+    if any(not isinstance(value[key], list) for key in expected):
+        return False
+    try:
+        target.write_text(json.dumps(value, ensure_ascii=True, indent=2) + "\n")
+        return True
+    except OSError:
+        return False
 
 
 def _latest_mtime_for_sid(path: pathlib.Path, sid: str) -> float:
@@ -350,7 +534,11 @@ def _compute_cutoff(
     )
     if latest == 0:
         return "SESSION-START", "fresh"
-    since_iso = datetime.datetime.fromtimestamp(latest).isoformat(timespec="seconds")
+    since_iso = (
+        datetime.datetime.fromtimestamp(latest, tz=datetime.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
     return since_iso, "continuation"
 
 
@@ -435,6 +623,41 @@ obsoleted entities so the model stops reasoning about stale state.
 """
 
 
+def _codex_work_log_override() -> str:
+    """Instructions that route Codex output through stdout, not tool writes."""
+    return f"""
+
+## Codex structured-output override
+
+This watchdog invocation is read-only and supplies a JSON output schema.
+Do not write OUTPUT_PATH and do not try to edit any file. This override
+supersedes the earlier Step E file-write requirement. Return one JSON object
+with a single `body` field. Its value must be either `SKIP` or the journal body
+text that the watchdog should append mechanically.
+
+For this installation, the work log to read for style is:
+{WORK_LOG_PATH}
+"""
+
+
+def _codex_proposals_override() -> str:
+    """Instructions that route Codex proposals through structured stdout."""
+    return f"""
+
+## Codex structured-output override
+
+This watchdog invocation is read-only and supplies a JSON output schema.
+Do not write any file. Return the proposals as the final JSON object instead
+of the prose `AGAM SYNC PROPOSALS` envelope described above. Include every
+schema key; use an empty array when there is no proposal for that key.
+
+For this installation, use these actual read-only paths instead of any legacy
+`~/.claude/agam` paths mentioned above:
+- identity directory: {AGAM_HOME}
+- work log: {WORK_LOG_PATH}
+"""
+
+
 def main() -> int:
     raw = sys.stdin.read().strip()
     if not raw:
@@ -446,6 +669,7 @@ def main() -> int:
     cwd = entry.get("cwd", "")
     agent = entry.get("agent", "unknown")
     project = pathlib.Path(cwd).name or "unknown"
+    is_codex = LLM_CLI == "codex"
 
     log(sid, "start", transcript=transcript, cwd=cwd)
 
@@ -505,23 +729,41 @@ def main() -> int:
         OUTPUT_PATH=str(wlog_out),
         SINCE_ISO=since_iso,
     )
+    if is_codex:
+        wlog_prompt += _codex_work_log_override()
     work_log_ok = False
     try:
-        r = run_claude(wlog_prompt, model="claude-haiku-4-5", timeout=180)
+        r = run_claude(
+            wlog_prompt,
+            model="claude-haiku-4-5",
+            timeout=180,
+            output_schema=WORK_LOG_OUTPUT_SCHEMA if is_codex else None,
+        )
+        codex_output_ok = True
+        if is_codex:
+            codex_output_ok = (
+                r.returncode == 0
+                and _materialize_codex_work_log(r.stdout, wlog_out)
+            )
         # mkstemp pre-creates the file, so "did haiku write?" is a size check,
         # not an existence check.
         has_body = wlog_out.exists() and wlog_out.stat().st_size > 0
-        log(sid, "work-log-done", rc=r.returncode, body_written=has_body)
+        work_log_details = {"rc": r.returncode, "body_written": has_body}
+        if is_codex:
+            work_log_details["structured_output_ok"] = codex_output_ok
+        log(sid, "work-log-done", **work_log_details)
         if has_body:
             appended = _append_work_log(wlog_out, project, today, now, sid, mode=cutoff_mode)
             if appended:
                 _record_work_log_written(sid, transcript)
             work_log_ok = True
-        elif r.returncode == 0:
+        elif r.returncode == 0 and not is_codex:
             # Haiku completed cleanly but skipped writing OUTPUT_PATH. Treat as implicit SKIP
             # so the session marks processed instead of looping in the retry queue forever.
             log(sid, "work-log-skip", reason="no-output-file")
             work_log_ok = True
+        elif r.returncode == 0:
+            log(sid, "work-log-invalid-output")
     except subprocess.TimeoutExpired:
         log(sid, "work-log-timeout")
     finally:
@@ -552,18 +794,42 @@ def main() -> int:
     _pfd, _pname = tempfile.mkstemp(prefix=f"proposals-{sid}-", suffix=".json")
     os.close(_pfd)
     proposals_path = pathlib.Path(_pname)
-    schema_block = JSON_SCHEMA_HINT.replace("{proposals_path}", str(proposals_path))
     sync_prompt = fill(
         PROMPTS / "agam-sync.txt",
         JSONL_PATH=sliced_path,
         SESSION_SIGNALS="AUTO",
         CONTEXT_SUMMARY="(watchdog: derive context from transcript)",
-    ) + schema_block
+    )
+    if is_codex:
+        sync_prompt += _codex_proposals_override()
+    else:
+        schema_block = JSON_SCHEMA_HINT.replace("{proposals_path}", str(proposals_path))
+        sync_prompt += schema_block
     sync_ok = False
     try:
-        r = run_claude(sync_prompt, model="claude-sonnet-4-6", timeout=180)
-        log(sid, "agam-sync-done", rc=r.returncode, proposals_written=proposals_path.exists())
-        sync_ok = (r.returncode == 0)
+        r = run_claude(
+            sync_prompt,
+            model="claude-sonnet-4-6",
+            timeout=180,
+            output_schema=PROPOSALS_OUTPUT_SCHEMA if is_codex else None,
+        )
+        codex_output_ok = True
+        if is_codex:
+            codex_output_ok = (
+                r.returncode == 0
+                and _materialize_codex_proposals(r.stdout, proposals_path)
+            )
+        proposals_written = (
+            proposals_path.exists() and proposals_path.stat().st_size > 0
+        )
+        sync_details = {
+            "rc": r.returncode,
+            "proposals_written": proposals_written,
+        }
+        if is_codex:
+            sync_details["structured_output_ok"] = codex_output_ok
+        log(sid, "agam-sync-done", **sync_details)
+        sync_ok = r.returncode == 0 and codex_output_ok
     except subprocess.TimeoutExpired:
         log(sid, "agam-sync-timeout")
 

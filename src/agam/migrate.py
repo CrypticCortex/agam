@@ -9,9 +9,13 @@ old install is untouched.
 
 Contract (``migrate_if_needed``):
 
-- ``~/.agam`` already has content        -> ("already", None)   no-op.
+- ``~/.agam/knowledge/graph.db`` exists  -> ("already", None)   no-op.
 - ``~/.claude/knowledge/graph.db`` found -> ("migrated", dest)  copy across.
 - neither                                -> ("fresh", None)     clean install.
+
+Operational directories such as ``~/.agam/queue`` do not count as a completed
+migration. Cursor can create that queue before the legacy Claude graph has been
+copied; treating any directory entry as authoritative would strand the graph.
 """
 
 from __future__ import annotations
@@ -55,7 +59,7 @@ def migrate_if_needed(home: Path) -> tuple[str, Path | None]:
     """
     home = Path(home)
     agam_home = home / ".agam"
-    if _has_content(agam_home):
+    if (agam_home / "knowledge" / "graph.db").exists():
         return "already", None
 
     legacy_kg = home / ".claude" / "knowledge" / "graph.db"

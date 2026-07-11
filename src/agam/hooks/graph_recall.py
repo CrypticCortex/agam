@@ -16,13 +16,13 @@ Session dedup: tracks what's already been injected this session.
 
 Environment variables:
     AGAM_KG_PATH         Path to knowledge graph SQLite DB
-                         (default: ~/.claude/knowledge/graph.db)
+                         (default: ~/.agam/knowledge/graph.db)
     AGAM_KG_DIR          Directory holding KG sidecar caches
                          (entity-names.txt, concept-index.json, idf-index.json,
                          sycophancy-log.jsonl). Defaults to the parent of
                          AGAM_KG_PATH.
-    AGAM_CONTEXT_TOOL    Path to agam-context.py (used for boot injection).
-                         (default: ~/.claude/tools/agam-context.py)
+    AGAM_CONTEXT_TOOL    Path to agam_context.py (used for boot injection).
+                         (default: ~/.agam/tools/agam/agam_context.py)
 """
 
 import json
@@ -34,7 +34,7 @@ import tempfile
 
 
 DB_PATH = os.environ.get(
-    "AGAM_KG_PATH", os.path.expanduser("~/.claude/knowledge/graph.db")
+    "AGAM_KG_PATH", os.path.expanduser("~/.agam/knowledge/graph.db")
 )
 # Sidecar caches live alongside the KG by default; override via AGAM_KG_DIR.
 _KG_DIR = os.environ.get("AGAM_KG_DIR") or os.path.dirname(DB_PATH)
@@ -43,7 +43,7 @@ CONCEPT_INDEX = os.path.join(_KG_DIR, "concept-index.json")
 IDF_INDEX = os.path.join(_KG_DIR, "idf-index.json")
 SYCOPHANCY_LOG = os.path.join(_KG_DIR, "sycophancy-log.jsonl")
 AGAM_CONTEXT_TOOL = os.environ.get(
-    "AGAM_CONTEXT_TOOL", os.path.expanduser("~/.claude/tools/agam-context.py")
+    "AGAM_CONTEXT_TOOL", os.path.expanduser("~/.agam/tools/agam/agam_context.py")
 )
 SESSION_FILE = ""  # Set in main() after parsing session_id
 

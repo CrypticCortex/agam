@@ -1,6 +1,8 @@
 """Tests for the neutral-home multi-agent install orchestrator."""
 
 import json
+import os
+import plistlib
 import sqlite3
 
 from agam.installer import run_install
@@ -50,6 +52,47 @@ def test_cursor_only(tmp_path):
     assert res.targets == ["cursor"]
 
 
+def test_codex_only(tmp_path):
+    res = run_install(
+        _answers(tmp_path), targets=["codex"], home=tmp_path, write_plist=False,
+    )
+    assert (tmp_path / ".codex" / "hooks.json").exists()
+    assert (
+        tmp_path / ".codex" / "hooks" / "agam" / "graph_recall.py"
+    ).exists()
+    assert (
+        tmp_path / ".codex" / "hooks" / "agam" / "codex_stop.py"
+    ).exists()
+    assert (tmp_path / ".codex" / "tools" / "agam" / "transcripts.py").exists()
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".cursor" / "hooks.json").exists()
+    assert res.targets == ["codex"]
+
+
+def test_codex_plist_persists_resolved_executable(monkeypatch, tmp_path):
+    tool_dir = tmp_path / "custom & toolchain"
+    tool_dir.mkdir()
+    codex = tool_dir / "codex"
+    codex.write_text("#!/bin/sh\nexit 0\n")
+    codex.chmod(0o755)
+
+    monkeypatch.setattr(
+        "agam.installer.shutil.which",
+        lambda name: str(codex) if name == "codex" else None,
+    )
+    res = run_install(
+        _answers(tmp_path), targets=["codex"], home=tmp_path, write_plist=True,
+    )
+
+    assert res.wrote_plist
+    plist = tmp_path / "Library" / "LaunchAgents" / "com.agam.watchdog.plist"
+    data = plistlib.loads(plist.read_bytes())
+    env = data["EnvironmentVariables"]
+    assert env["AGAM_LLM_CLI_PIN"] == "codex"
+    assert env["AGAM_LLM_CLI_PATH"] == str(codex.resolve())
+    assert os.access(env["AGAM_LLM_CLI_PATH"], os.X_OK)
+
+
 def test_preserves_existing_graph(tmp_path):
     # Pre-seed a graph with a sentinel entity; install must not clobber it.
     kdir = tmp_path / ".agam" / "knowledge"
@@ -87,3 +130,29 @@ def test_migrates_legacy_claude(tmp_path):
     names = [r[0] for r in conn.execute("SELECT name FROM entities")]
     conn.close()
     assert "legacy-entity" in names
+
+
+def test_cursor_queue_does_not_block_legacy_graph_migration(tmp_path):
+    kdir = tmp_path / ".claude" / "knowledge"
+    kdir.mkdir(parents=True)
+    legacy = kdir / "graph.db"
+    conn = sqlite3.connect(str(legacy))
+    conn.execute("CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.execute("INSERT INTO entities (name) VALUES ('legacy-with-cursor-queue')")
+    conn.commit()
+    conn.close()
+    queued = tmp_path / ".agam" / "queue" / "cursor.json"
+    queued.parent.mkdir(parents=True)
+    queued.write_text('{"agent":"cursor"}\n')
+
+    res = run_install(
+        _answers(tmp_path), targets=["codex"], home=tmp_path, write_plist=False,
+    )
+
+    assert res.migration_status == "migrated"
+    assert queued.exists()
+    migrated = tmp_path / ".agam" / "knowledge" / "graph.db"
+    conn = sqlite3.connect(str(migrated))
+    names = [row[0] for row in conn.execute("SELECT name FROM entities")]
+    conn.close()
+    assert "legacy-with-cursor-queue" in names

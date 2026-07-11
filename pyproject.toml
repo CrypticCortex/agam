@@ -1,7 +1,7 @@
 [project]
 name = "agam"
 version = "0.1.0"
-description = "Persistent knowledge-graph context injection for Claude Code."
+description = "Persistent knowledge-graph context injection for coding agents."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"

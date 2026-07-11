@@ -87,6 +87,19 @@ def test_cli_init_target_cursor(monkeypatch):
     assert called[0]["targets"] == ["cursor"]
 
 
+def test_cli_init_target_codex(monkeypatch):
+    from agam import cli
+
+    called: list[dict] = []
+    monkeypatch.setattr(
+        "agam.installer.run_install",
+        lambda answers, **kw: called.append(kw) or MockResult(),
+    )
+    rc = cli.main(["init", "--target", "codex"])
+    assert rc == 0
+    assert called[0]["targets"] == ["codex"]
+
+
 def test_cli_init_detected_both_prompts_for_explicit_target_choice(monkeypatch, tmp_path):
     from agam import cli
 
@@ -138,6 +151,102 @@ def test_cli_init_detected_both_prompts_for_explicit_target_choice(monkeypatch, 
         "Cursor only",
         "Both Claude + Cursor (recommended)",
     ]
+
+
+def test_cli_init_detected_three_uses_multi_select(monkeypatch, tmp_path):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    called: list[dict] = []
+    seen_choices: list[tuple[str, bool]] = []
+
+    class FakeAgent:
+        def __init__(self, name: str):
+            self.name = name
+
+        def detect_evidence(self, home):
+            return f"{self.name} present"
+
+    class FakeChoice:
+        def __init__(self, title, value=None, checked=False):
+            self.title = title
+            self.value = value
+            self.checked = checked
+
+    class FakeQuestion:
+        def __init__(self, choices):
+            seen_choices.extend((c.title, c.checked) for c in choices)
+
+        def ask(self):
+            return ["claude", "codex"]
+
+    fake_questionary = types.SimpleNamespace(
+        Choice=FakeChoice,
+        checkbox=lambda _message, choices: FakeQuestion(choices),
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setitem(sys.modules, "questionary", fake_questionary)
+    monkeypatch.setattr(
+        "agam.agents.detect_agents",
+        lambda home: [
+            FakeAgent("claude"),
+            FakeAgent("cursor"),
+            FakeAgent("codex"),
+        ],
+    )
+    monkeypatch.setattr(
+        "agam.installer.run_install",
+        lambda answers, **kw: called.append(kw) or MockResult(),
+    )
+
+    rc = cli.main(["init"])
+    assert rc == 0
+    assert called[0]["targets"] == ["claude", "codex"]
+    assert seen_choices == [
+        ("Claude", True),
+        ("Cursor", True),
+        ("Codex", True),
+    ]
+
+
+def test_cli_init_detected_three_empty_selection_cancels(monkeypatch, tmp_path):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    called: list[dict] = []
+
+    class FakeAgent:
+        def __init__(self, name):
+            self.name = name
+
+        def detect_evidence(self, home):
+            return "present"
+
+    class FakeChoice:
+        def __init__(self, title, value=None, checked=False):
+            self.title = title
+            self.value = value
+            self.checked = checked
+
+    fake_questionary = types.SimpleNamespace(
+        Choice=FakeChoice,
+        checkbox=lambda *_args, **_kwargs: types.SimpleNamespace(ask=lambda: []),
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setitem(sys.modules, "questionary", fake_questionary)
+    monkeypatch.setattr(
+        "agam.agents.detect_agents",
+        lambda home: [
+            FakeAgent("claude"), FakeAgent("cursor"), FakeAgent("codex")
+        ],
+    )
+    monkeypatch.setattr(
+        "agam.installer.run_install",
+        lambda answers, **kw: called.append(kw) or MockResult(),
+    )
+
+    assert cli.main(["init"]) == 1
+    assert called == []
 
 
 def test_cli_init_cancelled_target_prompt_aborts(monkeypatch, tmp_path):
@@ -378,7 +487,9 @@ def test_cli_status_no_crash(monkeypatch, tmp_path, capsys):
     rc = cli.main(["status"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Agam home" in out or "Container" in out
+    assert f"Agam home:    {tmp_path / '.agam'}" in out
+    assert str(tmp_path / ".agam" / "knowledge" / "graph.db") in out
+    assert str(tmp_path / ".agam" / "queue") in out
 
 
 def test_cli_status_with_container(monkeypatch, tmp_path, capsys):
@@ -408,7 +519,7 @@ def test_cli_obsolete_sets_status_property(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
     # Spin up a fresh KG (using the schema from installer).
-    installer.run_wizard(
+    installer.run_install(
         answers={
             "name": "Alice",
             "primary_goal": "test",
@@ -417,9 +528,10 @@ def test_cli_obsolete_sets_status_property(monkeypatch, tmp_path):
             "container_mode": "none",
             "bootstrap_now": False,
         },
+        targets=["claude"],
         home=tmp_path,
     )
-    kg = tmp_path / ".claude" / "knowledge" / "graph.db"
+    kg = tmp_path / ".agam" / "knowledge" / "graph.db"
     conn = sqlite3.connect(str(kg))
     conn.execute(
         "INSERT INTO entities (name, type, description, created, updated) "
@@ -448,7 +560,7 @@ def test_cli_obsolete_missing_entity_returns_1(monkeypatch, tmp_path):
     from agam import cli, installer
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    installer.run_wizard(
+    installer.run_install(
         answers={
             "name": "Alice",
             "primary_goal": "test",
@@ -457,6 +569,7 @@ def test_cli_obsolete_missing_entity_returns_1(monkeypatch, tmp_path):
             "container_mode": "none",
             "bootstrap_now": False,
         },
+        targets=["claude"],
         home=tmp_path,
     )
     rc = cli.main(["obsolete", "nonexistent-entity"])
@@ -588,6 +701,52 @@ def test_cli_uninstall_target_cursor_cleans_cursor_only(monkeypatch, tmp_path):
     assert "/tmp/keep-me.sh" in (cursor / "hooks.json").read_text()
     assert claude_agam.exists()
     assert (tmp_path / ".agam").exists()
+
+
+def test_cli_uninstall_target_codex_cleans_codex_only(monkeypatch, tmp_path):
+    import json
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    codex = tmp_path / ".codex"
+    agam_hooks = codex / "hooks" / "agam"
+    agam_hooks.mkdir(parents=True)
+    (codex / "tools" / "agam").mkdir(parents=True)
+    (agam_hooks / "graph_recall.py").write_text("# agam\n")
+    (agam_hooks / "codex_stop.py").write_text("# agam\n")
+    generic_user_hook = codex / "hooks" / "graph_recall.py"
+    generic_user_hook.write_text("# user-owned\n")
+    (codex / "hooks.json").write_text(json.dumps({
+        "hooks": {
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": str(agam_hooks / "graph_recall.py")}]},
+                {"hooks": [{"type": "command", "command": "/tmp/graph_recall.py"}]},
+                {"hooks": [{"type": "command", "command": "/tmp/keep-me.sh"}]},
+            ],
+            "Stop": [
+                {"hooks": [{"type": "command", "command": str(agam_hooks / "codex_stop.py")}]},
+            ],
+        }
+    }))
+    shared = tmp_path / ".agam"
+    shared.mkdir()
+    claude_hook = tmp_path / ".claude" / "hooks" / "graph_recall.py"
+    claude_hook.parent.mkdir(parents=True)
+    claude_hook.write_text("# keep\n")
+
+    rc = cli.main(["uninstall", "--target", "codex", "--confirm"])
+    assert rc == 0
+    assert not (agam_hooks / "graph_recall.py").exists()
+    assert not (agam_hooks / "codex_stop.py").exists()
+    assert not (codex / "tools" / "agam").exists()
+    cleaned = (codex / "hooks.json").read_text()
+    assert str(agam_hooks / "graph_recall.py") not in cleaned
+    assert str(agam_hooks / "codex_stop.py") not in cleaned
+    assert "/tmp/graph_recall.py" in cleaned
+    assert "/tmp/keep-me.sh" in cleaned
+    assert generic_user_hook.read_text() == "# user-owned\n"
+    assert claude_hook.exists()
+    assert shared.exists()
 
 
 def test_cli_uninstall_claude_cleans_agam_env_vars(monkeypatch, tmp_path):
@@ -819,7 +978,7 @@ def test_cli_doctor_passes_after_init(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr("agam.bootstrap._discover_container", lambda: None)
 
-    installer.run_wizard(
+    installer.run_install(
         answers={
             "name": "Alice",
             "primary_goal": "test",
@@ -828,6 +987,7 @@ def test_cli_doctor_passes_after_init(monkeypatch, tmp_path, capsys):
             "container_mode": "none",
             "bootstrap_now": False,
         },
+        targets=["claude"],
         home=tmp_path,
     )
 
@@ -855,6 +1015,10 @@ def test_cli_doctor_passes_after_init(monkeypatch, tmp_path, capsys):
         "agam.invoker.probe_all",
         lambda: [(HostInvoker(), ProbeResult(True, "host claude ready", "fast"))],
     )
+    monkeypatch.setattr(
+        "agam.cli.shutil.which",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
 
     rc = cli.main(["doctor"])
     out = capsys.readouterr().out
@@ -862,6 +1026,89 @@ def test_cli_doctor_passes_after_init(monkeypatch, tmp_path, capsys):
     assert "[FAIL]" not in out, f"doctor should not FAIL on a fresh install:\n{out}"
     assert "All checks passed" in out
     assert rc == 0
+
+
+def test_cli_doctor_passes_for_codex_only_install(
+    monkeypatch, tmp_path, capsys
+):
+    """Codex-only installs are healthy without ~/.claude or the Claude CLI."""
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr(
+        "agam.cli.shutil.which",
+        lambda name: "/opt/codex/bin/codex" if name == "codex" else None,
+    )
+    monkeypatch.setattr("agam.invoker.probe_all", lambda: [])
+
+    installer.run_install(
+        answers={
+            "name": "Codex User",
+            "primary_goal": "shared agent memory",
+            "projects_dir": str(tmp_path / "projects"),
+            "platform": "linux",
+            "container_mode": "auto",
+            "bootstrap_now": False,
+        },
+        targets=["codex"],
+        home=tmp_path,
+        write_plist=False,
+    )
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    assert "[FAIL]" not in out
+    assert "Codex Agam hooks registered" in out
+    assert "codex=/opt/codex/bin/codex" in out
+    assert "All checks passed" in out
+
+
+def test_cli_doctor_accepts_codex_from_launchd_absolute_path(
+    monkeypatch, tmp_path, capsys
+):
+    """launchd's persisted Codex path is healthy even when shell PATH differs."""
+    from agam import cli, installer
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    codex = tmp_path / "vscode-extension" / "bin" / "codex"
+    codex.parent.mkdir(parents=True)
+    codex.write_text("#!/bin/sh\nexit 0\n")
+    codex.chmod(0o755)
+
+    monkeypatch.setattr(
+        "agam.installer.shutil.which",
+        lambda name: str(codex) if name == "codex" else None,
+    )
+    installer.run_install(
+        answers={
+            "name": "Launchd Codex User",
+            "primary_goal": "shared agent memory",
+            "projects_dir": str(tmp_path / "projects"),
+            "platform": "linux",
+            "container_mode": "auto",
+            "bootstrap_now": False,
+        },
+        targets=["codex"],
+        home=tmp_path,
+        write_plist=True,
+    )
+
+    # The interactive shell cannot see Codex, while the installed launchd
+    # configuration retains the absolute executable selected during install.
+    monkeypatch.setattr("agam.cli.shutil.which", lambda _name: None)
+    monkeypatch.setattr("agam.invoker.probe_all", lambda: [])
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    assert "[FAIL]" not in out
+    assert f"codex={codex.resolve()}" in out
+    assert "All checks passed" in out
 
 
 # ---------------------------------------------------------------------------

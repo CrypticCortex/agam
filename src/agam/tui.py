@@ -4,14 +4,15 @@ Usable, not just informational. Every row supports drill-down (Enter)
 and most rows support direct actions (force-sync a queue entry, edit a
 rationale, run a lint fix). Auto-refreshes every 30s, manual refresh
 via 'r'. All paths come from env vars with sane defaults so the same
-module works in both the personal and  installs.
+module works across Claude Code, Cursor, and Codex installs.
 
 Env vars:
-    AGAM_HOME        default ~/.claude/agam
-    AGAM_KG_PATH     default ~/.claude/knowledge/graph.db
-    AGAM_WORKLOG     default ~/.claude/work-log.md
-    AGAM_HOOKS       default ~/.claude/hooks
-    AGAM_TOOLS       default ~/.claude/tools
+    AGAM_DATA_HOME   default ~/.agam
+    AGAM_HOME        default AGAM_DATA_HOME
+    AGAM_KG_PATH     default AGAM_DATA_HOME/knowledge/graph.db
+    AGAM_WORK_LOG    default AGAM_HOME/work-log.md
+    AGAM_HOOKS_DIR   default AGAM_HOME/hooks
+    AGAM_TOOLS_DIR   default AGAM_HOME/tools
 
 Bindings (top-level):
     q          quit
@@ -72,34 +73,87 @@ def _env_path(var: str, default: Path) -> Path:
 
 
 HOME = Path.home()
-AGAM = _env_path("AGAM_HOME", HOME / ".claude" / "agam")
-KG_DB = _env_path("AGAM_KG_PATH", HOME / ".claude" / "knowledge" / "graph.db")
-WORKLOG = _env_path("AGAM_WORKLOG", HOME / ".claude" / "work-log.md")
-HOOKS_DIR = _env_path("AGAM_HOOKS", HOME / ".claude" / "hooks")
-TOOLS_DIR = _env_path("AGAM_TOOLS", HOME / ".claude" / "tools")
 
-QUEUE_PATH = AGAM / ".pending-closes.jsonl"
-ARCHIVE_PATH = AGAM / ".pending-closes.archive.jsonl"
+
+def _data_home(home: Path = HOME) -> Path:
+    """Resolve Agam's shared, agent-neutral operational home."""
+    return _env_path("AGAM_DATA_HOME", home / ".agam")
 
 
 def _cursor_home() -> Path:
-    """Cursor's operational home (file-per-session queue + processed/errors/log).
-    Honors AGAM_DATA_HOME, else the re-homed ~/.claude/cursor-agam, else the
-    legacy neutral ~/.agam."""
-    env = os.environ.get("AGAM_DATA_HOME")
-    if env:
-        return Path(os.path.expanduser(env))
-    for cand in (HOME / ".claude" / "cursor-agam", HOME / ".agam"):
-        if cand.exists():
-            return cand
-    return HOME / ".claude" / "cursor-agam"
+    """Backward-compatible alias for the former Cursor-specific resolver."""
+    return _data_home()
 
 
-DATA_HOME = _cursor_home()
+def _identity_home(home: Path, data_home: Path | None = None) -> Path:
+    """Use shared identity when present, else a pre-migration Claude identity."""
+    if os.environ.get("AGAM_HOME"):
+        return _env_path("AGAM_HOME", home / ".agam")
+    shared = data_home or _data_home(home)
+    legacy = home / ".claude" / "agam"
+    shared_identity = any(
+        (shared / filename).exists()
+        for filename in ("AGAM.md", "THISAI.md", "config.yaml")
+    )
+    return shared if shared_identity or not legacy.exists() else legacy
+
+
+def _knowledge_db(home: Path, data_home: Path | None = None) -> Path:
+    """Prefer the shared graph, with a read-compatible legacy fallback."""
+    if os.environ.get("AGAM_KG_PATH"):
+        return _env_path("AGAM_KG_PATH", home / ".agam" / "knowledge" / "graph.db")
+    shared = (data_home or _data_home(home)) / "knowledge" / "graph.db"
+    legacy = home / ".claude" / "knowledge" / "graph.db"
+    return shared if shared.exists() or not legacy.exists() else legacy
+
+
+def _first_existing(default: Path, *fallbacks: Path) -> Path:
+    """Return the first existing compatibility path, else the shared default."""
+    for candidate in (default, *fallbacks):
+        if candidate.exists():
+            return candidate
+    return default
+
+
+DATA_HOME = _data_home()
+AGAM = _identity_home(HOME, DATA_HOME)
+KG_DB = _knowledge_db(HOME, DATA_HOME)
+WORKLOG = _env_path(
+    "AGAM_WORK_LOG",
+    _env_path(
+        "AGAM_WORKLOG",
+        _first_existing(
+            DATA_HOME / "work-log.md",
+            HOME / ".claude" / "work-log.md",
+            AGAM / "work-log.md",
+        ),
+    ),
+)
+HOOKS_DIR = _env_path(
+    "AGAM_HOOKS_DIR",
+    _env_path(
+        "AGAM_HOOKS",
+        _first_existing(DATA_HOME / "hooks", HOME / ".claude" / "hooks"),
+    ),
+)
+TOOLS_DIR = _env_path(
+    "AGAM_TOOLS_DIR",
+    _env_path(
+        "AGAM_TOOLS",
+        _first_existing(DATA_HOME / "tools", HOME / ".claude" / "tools"),
+    ),
+)
+
+QUEUE_PATH = AGAM / ".pending-closes.jsonl"
+ARCHIVE_PATH = AGAM / ".pending-closes.archive.jsonl"
 NEW_QUEUE_DIR = DATA_HOME / "queue"
-CURSOR_PROCESSED = DATA_HOME / "processed"
-CURSOR_ERRORS = DATA_HOME / "queue-errors"
-CURSOR_WLOG = DATA_HOME / "logs" / "watchdog.log"
+SHARED_PROCESSED = DATA_HOME / "processed"
+SHARED_ERRORS = DATA_HOME / "queue-errors"
+SHARED_WLOG = DATA_HOME / "logs" / "watchdog.log"
+# Back-compatible aliases for callers that imported the old Cursor-era names.
+CURSOR_PROCESSED = SHARED_PROCESSED
+CURSOR_ERRORS = SHARED_ERRORS
+CURSOR_WLOG = SHARED_WLOG
 PROCESSED = AGAM / ".processed-sessions.jsonl"
 WLOG = AGAM / ".watchdog-log"
 LINT = AGAM / ".lint-findings.md"
@@ -110,17 +164,17 @@ MUGAM = AGAM / "MUGAM.md"
 
 
 def _find_tool(*candidates: str) -> Path | None:
-    """Resolve a tool path across the personal and  install layouts.
+    """Resolve a tool path across legacy and shared install layouts.
 
     Personal install drops tools at ``~/.claude/tools/<dash-name>.py``.
-     install drops them at ``~/.claude/tools/agam/<underscore_name>.py``.
+    Shared installs use ``~/.agam/tools/agam/<underscore_name>.py``.
     Try each candidate in order; return the first one that exists.
     """
     for c in candidates:
         p = TOOLS_DIR / c
         if p.exists():
             return p
-        # Also try one level down ( layout)
+        # Also try the shared install's one-level-down package directory.
         nested = TOOLS_DIR / "agam" / c
         if nested.exists():
             return nested
@@ -133,6 +187,67 @@ WATCHDOG_MONITOR = _find_tool("watchdog-monitor.py", "watchdog_monitor.py")
 
 
 # ---- helpers ------------------------------------------------------------
+
+_AGENT_STYLES = {
+    "claude": "yellow3",
+    "cursor": "cyan",
+    "codex": "#10a37f",
+}
+
+
+def _agent_style(agent: str) -> str:
+    """Consistent provenance color for every supported agent."""
+    return _AGENT_STYLES.get(agent, "grey50")
+
+
+def _file_mentions(path: Path, markers: tuple[str, ...]) -> bool:
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(marker in body for marker in markers)
+
+
+def _wired_agents(home: Path = HOME) -> list[str]:
+    """Return agents whose Agam-specific wiring is installed.
+
+    Config-directory presence alone is not enough: the animation represents a
+    live wire to the shared brain, not merely an installed editor or CLI.
+    """
+    specs = (
+        (
+            "claude",
+            home / ".claude" / "settings.json",
+            (
+                home / ".claude" / "hooks" / "graph_recall.py",
+                home / ".claude" / "hooks" / "session_close.py",
+                home / ".claude" / "hooks" / "graph-recall.py",
+                home / ".claude" / "hooks" / "session-close-hook.py",
+            ),
+        ),
+        (
+            "cursor",
+            home / ".cursor" / "hooks.json",
+            (
+                home / ".cursor" / "hooks" / "cursor_stop.py",
+                home / ".cursor" / "hooks" / "cursor_session_end.py",
+            ),
+        ),
+        (
+            "codex",
+            home / ".codex" / "hooks.json",
+            (
+                home / ".codex" / "hooks" / "agam" / "graph_recall.py",
+                home / ".codex" / "hooks" / "agam" / "codex_stop.py",
+            ),
+        ),
+    )
+    wired: list[str] = []
+    for name, config, owned_files in specs:
+        markers = tuple(str(path) for path in owned_files)
+        if any(path.exists() for path in owned_files) or _file_mentions(config, markers):
+            wired.append(name)
+    return wired
 
 def _age_str(seconds: float) -> str:
     if seconds < 60:
@@ -238,7 +353,7 @@ def _kg_query(sql: str, params: tuple = ()) -> list:
 def _read_queue() -> list[dict]:
     """Merge both queue sources: legacy .pending-closes.jsonl (personal Claude
     pipeline) + the file-per-session queue/*.json the shared watchdog drains
-    (Cursor + OSS). Each entry keeps its 'agent' tag where present."""
+    (Claude, Cursor, and Codex). Each entry keeps its agent provenance."""
     entries = list(_read_jsonl(QUEUE_PATH))
     if NEW_QUEUE_DIR.exists():
         for p in sorted(NEW_QUEUE_DIR.glob("*.json")):
@@ -291,15 +406,15 @@ def _queue_state(entries: list[dict]) -> list[dict]:
 
 def _last_drain_ts() -> float | None:
     """Most recent successful drain across BOTH pipelines: the personal jsonl
-    watchdog-log and the cursor text watchdog.log."""
+    watchdog-log and the shared text watchdog.log."""
     best = None
     for e in reversed(_tail_jsonl(WLOG, 120)):
         if e.get("event") in ("done", "work-log-appended", "agam-sync-done"):
             best = e.get("ts")
             break
-    if CURSOR_WLOG.exists():
+    if SHARED_WLOG.exists():
         try:
-            for line in reversed(CURSOR_WLOG.read_text(errors="replace").splitlines()):
+            for line in reversed(SHARED_WLOG.read_text(errors="replace").splitlines()):
                 if line.startswith("[") and (" ok " in line or "drain-done" in line):
                     iso = line[1:line.index("]")].replace("Z", "+00:00")
                     ts = datetime.fromisoformat(iso).timestamp()
@@ -317,7 +432,7 @@ def _draining() -> bool:
 
 def _error_count() -> int:
     n = 0
-    for d in (CURSOR_ERRORS, AGAM / "queue-errors"):
+    for d in {SHARED_ERRORS, AGAM / "queue-errors"}:
         if d.exists() and d.is_dir():
             n += sum(1 for _ in d.glob("*.json"))
     return n
@@ -352,7 +467,7 @@ def _invoker() -> tuple[str, str]:
     """(label, color): can the watchdog drain right now?"""
     if _container_name():
         return ("container", "green")
-    if shutil.which("claude") or shutil.which("cursor-agent"):
+    if any(shutil.which(cli) for cli in ("claude", "cursor-agent", "codex")):
         return ("host", "green")
     return ("none", "red")
 
@@ -430,7 +545,9 @@ def render_overview() -> Text:
     t.append("\n  ", style="grey50")
     t.append(f"claude {prov.get('claude', 0)}", style="yellow3")
     t.append(" \u00b7 ", style="grey50")
-    t.append(f"cursor {prov.get('cursor', 0)}\n", style="cyan")
+    t.append(f"cursor {prov.get('cursor', 0)}", style="cyan")
+    t.append(" \u00b7 ", style="grey50")
+    t.append(f"codex {prov.get('codex', 0)}\n", style=_agent_style("codex"))
     return t
 
 
@@ -533,8 +650,10 @@ def render_next_actions() -> Text:
                 suggestions.append(("daycap exhausted", "press d to drain (sync --all)"))
         except (ValueError, OSError):
             pass
-    if _container_name() is None:
-        suggestions.append(("no claude-code container", "press c to start"))
+    if _invoker()[0] == "none":
+        suggestions.append(
+            ("no healthy enrichment CLI", "start a container or install an agent CLI")
+        )
     queue = _read_queue()
     if len(queue) > 25:
         suggestions.append((f"queue depth high ({len(queue)})", "switch to queue tab to inspect"))
@@ -596,13 +715,7 @@ class BrainBar(Static):
         self.set_interval(10.0, self._refresh_stats)
 
     def _refresh_stats(self) -> None:
-        home = Path.home()
-        agents = []
-        if (home / ".claude" / "settings.json").exists() or (home / ".claude" / "hooks").exists():
-            agents.append("claude")
-        if (home / ".cursor" / "hooks.json").exists():
-            agents.append("cursor")
-        self._agents = agents
+        self._agents = _wired_agents(Path.home())
         ent = _kg_query("SELECT COUNT(*) FROM entities")
         self._total = ent[0][0] if ent else 0
         self._prov = {a: c for a, c in _provenance_counts()}
@@ -650,11 +763,16 @@ class BrainBar(Static):
 
     def _agent_row(self, idx: int):
         """Synapse packet feeding the brain, for the cell row `idx`."""
+        specs = {
+            1: ("claude", "claude ", "green"),
+            3: ("cursor", "cursor ", "cyan"),
+            5: ("codex", "codex  ", "bright_green"),
+        }
+        item = specs.get(idx)
         spec = None
-        if idx == 2 and "claude" in self._agents:
-            spec = ("claude ", "yellow3", "green")
-        elif idx == 4 and "cursor" in self._agents:
-            spec = ("cursor ", "cyan", "cyan")
+        if item is not None and item[0] in self._agents:
+            name, label, pulse_style = item
+            spec = (label, _agent_style(name), pulse_style)
         if not spec:
             return None
         label, label_style, pulse_style = spec
@@ -689,10 +807,13 @@ class BrainBar(Static):
         minds = len(self._agents)
         cn = self._prov.get("claude", 0)
         un = self._prov.get("cursor", 0)
+        xn = self._prov.get("codex", 0)
         out.append(f"{minds} mind{'s' if minds != 1 else ''} \u00b7 {self._total} memories  ", style="grey50")
         out.append(f"claude {cn}", style="yellow3")
         out.append(" / ", style="grey50")
         out.append(f"cursor {un}", style="cyan")
+        out.append(" / ", style="grey50")
+        out.append(f"codex {xn}", style=_agent_style("codex"))
         return out
 
 
@@ -1097,7 +1218,7 @@ class AgamApp(App):
                 "orange3" if "stale" in state else
                 "yellow" if "waiting" in state else "grey50"
             )
-            agent_color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
+            agent_color = _agent_style(agent)
             table.add_row(
                 str(i),
                 Text(state, style=color),
@@ -1153,7 +1274,7 @@ class AgamApp(App):
                 (eid,),
             )
             agent = agent_row[0][0] if agent_row else "?"
-            agent_color = "cyan" if agent == "cursor" else ("yellow3" if agent == "claude" else "grey50")
+            agent_color = _agent_style(agent)
             armed = "yes" if triggers else "—"
             short_desc = (desc or "").splitlines()[0][:80] if desc else ""
             table.add_row(

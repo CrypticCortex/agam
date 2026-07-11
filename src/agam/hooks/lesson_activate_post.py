@@ -25,7 +25,7 @@ import sys
 import tempfile
 
 DB_PATH = os.environ.get(
-    "AGAM_KG_PATH", os.path.expanduser("~/.claude/knowledge/graph.db")
+    "AGAM_KG_PATH", os.path.expanduser("~/.agam/knowledge/graph.db")
 )
 CACHE_MAX_AGE = 3600
 
@@ -152,15 +152,23 @@ def main():
     _init_paths(session_id)
 
     tool_name = data.get("tool_name", "")
-    tool_output = data.get("tool_output", {})
+    # Claude calls this field ``tool_output``; Codex documents
+    # ``tool_response``. Prefer the Codex spelling when both are present.
+    tool_output = data.get("tool_response", data.get("tool_output", {}))
 
     # Only activate on failed Bash commands
     if tool_name != "Bash":
         sys.exit(0)
 
     # Check for failure -- look at stdout/stderr for error indicators
-    stdout = tool_output.get("stdout", "") if isinstance(tool_output, dict) else str(tool_output)
-    stderr = tool_output.get("stderr", "") if isinstance(tool_output, dict) else ""
+    if isinstance(tool_output, dict):
+        stdout = tool_output.get("stdout", "")
+        stderr = tool_output.get("stderr", "")
+        if not stdout and not stderr:
+            stdout = json.dumps(tool_output, ensure_ascii=False)
+    else:
+        stdout = str(tool_output)
+        stderr = ""
     error_text = stdout + "\n" + stderr
 
     if not error_text or len(error_text.strip()) < 5:

@@ -60,15 +60,30 @@ def test_originals_left_untouched(tmp_path):
     assert (tmp_path / ".claude" / "agam" / "AGAM.md").exists()
 
 
-def test_already_when_agam_has_content(tmp_path):
+def test_already_when_agam_has_graph(tmp_path):
     _make_legacy(tmp_path)
-    (tmp_path / ".agam").mkdir()
-    (tmp_path / ".agam" / "something").write_text("x")
+    shared_knowledge = tmp_path / ".agam" / "knowledge"
+    shared_knowledge.mkdir(parents=True)
+    (shared_knowledge / "graph.db").write_text("existing shared graph")
     status, dest = migrate_if_needed(tmp_path)
     assert status == "already"
     assert dest is None
-    # Did not copy over the existing agam home.
-    assert not (tmp_path / ".agam" / "knowledge").exists()
+    assert (shared_knowledge / "graph.db").read_text() == "existing shared graph"
+
+
+def test_queue_only_shared_home_does_not_block_legacy_migration(tmp_path):
+    _make_legacy(tmp_path)
+    queue_entry = tmp_path / ".agam" / "queue" / "cursor-session.json"
+    queue_entry.parent.mkdir(parents=True)
+    queue_entry.write_text('{"agent":"cursor"}\n')
+
+    status, dest = migrate_if_needed(tmp_path)
+
+    assert status == "migrated"
+    assert dest == tmp_path / ".agam"
+    assert (tmp_path / ".agam" / "knowledge" / "graph.db").exists()
+    assert (tmp_path / ".agam" / "AGAM.md").exists()
+    assert queue_entry.read_text() == '{"agent":"cursor"}\n'
 
 
 def test_idempotent(tmp_path):

@@ -6,21 +6,22 @@
 #   2. AGAM_INVOKER=container or AGAM_WATCHDOG_MODE=container -> force container.
 #   3. AGAM_CONTAINER_NAME exact name running -> named container.
 #   4. Image matching AGAM_CONTAINER_PATTERN running -> discovered container.
-#   5. `claude` on PATH -> host. (Auth lives in Keychain on macOS or in
-#      a file inside the container; we trust claude's own auth handling.)
+#   5. An enrichment CLI on PATH -> host. Preference is claude, then
+#      cursor-agent, then codex. (Each CLI owns its own authentication.)
 #   6. None of the above -> log no-invoker and exit (queue preserved).
 #
-# The Python module ``agam.invoker`` is the source of truth for this cascade
-# (tested in tests/test_invoker.py). This script reimplements the same
-# decision logic in shell because launchd runs the watchdog without
-# guaranteed access to the agam Python environment. Keep the two in sync.
+# The container/host resolution mirrors ``agam.invoker``. This launchd script
+# also selects among supported host CLIs because it runs without guaranteed
+# access to the agam Python environment.
 #
 # Env:
-#   AGAM_HOME              default $HOME/.claude/agam
+#   AGAM_HOME              default $HOME/.agam
 #   AGAM_INVOKER           host | container (overrides cascade)
 #   AGAM_WATCHDOG_MODE     host | container (legacy alias)
 #   AGAM_CONTAINER_PATTERN regex (default claude-code)
 #   AGAM_CONTAINER_NAME    exact name override
+#   AGAM_LLM_CLI_PIN       claude | cursor-agent | codex (host override)
+#   AGAM_LLM_CLI_PATH      absolute host CLI executable path (launchd-safe)
 #   AGAM_MAX_PER_RUN       max entries drained per tick (default 25). Bounds
 #                          one pass so a backlog after downtime can't fire an
 #                          unbounded number of enrichment runs at once.
@@ -33,7 +34,11 @@ set -u
 AGAM_HOME="${AGAM_HOME:-${AGAM_DATA_HOME:-$HOME/.agam}}"
 LOG="$AGAM_HOME/logs/watchdog.log"
 LOCK="$AGAM_HOME/.watchdog.lock"
-mkdir -p "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" "$AGAM_HOME/queue-errors"
+PROCESSING_DIR="$AGAM_HOME/processing"
+RETRY_DIR="$AGAM_HOME/.retries"
+mkdir -p \
+    "$AGAM_HOME/logs" "$AGAM_HOME/queue" "$AGAM_HOME/processed" \
+    "$AGAM_HOME/queue-errors" "$PROCESSING_DIR" "$RETRY_DIR"
 
 log() { echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
 
@@ -54,6 +59,31 @@ if ! ( set -C; echo $$ > "$LOCK" ) 2>/dev/null; then
 fi
 trap 'rm -f "$LOCK"' EXIT
 
+# A claimed generation may survive an abrupt watchdog termination. Requeue it
+# under a generation-specific name before taking a new snapshot. The normal
+# enqueue path only replaces <session>.json, so this recovered generation
+# cannot overwrite (or be overwritten by) a newer session generation.
+shopt -s nullglob
+for claim_dir in "$PROCESSING_DIR"/claim.*; do
+    [[ -d "$claim_dir" ]] || continue
+    for claim in "$claim_dir"/*.json; do
+        name=$(basename "$claim")
+        stem="${name%.json}"
+        generation=$(basename "$claim_dir")
+        recovered_name="${stem}.retry-recovered-${generation}.json"
+        if [[ -e "$AGAM_HOME/queue/$recovered_name" ]]; then
+            recovered_name="${stem}.retry-recovered-${generation}-$$-${RANDOM}.json"
+        fi
+        if mv "$claim" "$AGAM_HOME/queue/$recovered_name"; then
+            if [[ -f "$RETRY_DIR/$name" ]]; then
+                mv "$RETRY_DIR/$name" "$RETRY_DIR/$recovered_name"
+            fi
+            log "recovered-claim $name as $recovered_name"
+        fi
+    done
+    rmdir "$claim_dir" 2>/dev/null || true
+done
+
 # --- Resolve invoker (shell cascade mirror of agam.invoker.resolve_invoker)
 PINNED=""
 EXPLICIT="${AGAM_INVOKER:-}"
@@ -65,15 +95,39 @@ CONTAINER_NAME_OVERRIDE="${AGAM_CONTAINER_NAME:-}"
 
 probe_host() {
     # 0 = healthy, 1 = unhealthy. Writes detail to global PROBE_DETAIL and the
-    # chosen LLM CLI to AGAM_LLM_CLI. Prefer claude; fall back to cursor-agent
-    # so a Cursor-only host (no claude installed) can still enrich the graph.
+    # chosen LLM CLI to AGAM_LLM_CLI. Prefer claude; fall back to cursor-agent,
+    # then codex, so a host with only one supported agent can still enrich the
+    # graph without changing the historical Claude/Cursor preference.
     # Auth lives in each tool's own store; real auth failures surface at run.
     #
-    # AGAM_LLM_CLI_PIN overrides the preference (e.g. pin cursor-agent on a host
-    # where claude -p can't write files headlessly).
+    # AGAM_LLM_CLI_PATH is checked first. The neutral installer records an
+    # absolute path because launchd's fixed PATH may not include npm/nvm/asdf
+    # shims. A stale path falls through to the normal probe cascade.
+    if [[ -n "${AGAM_LLM_CLI_PATH:-}" ]]; then
+        local cli_path="$AGAM_LLM_CLI_PATH"
+        local cli_kind="${AGAM_LLM_CLI_PIN:-$(basename "$cli_path")}"
+        if [[ "$cli_path" == /* && -f "$cli_path" && -x "$cli_path" ]]; then
+            case "$cli_kind" in
+                claude|cursor-agent|codex)
+                    AGAM_LLM_CLI="$cli_kind"
+                    PROBE_DETAIL="host $cli_kind at $cli_path"
+                    return 0
+                    ;;
+            esac
+        fi
+        # Never forward a stale, relative, or unrecognized override to the
+        # inner runner if a PATH fallback succeeds below.
+        AGAM_LLM_CLI_PATH=""
+    fi
+
+    # AGAM_LLM_CLI_PIN overrides the preference (e.g. pin codex even when
+    # claude is also installed).
     if [[ -n "${AGAM_LLM_CLI_PIN:-}" ]]; then
-        if command -v "$AGAM_LLM_CLI_PIN" >/dev/null 2>&1; then
+        local resolved
+        resolved=$(command -v "$AGAM_LLM_CLI_PIN" 2>/dev/null || true)
+        if [[ -n "$resolved" ]]; then
             AGAM_LLM_CLI="$AGAM_LLM_CLI_PIN"
+            [[ "$resolved" == /* ]] && AGAM_LLM_CLI_PATH="$resolved"
             PROBE_DETAIL="pinned $AGAM_LLM_CLI_PIN on PATH"
             return 0
         fi
@@ -82,15 +136,23 @@ probe_host() {
     fi
     if command -v claude >/dev/null 2>&1; then
         AGAM_LLM_CLI="claude"
+        AGAM_LLM_CLI_PATH=$(command -v claude)
         PROBE_DETAIL="host claude on PATH"
         return 0
     fi
     if command -v cursor-agent >/dev/null 2>&1; then
         AGAM_LLM_CLI="cursor-agent"
+        AGAM_LLM_CLI_PATH=$(command -v cursor-agent)
         PROBE_DETAIL="host cursor-agent on PATH (claude absent)"
         return 0
     fi
-    PROBE_DETAIL="neither claude nor cursor-agent on PATH"
+    if command -v codex >/dev/null 2>&1; then
+        AGAM_LLM_CLI="codex"
+        AGAM_LLM_CLI_PATH=$(command -v codex)
+        PROBE_DETAIL="host codex on PATH (claude and cursor-agent absent)"
+        return 0
+    fi
+    PROBE_DETAIL="none of claude, cursor-agent, or codex on PATH"
     return 1
 }
 
@@ -176,7 +238,6 @@ else
     fi
 fi
 
-shopt -s nullglob
 entries=("$AGAM_HOME"/queue/*.json)
 
 if [[ -z "$INVOKER_KIND" ]]; then
@@ -242,6 +303,7 @@ run_entry() {
                 AGAM_KG_PATH="${AGAM_KG_PATH:-$HOME/.claude/knowledge/graph.db}" \
                 AGAM_USER_ENTITY="${AGAM_USER_ENTITY:-User}" \
                 AGAM_LLM_CLI="$AGAM_LLM_CLI" \
+                AGAM_LLM_CLI_PATH="${AGAM_LLM_CLI_PATH:-}" \
                 "$HOOKS_DIR_RESOLVED/agam_watchdog_inner.py" < "$entry_file"
             ;;
         container|named-container)
@@ -267,8 +329,6 @@ run_entry() {
 # successive ticks instead of starving old entries or blowing up one tick.
 MAX_PER_RUN="${AGAM_MAX_PER_RUN:-25}"
 MAX_RETRIES="${AGAM_MAX_RETRIES:-3}"
-RETRY_DIR="$AGAM_HOME/.retries"
-mkdir -p "$RETRY_DIR"
 
 drained=0
 ok_n=0
@@ -284,31 +344,69 @@ while IFS= read -r entry; do
         break
     fi
     name=$(basename "$entry")
-    run_entry "$entry"
+    # Atomically detach this exact generation from queue/. A concurrent
+    # enqueue_file() can now recreate queue/<session>.json without our success
+    # path ever moving that newer generation away.
+    claim_dir=$(mktemp -d "$PROCESSING_DIR/claim.XXXXXX") || {
+        log "claim-dir-failed $name"
+        continue
+    }
+    claim="$claim_dir/$name"
+    if ! mv "$entry" "$claim" 2>/dev/null; then
+        rmdir "$claim_dir" 2>/dev/null || true
+        continue
+    fi
+    generation=$(basename "$claim_dir")
+
+    run_entry "$claim"
     rc=$?
     drained=$((drained + 1))
     if [[ $rc -eq 0 ]]; then
-        mv "$entry" "$AGAM_HOME/processed/$name"
-        rm -f "$RETRY_DIR/$name"
-        ok_n=$((ok_n + 1))
-        log "ok $name"
+        archive="$AGAM_HOME/processed/$name"
+        if [[ -e "$archive" ]]; then
+            archive="$AGAM_HOME/processed/${name%.json}.${generation}.json"
+        fi
+        if mv "$claim" "$archive"; then
+            rm -f "$RETRY_DIR/$name"
+            ok_n=$((ok_n + 1))
+            log "ok $name archived=$(basename "$archive")"
+        else
+            retry_n=$((retry_n + 1))
+            log "archive-failed $name rc=$rc claim=$claim"
+        fi
     else
-        # Bounded retry: count failures in a sidecar; leave the entry in queue/
-        # so the next tick retries it. Only dead-letter after MAX_RETRIES so a
-        # transient blip doesn't permanently exile a real session.
+        # Bounded retry: every failed claimed generation gets its own queue
+        # name. Never move it back to queue/<session>.json, which may now hold a
+        # newer atomically-enqueued generation.
         rfile="$RETRY_DIR/$name"
         n=$(( $(cat "$rfile" 2>/dev/null || echo 0) + 1 ))
         if [[ $n -ge $MAX_RETRIES ]]; then
-            mv "$entry" "$AGAM_HOME/queue-errors/$name"
-            rm -f "$rfile"
-            err_n=$((err_n + 1))
-            log "err $name rc=$rc attempts=$n dead-letter"
+            deadletter="$AGAM_HOME/queue-errors/$name"
+            if [[ -e "$deadletter" ]]; then
+                deadletter="$AGAM_HOME/queue-errors/${name%.json}.${generation}.json"
+            fi
+            if mv "$claim" "$deadletter"; then
+                rm -f "$rfile"
+                err_n=$((err_n + 1))
+                log "err $name rc=$rc attempts=$n dead-letter=$(basename "$deadletter")"
+            else
+                retry_n=$((retry_n + 1))
+                log "dead-letter-failed $name rc=$rc claim=$claim"
+            fi
         else
-            echo "$n" > "$rfile"
-            retry_n=$((retry_n + 1))
-            log "retry $name rc=$rc attempt=$n/$MAX_RETRIES"
+            retry_name="${name%.json}.retry-${generation}.json"
+            if mv "$claim" "$AGAM_HOME/queue/$retry_name"; then
+                echo "$n" > "$RETRY_DIR/$retry_name"
+                rm -f "$rfile"
+                retry_n=$((retry_n + 1))
+                log "retry $name rc=$rc attempt=$n/$MAX_RETRIES as=$retry_name"
+            else
+                retry_n=$((retry_n + 1))
+                log "requeue-failed $name rc=$rc claim=$claim"
+            fi
         fi
     fi
+    rmdir "$claim_dir" 2>/dev/null || true
 done < <(ls -1tr "$AGAM_HOME"/queue/*.json 2>/dev/null)
 
 log "drain-done ok=$ok_n err=$err_n retry=$retry_n"

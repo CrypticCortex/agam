@@ -18,8 +18,10 @@ import importlib.util
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
+import time
 
 
 INNER_PATH = (
@@ -64,6 +66,80 @@ def _load_inner():
     return mod
 
 
+# ---- Codex CLI enrichment -------------------------------------------------
+
+def test_codex_exec_is_ephemeral_read_only_and_disables_hooks(monkeypatch, tmp_path):
+    inner = _load_inner()
+    monkeypatch.setattr(inner, "LLM_CLI", "codex")
+    monkeypatch.setattr(inner, "LLM_CLI_PATH", "/custom/toolchains/codex")
+    monkeypatch.setattr(inner, "AGAM_HOME", tmp_path)
+    observed = {}
+
+    def fake_run(args, **kwargs):
+        schema_path = pathlib.Path(args[args.index("--output-schema") + 1])
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        observed["schema_path"] = schema_path
+        observed["schema"] = json.loads(schema_path.read_text())
+        return subprocess.CompletedProcess(args, 0, stdout='{"body":"SKIP"}', stderr="")
+
+    monkeypatch.setattr(inner.subprocess, "run", fake_run)
+    result = inner.run_claude(
+        "private enrichment prompt",
+        model="claude-haiku-4-5",
+        timeout=42,
+        output_schema=inner.WORK_LOG_OUTPUT_SCHEMA,
+    )
+
+    args = observed["args"]
+    assert result.returncode == 0
+    assert args[:2] == ["/custom/toolchains/codex", "exec"]
+    assert "--ephemeral" in args
+    assert args[args.index("--disable") + 1] == "hooks"
+    assert args[args.index("--sandbox") + 1] == "read-only"
+    assert "--skip-git-repo-check" in args
+    assert args[args.index("--color") + 1] == "never"
+    assert args[args.index("--cd") + 1] == str(tmp_path)
+    assert args[-1] == "-"
+    assert "private enrichment prompt" not in args
+    assert "claude-haiku-4-5" not in args
+    assert observed["kwargs"]["input"] == "private enrichment prompt"
+    assert observed["kwargs"]["timeout"] == 42
+    assert observed["schema"] == inner.WORK_LOG_OUTPUT_SCHEMA
+    assert not observed["schema_path"].exists(), "temporary schema leaked"
+
+
+def test_codex_work_log_stdout_is_materialized_for_existing_append_path(tmp_path):
+    inner = _load_inner()
+    target = tmp_path / "work-log-body.md"
+
+    assert inner._materialize_codex_work_log(
+        json.dumps({"body": "  I fixed the retry path.  "}), target
+    )
+    assert target.read_text() == "I fixed the retry path."
+
+    invalid = tmp_path / "invalid.md"
+    assert not inner._materialize_codex_work_log("not json", invalid)
+    assert not invalid.exists()
+
+
+def test_codex_proposal_stdout_is_materialized_for_existing_applier(tmp_path):
+    inner = _load_inner()
+    proposals = {key: [] for key in inner.PROPOSALS_OUTPUT_SCHEMA["properties"]}
+    proposals["signals"] = ["BUILT"]
+    proposals["thisai_projects"] = [{"name": "Agam", "note": "Added Codex fallback"}]
+    target = tmp_path / "proposals.json"
+
+    assert inner._materialize_codex_proposals(json.dumps(proposals), target)
+    assert json.loads(target.read_text()) == proposals
+
+    missing_key = dict(proposals)
+    missing_key.pop("obsolete")
+    invalid = tmp_path / "invalid-proposals.json"
+    assert not inner._materialize_codex_proposals(json.dumps(missing_key), invalid)
+    assert not invalid.exists()
+
+
 # ---- _compute_cutoff -------------------------------------------------------
 
 def test_compute_cutoff_returns_session_start_when_no_processed_file():
@@ -97,9 +173,7 @@ def test_compute_cutoff_returns_iso_for_prior_processed_sid():
         p.write_text(json.dumps({"session_id": "sid-x", "processed_mtime": 1776000000}) + "\n")
         since, mode = inner._compute_cutoff("sid-x", processed_path=p)
         assert mode == "continuation"
-        # 1776000000 in local time -- just check it parses as ISO
-        assert "T" in since
-        assert since.count(":") == 2  # hh:mm:ss
+        assert since == "2026-04-12T13:20:00Z"
     _assert_real_untouched(snapshots)
 
 
@@ -115,8 +189,7 @@ def test_compute_cutoff_picks_latest_mtime_across_rows():
         )
         since, mode = inner._compute_cutoff("sid-x", processed_path=p)
         assert mode == "continuation"
-        import datetime
-        expected = datetime.datetime.fromtimestamp(1776900000).isoformat(timespec="seconds")
+        expected = "2026-04-22T23:20:00Z"
         assert since == expected
     _assert_real_untouched(snapshots)
 
@@ -146,8 +219,7 @@ def test_compute_cutoff_reads_work_log_written_when_processed_absent():
         wlw.write_text(json.dumps({"session_id": "sid-x", "processed_mtime": 1776500000}) + "\n")
         since, mode = inner._compute_cutoff("sid-x", processed_path=processed, work_log_path=wlw)
         assert mode == "continuation"
-        import datetime
-        expected = datetime.datetime.fromtimestamp(1776500000).isoformat(timespec="seconds")
+        expected = "2026-04-18T08:13:20Z"
         assert since == expected
     _assert_real_untouched(snapshots)
 
@@ -163,8 +235,7 @@ def test_compute_cutoff_picks_max_across_processed_and_work_log_written():
         wlw.write_text(json.dumps({"session_id": "sid-x", "processed_mtime": 1776900000}) + "\n")
         since, mode = inner._compute_cutoff("sid-x", processed_path=processed, work_log_path=wlw)
         assert mode == "continuation"
-        import datetime
-        expected = datetime.datetime.fromtimestamp(1776900000).isoformat(timespec="seconds")
+        expected = "2026-04-22T23:20:00Z"
         assert since == expected
     _assert_real_untouched(snapshots)
 
@@ -179,6 +250,33 @@ def test_compute_cutoff_ignores_other_sids_in_work_log_written():
         since, mode = inner._compute_cutoff("sid-x", processed_path=processed, work_log_path=wlw)
         assert since == "SESSION-START"
         assert mode == "fresh"
+    _assert_real_untouched(snapshots)
+
+
+def test_compute_cutoff_is_utc_regardless_of_host_timezone(monkeypatch, tmp_path):
+    """Epoch sidecars always become a Codex-compatible UTC ``Z`` cutoff."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+    processed = tmp_path / "processed.jsonl"
+    processed.write_text(
+        json.dumps({"session_id": "sid-x", "processed_mtime": 1776000000}) + "\n"
+    )
+
+    old_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "Pacific/Honolulu")
+    if hasattr(time, "tzset"):
+        time.tzset()
+    try:
+        since, mode = inner._compute_cutoff("sid-x", processed_path=processed)
+        assert (since, mode) == ("2026-04-12T13:20:00Z", "continuation")
+    finally:
+        if old_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", old_tz)
+        if hasattr(time, "tzset"):
+            time.tzset()
+
     _assert_real_untouched(snapshots)
 
 
@@ -455,6 +553,68 @@ def test_slice_preserves_last_n_pre_cutoff_events_as_window(tmp_path):
 
     # Clean up the temp slice.
     pathlib.Path(path).unlink(missing_ok=True)
+    _assert_real_untouched(snapshots)
+
+
+def test_slice_compares_timestamp_instants_across_iso_timezone_forms(
+    monkeypatch, tmp_path
+):
+    """Z, numeric offsets, and legacy naive timestamps share one UTC boundary."""
+    snapshots = _snapshot_real()
+    inner = _load_inner()
+    events = [
+        # Lexically later than the cutoff, but one minute earlier in UTC.
+        _user_event("2026-07-01T15:34:00+05:30", "offset-pre"),
+        _user_event("2026-07-01T10:04:30Z", "z-pre"),
+        _user_event("2026-07-01T10:04:45", "legacy-naive-pre"),
+        # Lexically earlier than the cutoff, but one minute later in UTC.
+        _user_event("2026-07-01T05:06:00-05:00", "offset-post"),
+        _user_event("2026-07-01T10:05:00+00:00", "utc-equal"),
+        _user_event("2026-07-01T10:05:01Z", "z-post"),
+    ]
+    transcript = tmp_path / "timezone-forms.jsonl"
+    _write_transcript(transcript, events)
+
+    expected_texts = [
+        "offset-pre",
+        "z-pre",
+        "legacy-naive-pre",
+        "offset-post",
+        "utc-equal",
+        "z-post",
+    ]
+
+    # The same UTC instant expressed in every supported cutoff form must
+    # classify events identically, even on a non-UTC host.
+    cutoffs = [
+        "2026-07-01T10:05:00Z",
+        "2026-07-01T10:05:00+00:00",
+        "2026-07-01T15:35:00+05:30",
+        "2026-07-01T10:05:00",  # legacy zone-less form is interpreted as UTC
+    ]
+    old_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    if hasattr(time, "tzset"):
+        time.tzset()
+    try:
+        for cutoff in cutoffs:
+            path, win_n, delta_n = inner._slice_transcript_for_sonnet(
+                str(transcript), cutoff, "sid-timezones"
+            )
+            assert win_n == 3
+            assert delta_n == 3
+            sliced = _read_jsonl(path)
+            texts = [row["message"]["content"][0]["text"] for row in sliced]
+            assert texts == expected_texts
+            pathlib.Path(path).unlink(missing_ok=True)
+    finally:
+        if old_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", old_tz)
+        if hasattr(time, "tzset"):
+            time.tzset()
+
     _assert_real_untouched(snapshots)
 
 

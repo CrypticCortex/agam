@@ -26,17 +26,18 @@ Performance: <5ms typical (cached trigger index, substring matching).
 
 Environment variables:
     AGAM_KG_PATH         Path to knowledge graph SQLite DB
-                         (default: ~/.claude/knowledge/graph.db)
+                         (default: ~/.agam/knowledge/graph.db)
 """
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
 
 DB_PATH = os.environ.get(
-    "AGAM_KG_PATH", os.path.expanduser("~/.claude/knowledge/graph.db")
+    "AGAM_KG_PATH", os.path.expanduser("~/.agam/knowledge/graph.db")
 )
 CACHE_MAX_AGE = 3600  # 1 hour
 
@@ -235,7 +236,7 @@ def build_context(matches, trigger_kind="command"):
 
 
 def _extract_file_paths(tool_input):
-    """Pull ``file_path`` from Edit/Write/MultiEdit tool_input.
+    """Pull touched paths from Claude-style edits or Codex ``apply_patch``.
 
     The top-level ``file_path`` is the canonical handle for the file
     being touched (Edit/Write/MultiEdit all share this shape). Keep this
@@ -246,6 +247,17 @@ def _extract_file_paths(tool_input):
     fp = tool_input.get("file_path")
     if isinstance(fp, str) and fp:
         paths.append(fp)
+    command = tool_input.get("command")
+    if isinstance(command, str):
+        # Codex reports apply_patch through the canonical tool name
+        # ``apply_patch`` and places the patch text in ``tool_input.command``.
+        # Extract only the explicit patch headers; never interpret the patch.
+        for match in re.finditer(
+            r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$",
+            command,
+            re.MULTILINE,
+        ):
+            paths.append(match.group(1))
     return paths
 
 
@@ -283,8 +295,8 @@ def main():
     # cost amortizes via the cache file).
     index = load_trigger_index()
 
-    # Edit / Write / MultiEdit -> file-path triggers.
-    if tool_name in ("Edit", "Write", "MultiEdit"):
+    # Edit / Write / MultiEdit / Codex apply_patch -> file-path triggers.
+    if tool_name in ("Edit", "Write", "MultiEdit", "apply_patch"):
         if not index.get("file"):
             sys.exit(0)
         file_paths = _extract_file_paths(tool_input)

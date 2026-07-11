@@ -155,6 +155,9 @@ def _substitute_plist(raw: bytes) -> bytes:
         .replace(b"{{AGAM_HOOKS_DIR}}", b"/tmp/home/.claude/hooks")
         .replace(b"{{AGAM_TOOLS_DIR}}", b"/tmp/home/.claude/tools/agam")
         .replace(b"{{AGAM_KG_PATH}}", b"/tmp/home/.claude/knowledge/graph.db")
+        .replace(b"{{AGAM_GRAPH_ONLY}}", b"0")
+        .replace(b"{{AGAM_LLM_CLI_PIN}}", b"")
+        .replace(b"{{AGAM_LLM_CLI_PATH}}", b"")
     )
 
 
@@ -174,6 +177,7 @@ def test_plist_parses_after_substitution() -> None:
     assert data["StandardOutPath"].endswith("/watchdog.stdout.log")
     assert data["StandardErrorPath"].endswith("/watchdog.stderr.log")
     assert data["WorkingDirectory"] == "/tmp/home"
+    assert data["EnvironmentVariables"]["AGAM_LLM_CLI_PATH"] == ""
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,23 @@
+{"timestamp":"2026-07-01T10:00:00Z","type":"session_meta","payload":{"id":"sanitized-session","cwd":"/Users/example/coding/widget","base_instructions":"not retained"}}
+{"timestamp":"2026-07-01T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Add retry support to the client."}]}}
+{"timestamp":"2026-07-01T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Add retry support to the client.","images":[]}}
+{"timestamp":"2026-07-01T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"I will inspect the client first.","phase":"commentary"}}
+{"timestamp":"2026-07-01T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call-1","input":"rg -n retry /Users/example/coding/widget/src/client.py"}}
+{"timestamp":"2026-07-01T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":"no matches"}}
+this line simulates a partially-written rollout event
+{"timestamp":"2026-07-01T10:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Use exponential backoff."}]}}
+{"timestamp":"2026-07-01T10:01:00Z","type":"event_msg","payload":{"type":"user_message","message":"Use exponential backoff."}}
+{"timestamp":"2026-07-01T10:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Keep the public API compatible."}]}}
+{"timestamp":"2026-07-01T10:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"Keep the public API compatible."}}
+{"timestamp":"2026-07-01T10:03:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please add tests too."}]}}
+{"timestamp":"2026-07-01T10:03:00Z","type":"event_msg","payload":{"type":"user_message","message":"Please add tests too."}}
+{"timestamp":"2026-07-01T10:03:01Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","call_id":"call-2","arguments":"{\"patch\":\"*** Begin Patch\\n*** Update File: /Users/example/coding/widget/src/client.py\\n*** End Patch\"}"}}
+{"timestamp":"2026-07-01T10:03:02Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call-2","status":"completed","success":true,"changes":{"/Users/example/coding/widget/src/client.py":{"kind":"update"},"/Users/example/coding/widget/tests/test_client.py":{"kind":"add"}}}}
+{"timestamp":"2026-07-01T10:04:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Run the focused tests."}]}}
+{"timestamp":"2026-07-01T10:04:00Z","type":"event_msg","payload":{"type":"user_message","message":"Run the focused tests."}}
+{"timestamp":"2026-07-01T10:04:01Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"opaque-private-data","summary":[]}}
+{"timestamp":"2026-07-01T10:05:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"That looks good; finish it."}]}}
+{"timestamp":"2026-07-01T10:05:00Z","type":"event_msg","payload":{"type":"user_message","message":"That looks good; finish it."}}
+{"timestamp":"2026-07-01T10:05:01Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Implemented retry support and fixed the tests."}]}}
+{"timestamp":"2026-07-01T10:05:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Implemented retry support and fixed the tests.","phase":"final"}}
+{"timestamp":"2026-07-01T10:05:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1234}}}}

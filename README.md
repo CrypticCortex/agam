@@ -1,26 +1,34 @@
 # Agam
 
-Knowledge-graph-powered identity and context injection layer on top of Claude Code. Agam auto-injects relevant entities (projects, services, decisions, bugs, lessons) into every Claude Code session via a `UserPromptSubmit` hook, so the model answers from your history instead of searching files every time. You seed the graph once via a bootstrap pass over prior session transcripts, then Agam keeps it warm in the background.
+Knowledge-graph-powered identity and context injection for Claude Code, Cursor,
+and Codex. Agam keeps one local shared brain across agents: it recalls relevant
+projects, services, decisions, bugs, and lessons while you work, then distills
+substantive completed sessions back into the graph in the background.
 
 ## What Agam actually does
 
-- Identity files at `~/.claude/agam/` (AGAM.md, THISAI.md, MUGAM.md) give Claude Code a persistent sense of who you are and what you are working on.
-- A SQLite knowledge graph at `~/.claude/knowledge/graph.db` stores entities + relationships with FTS5 search.
-- The `graph-recall` hook (UserPromptSubmit) matches entity names in your prompts and injects their context inline, before the model answers.
-- The `graph-update` hook (Stop) enqueues finished sessions for background processing by a launchd-managed watchdog.
-- The `agam bootstrap` command seeds the graph from your existing Claude Code transcripts in `~/.claude/projects/`.
+- Identity files at `~/.agam/` (AGAM.md, THISAI.md, MUGAM.md) describe who you are and what you are working on.
+- A SQLite knowledge graph at `~/.agam/knowledge/graph.db` stores entities and relationships with FTS5 search.
+- Claude Code and Codex use `UserPromptSubmit` hooks for prompt-specific recall. Cursor receives a refreshed always-on rule digest.
+- Agent stop/session-end hooks enqueue substantive work for a launchd-managed watchdog, with `source-agent` provenance preserved.
+- `agam bootstrap` can seed the graph from existing Claude Code transcripts in `~/.claude/projects/`.
 
-No Anthropic API key is needed or supported. Every LLM call Agam makes runs inside your existing claude-code devcontainer via `docker exec`, reusing the OAuth credentials you already authenticated with.
+No provider API key is required by Agam. Background enrichment reuses the
+authentication of an installed agent CLI. Claude Code remains the current
+engine for the optional historical bootstrap pass; ongoing enrichment can run
+through Claude, Cursor Agent, or Codex.
 
 ## Prerequisites
 
 - macOS. Only platform supported in v1.
-- [Claude Code](https://claude.ai/code) installed and authenticated (run `claude` interactively once). Agam reuses whatever auth Claude Code already has; you do not need to find where it lives.
+- At least one supported agent installed and authenticated on the host (Claude Code, Cursor Agent, or Codex), or Claude Code available in a devcontainer.
 - [uv](https://docs.astral.sh/uv/) for Python execution.
 - Python 3.11 or newer (uv will fetch one if you do not have it).
-- Optional but strongly recommended: Docker Desktop with a running claude-code devcontainer. The bootstrap pipeline and the background watchdog both shell out to `docker exec`. The identity files and the `graph-recall` hook work without Docker, so you can install Agam on a machine where Docker is not ready yet.
+- Optional: Docker Desktop with a running Claude Code devcontainer. Docker is only needed for container-based Claude enrichment; host Claude, Cursor, and Codex modes work without it.
 
-The installer verifies every required prerequisite and bails with a useful error if something is missing.
+The installer stops when `uv` or macOS is missing and warns when no usable host
+CLI or optional Docker runtime is detected. Authentication failures surface
+when the selected CLI is first invoked.
 
 ## Install
 
@@ -30,24 +38,49 @@ cd ~/coding/agam
 ./install.sh
 ```
 
+The wizard detects installed agents and lets you choose which ones to wire. To
+wire one agent explicitly, or all three at once:
+
+```bash
+./install.sh --target codex
+./install.sh --target claude --target cursor --target codex
+```
+
+Codex hook scripts are installed in Agam's owned namespace at
+`~/.codex/hooks/agam/`; their registrations are merged into
+`~/.codex/hooks.json` without replacing unrelated hooks. After the first Codex
+launch, open `/hooks`, review the installed Agam commands, and trust them if
+Codex reports that they are awaiting trust.
+
 `install.sh` does the minimum:
 
-1. Checks for `uv`, `claude`, Docker (warns if absent), and macOS. Auth is verified later by `agam doctor` and at the first real `claude -p` call, not by guessing where credentials are stored.
+1. Checks for `uv`, a supported agent CLI, Docker (optional), and macOS. Authentication is verified by the selected CLI when it is first invoked.
 2. Runs `uv sync` to materialize the Python environment.
 3. Delegates to `uv run agam init`, which is the real installer.
 
-`agam init` is an interactive [questionary](https://github.com/tmbo/questionary) wizard. It asks a few questions (name, primary goal, projects directory, container mode), then:
+`agam init` is an interactive [questionary](https://github.com/tmbo/questionary) wizard. It asks a few questions (name, primary goal, projects directory, platform, and whether to bootstrap now), then:
 
-- Renders `templates/*.template` into `~/.claude/agam/` (AGAM.md, THISAI.md, MUGAM.md, CLAUDE.md snippet).
-- Merges Agam hooks into `~/.claude/settings.json` (creating a timestamped backup of the existing file first).
+- Renders the shared identity and configuration into `~/.agam/`.
+- Merges agent-specific wiring into the selected Claude, Cursor, and/or Codex configuration without replacing unrelated hooks.
 - Writes the watchdog launchd plist to `~/Library/LaunchAgents/com.agam.watchdog.plist` and loads it.
-- Creates `~/.claude/knowledge/graph.db` with the FTS5 schema if it does not exist.
+- Creates `~/.agam/knowledge/graph.db` with the FTS5 schema if it does not exist.
 
-Re-running the installer is safe. By default it refuses to overwrite an existing `~/.claude/agam/`. Pass `--force` to overwrite with a timestamped backup of the previous install:
+Re-running the installer is safe: it refreshes bundled prompts, tools, and the
+selected agent wiring while preserving the identity and knowledge graph in
+`~/.agam/`. After updating the source checkout, re-run it for every agent you
+use:
 
 ```bash
-uv run agam init --force
+git pull --ff-only
+./install.sh --target claude --target cursor --target codex
 ```
+
+Upgrades from the older Claude-specific layout are copy-migrated when
+`~/.agam/knowledge/graph.db` is absent: Agam copies the legacy graph from
+`~/.claude/knowledge/` and identity files from `~/.claude/agam/`, then leaves
+the originals untouched. A partially created `~/.agam/` containing only
+operational data such as `queue/` does not suppress this migration; those queue
+entries remain in place while the legacy graph is copied.
 
 You can also drive the wizard non-interactively by feeding it a YAML answer file:
 
@@ -103,7 +136,7 @@ Cost estimation uses a 4-chars-per-token heuristic, $0.80 per 1M Haiku input tok
 
 ### `config.yaml`
 
-Written into `~/.claude/agam/config.yaml` by the installer:
+Written into `~/.agam/config.yaml` by the installer:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -111,9 +144,11 @@ Written into `~/.claude/agam/config.yaml` by the installer:
 | `primary-goal` | string | One-line direction that anchors THISAI.md. |
 | `projects-dir` | path | Where your code lives. Used by boot context injection. |
 | `platform` | string | `macos` for v1. |
-| `container-mode` | string | `docker` (default) or `host`. Controls how LLM calls are executed. |
+| `container-mode` | string | `auto` for new installs. Retained for compatibility; the watchdog now resolves an invoker at run time. |
 
-Edit this file directly and the next session picks up the changes. Re-run `agam init --force` if you want the wizard to regenerate everything from templates.
+Edit this file directly and the next session picks up the changes. Re-run
+`agam init` to refresh bundled prompts, hooks, and tools without replacing the
+identity or graph.
 
 ### Environment variables
 
@@ -123,30 +158,46 @@ Edit this file directly and the next session picks up the changes. Re-run `agam 
 | `AGAM_CONTAINER_PATTERN` | `claude-code` | Regex matched against `docker ps` rows to discover your claude-code container. |
 | `AGAM_CONTAINER_NAME` | unset | Exact container name. Beats the regex above. |
 | `AGAM_WATCHDOG_MODE` | unset | Legacy alias for `AGAM_INVOKER`. Honored for back-compat. |
-| `AGAM_HOME` | `~/.claude/agam` | Root of identity + log directories. |
-| `AGAM_KG_PATH` | `~/.claude/knowledge/graph.db` | Path to the SQLite graph. |
+| `AGAM_LLM_CLI_PIN` | unset | Pin host enrichment to `claude`, `cursor-agent`, or `codex`. |
+| `AGAM_LLM_CLI_PATH` | unset | Absolute host CLI executable path. The macOS installer records this in the launchd plist so npm/nvm/asdf-installed CLIs remain discoverable under launchd's restricted `PATH`. |
+| `AGAM_DATA_HOME` | `~/.agam` | Shared, agent-neutral data root. |
+| `AGAM_HOME` | `~/.agam` | Legacy-compatible identity + log root override. |
+| `AGAM_KG_PATH` | `~/.agam/knowledge/graph.db` | Path to the SQLite graph. |
 | `AGAM_PROMPTS_DIR` | bundled | Directory holding bootstrap prompt templates. |
 
-You will rarely need the last three. They exist for tests and for contributors running Agam out of a non-default layout.
+These overrides are mainly useful for diagnostics, tests, and non-default layouts.
 
-## How Agam talks to Claude
+## How Agam runs background enrichment
 
-Agam needs to call `claude -p` somewhere when it bootstraps the graph or processes a finished session. That `somewhere` is auto-detected at run time -- you do not pick a "mode" at install time.
+The optional historical bootstrap still invokes Claude Code. The ongoing
+watchdog is agent-neutral and chooses a healthy enrichment CLI at run time:
 
-The detection is a cascade. Agam walks the list in order and uses the first one that probes healthy:
+1. A named or discovered Claude Code container, when configured and running.
+2. A host CLI, preferring `claude`, then `cursor-agent`, then `codex`.
+3. `AGAM_LLM_CLI_PIN=claude|cursor-agent|codex` overrides that host preference.
 
-1. **Pinned via `AGAM_INVOKER`** (or the legacy `AGAM_WATCHDOG_MODE`) -- if set, that invoker is the only candidate.
-2. **Named container** -- if `AGAM_CONTAINER_NAME` points to a running container.
-3. **Discovered container** -- the first `docker ps` row whose image name matches `AGAM_CONTAINER_PATTERN` (default `claude-code`).
-4. **Host claude** -- `claude` on your `PATH`. (Auth lives wherever Claude Code put it -- Keychain on macOS host, a file in a container. The probe doesn't second-guess Claude Code; if the CLI is on PATH it's eligible, and a real auth failure surfaces at run time with claude's own error.)
+On macOS, the installer also stores the selected CLI's resolved absolute path in
+the launchd plist. An explicit `AGAM_LLM_CLI_PATH` must be absolute and
+executable; if a stored path later becomes stale, the watchdog falls back to
+the normal pin/PATH probes.
 
-Both "container" and "host" are first-class. Container is preferred when both are available because Agam's background calls then run isolated from your interactive Claude Code session. If only one is available, the cascade picks it without asking.
+Codex enrichment runs non-interactively and ephemerally with Agam hooks disabled
+for the child run, preventing a background enrichment task from recursively
+enqueueing itself.
 
-Concretely, when a session closes:
+When a substantive session or turn completes:
 
-- The Stop hook writes a queue entry into `~/.claude/agam/queue/`.
-- The watchdog launchd agent ticks every few minutes, resolves the invoker, and drains the queue. Container: `docker exec <discovered-name> claude -p ...`. Host: `claude -p ...` directly.
-- No healthy invoker: the queue stays untouched and `~/.claude/agam/logs/watchdog.log` records a `no-invoker` line listing every probe failure. The next tick tries again.
+- Its agent hook writes or refreshes a file-per-session entry in `~/.agam/queue/`.
+- The launchd watchdog resolves an invoker and drains the queue every few minutes.
+- With no healthy invoker, the queue remains untouched and `~/.agam/logs/watchdog.log` records the failed probes for the next tick.
+
+For Codex, each worthwhile Stop event is normalized into a distinct immutable
+snapshot under `~/.agam/transcripts/codex/`. The watchdog atomically claims one
+queue generation before processing it, so a newer Stop from the same session
+can remain queued without replacing the transcript currently being read.
+Snapshots referenced by pending, processing, retry, or dead-letter work are
+protected; completed or superseded generations are pruned to the two most
+recent per session while their processed audit records remain available.
 
 To see what Agam thinks is available right now:
 
@@ -154,9 +205,29 @@ To see what Agam thinks is available right now:
 agam doctor
 ```
 
-That prints one line per candidate invoker with PASS/WARN/FAIL and the reason. Use it as the first stop when "auto-learning stopped happening" -- usually it tells you the answer (container stopped, OAuth token expired, claude not on PATH).
+Use the doctor output together with `~/.agam/logs/watchdog.log` as the first stop
+when automatic learning pauses. Each selected CLI owns and reports its own
+authentication failures.
 
-Agam never takes an Anthropic API key. Every `claude -p` invocation goes through your existing Claude Code OAuth -- wherever Claude Code chose to put it (Keychain, `~/.claude/.credentials.json`, etc.). If you need an API key, you are using the wrong tool.
+## TUI
+
+Run the local dashboard with:
+
+```bash
+agam tui
+```
+
+The brain can show one animated input wire each for Claude, Cursor, and Codex.
+A wire appears only when Agam-specific hooks for that agent are actually
+installed; having the CLI or editor installed is not enough. The `mind` count
+is therefore the number of wired agents, while `memories` is the entity count
+in the shared graph.
+
+The `claude N / cursor N / codex N` values report entity provenance from the
+graph's `source-agent` tags, colored yellow, cyan, and green respectively. A
+wired agent can legitimately show zero until one of its sessions has been
+learned. If an expected wire is missing, refresh it with, for example,
+`agam init --target codex`.
 
 ## Troubleshooting
 
@@ -171,38 +242,30 @@ That prints the Agam home path, knowledge graph size, queue depth, bootstrap res
 Common situations:
 
 - **`Container: (none detected)`** -- your claude-code devcontainer is not running. Start it, then re-run `agam status`. If detection still fails and you have a custom name, set `AGAM_CONTAINER_NAME` to the exact name shown by `docker ps`.
-- **`no-container` lines in `~/.claude/agam/logs/watchdog.log`** -- expected whenever the container is down. The queue will drain on the next tick after you start the container.
-- **Queue stuck / entries in `~/.claude/agam/queue-errors/`** -- a session failed processing. Open the error payload to see the underlying exception. Logs:
+- **`no-container` lines in `~/.agam/logs/watchdog.log`** -- expected whenever the container is down. A healthy host CLI can still drain the queue.
+- **Queue stuck / entries in `~/.agam/queue-errors/`** -- a session failed processing. Open the error payload to see the underlying exception. Logs:
   ```bash
-  tail -n 100 ~/.claude/agam/logs/watchdog.log
-  ls ~/.claude/agam/queue-errors/
+  tail -n 100 ~/.agam/logs/watchdog.log
+  ls ~/.agam/queue-errors/
   ```
 - **`ERR: no claude-code container running` from `agam bootstrap`** -- same fix as above. Start the container and re-run; bootstrap resumes automatically.
-- **`graph-recall` is not injecting anything** -- first confirm the hook is in `~/.claude/settings.json` under `hooks.UserPromptSubmit`. Then confirm the graph has entities: `sqlite3 ~/.claude/knowledge/graph.db 'select count(*) from entities;'`. A freshly installed Agam with no bootstrap run is empty; that is the most common cause.
+- **Recall is not injecting anything** -- confirm the selected agent's hook wiring (`~/.claude/settings.json`, `~/.codex/hooks.json` plus `~/.codex/hooks/agam/`, or Cursor's generated rule), then confirm the graph has entities: `sqlite3 ~/.agam/knowledge/graph.db 'select count(*) from entities;'`. A fresh graph is the most common cause.
 
 ## Uninstall
 
 Back up anything you want to keep first:
 
 ```bash
-cp -r ~/.claude/agam ~/agam-backup-$(date +%Y%m%d)
-cp ~/.claude/knowledge/graph.db ~/graph-backup-$(date +%Y%m%d).db
+cp -r ~/.agam ~/agam-backup-$(date +%Y%m%d)
 ```
 
-Then tear down:
+Preview a complete uninstall:
 
 ```bash
-# Stop + remove the watchdog
-launchctl unload ~/Library/LaunchAgents/com.agam.watchdog.plist
-rm ~/Library/LaunchAgents/com.agam.watchdog.plist
-
-# Remove Agam hooks from settings.json
-# Open ~/.claude/settings.json in your editor and delete the entries
-# whose command paths reference agam or ~/.claude/agam/.
-
-# Delete identity files + knowledge graph if you want a clean slate
-rm -rf ~/.claude/agam
-rm -f ~/.claude/knowledge/graph.db
+agam uninstall
+agam uninstall --target codex          # one agent only
+agam uninstall --confirm               # soft uninstall; preserves data backup
+agam uninstall --confirm --purge       # permanent deletion
 ```
 
 The repo at `~/coding/agam` is independent; remove it separately if you no longer want the source.
@@ -211,9 +274,12 @@ The repo at `~/coding/agam` is independent; remove it separately if you no longe
 
 | Command | Purpose |
 |---|---|
-| `agam init` | Install Agam scaffolding into `~/.claude/`. Use `--force` to overwrite, `--answers FILE.yaml` to script. |
+| `agam init` | Install the shared brain and selected agent wiring. Repeat `--target` for Claude, Cursor, and/or Codex. |
 | `agam bootstrap` | Scan transcripts, estimate cost, extract + reconcile into the knowledge graph. Resumable. |
 | `agam status` | Print install health: paths, graph size, queue depth, container detection, resume state. |
+| `agam doctor` | Run deeper installation and invoker diagnostics. |
+| `agam tui` | Open the local dashboard for wiring, provenance, graph, queue, and lessons. |
+| `agam uninstall` | Preview or remove selected agent wiring and, when no agents remain, the shared data home. |
 | `agam reset` | Remove bootstrap scratch state (`~/.claude/.agam-bootstrap-state.json` and candidates). Dry-run by default; pass `--confirm` to actually delete. Never touches identity files or the graph. |
 
 ## Project layout
@@ -222,11 +288,12 @@ The repo at `~/coding/agam` is independent; remove it separately if you no longe
 agam/
   install.sh              -- macOS host installer. Thin wrapper over agam init.
   src/agam/
-    cli.py                -- argparse entrypoint (init, bootstrap, status, reset).
+    cli.py                -- argparse entrypoint for installation, operations, and maintenance.
     installer.py          -- questionary wizard + settings merge.
     bootstrap.py          -- scan, extract (Haiku), reconcile (Sonnet), durable state.
-    settings_merger.py    -- safe merge of Agam hooks into ~/.claude/settings.json.
-    tools/                -- Python helpers shipped to ~/.claude/tools/.
+    agents/               -- Claude, Cursor, and Codex installation adapters.
+    *_hooks_merger.py     -- non-destructive per-agent hook config merging.
+    tools/                -- shared graph, queue, context, and maintenance helpers.
     hooks/                -- PreToolUse / PostToolUse / Stop / UserPromptSubmit hook scripts.
   templates/              -- AGAM.md / THISAI.md / MUGAM.md / plist / CLAUDE.md snippet.
   prompts/                -- Bootstrap prompt templates (work-log, agam-sync).

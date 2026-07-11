@@ -43,6 +43,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as xml_escape
 
 # questionary and yaml are optional at import time so the module remains
 # importable in tests that supply answers directly and don't need either.
@@ -417,6 +418,9 @@ def _write_launchd_plist(
         .replace("{{AGAM_HOOKS_DIR}}", str(paths.hooks))
         .replace("{{AGAM_TOOLS_DIR}}", str(paths.tools))
         .replace("{{AGAM_KG_PATH}}", str(paths.knowledge / "graph.db"))
+        .replace("{{AGAM_GRAPH_ONLY}}", "0")
+        .replace("{{AGAM_LLM_CLI_PIN}}", "")
+        .replace("{{AGAM_LLM_CLI_PATH}}", "")
     )
     (staging_launch_agents / "com.agam.watchdog.plist").write_text(
         text, encoding="utf-8"
@@ -688,8 +692,77 @@ def _commit_kg(src_db: Path, dst_db: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+_WATCHDOG_TARGET_CLI = {
+    "claude": "claude",
+    "cursor": "cursor-agent",
+    "codex": "codex",
+}
+_WATCHDOG_CLI_PREFERENCE = ("claude", "cursor-agent", "codex")
+
+
+def _absolute_executable(path: str) -> str:
+    """Return a resolved absolute executable path or raise ValueError."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("AGAM_LLM_CLI_PATH must be an absolute path")
+    resolved = candidate.resolve()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ValueError(f"AGAM_LLM_CLI_PATH is not executable: {candidate}")
+    return str(resolved)
+
+
+def _resolve_watchdog_llm_cli(targets: list[str]) -> tuple[str, str]:
+    """Choose the host enrichment CLI and persist its absolute executable.
+
+    Explicit AGAM_LLM_CLI_PIN/AGAM_LLM_CLI_PATH values win. Otherwise selected
+    agent targets are considered in the watchdog's historical preference order.
+    A single selected target remains pinned even when its executable is not
+    currently discoverable, allowing launchd's PATH probe to find it later.
+    """
+    supported = set(_WATCHDOG_CLI_PREFERENCE)
+    explicit_pin = os.environ.get("AGAM_LLM_CLI_PIN", "").strip()
+    explicit_path = os.environ.get("AGAM_LLM_CLI_PATH", "").strip()
+
+    if explicit_pin and explicit_pin not in supported:
+        raise ValueError(
+            "AGAM_LLM_CLI_PIN must be claude, cursor-agent, or codex"
+        )
+
+    if explicit_path:
+        cli_path = _absolute_executable(explicit_path)
+        cli_name = explicit_pin or Path(cli_path).name
+        if cli_name not in supported:
+            raise ValueError(
+                "cannot infer CLI from AGAM_LLM_CLI_PATH; set "
+                "AGAM_LLM_CLI_PIN to claude, cursor-agent, or codex"
+            )
+        return cli_name, cli_path
+
+    if explicit_pin:
+        found = shutil.which(explicit_pin)
+        return explicit_pin, _absolute_executable(found) if found else ""
+
+    selected = {
+        cli for target in targets
+        if (cli := _WATCHDOG_TARGET_CLI.get(target)) is not None
+    }
+    candidates = [cli for cli in _WATCHDOG_CLI_PREFERENCE if cli in selected]
+    for cli in candidates:
+        found = shutil.which(cli)
+        if found:
+            return cli, _absolute_executable(found)
+    if len(candidates) == 1:
+        return candidates[0], ""
+    return "", ""
+
+
 def _render_neutral_plist(
-    home: Path, agam_home: Path, *, graph_only: bool = False, llm_cli_pin: str = ""
+    home: Path,
+    agam_home: Path,
+    *,
+    graph_only: bool = False,
+    llm_cli_pin: str = "",
+    llm_cli_path: str = "",
 ) -> Path | None:
     """Render + write the watchdog plist pointing at the shared ~/.agam home.
 
@@ -711,6 +784,7 @@ def _render_neutral_plist(
         .replace("{{AGAM_KG_PATH}}", str(agam_home / "knowledge" / "graph.db"))
         .replace("{{AGAM_GRAPH_ONLY}}", "1" if graph_only else "0")
         .replace("{{AGAM_LLM_CLI_PIN}}", llm_cli_pin or "")
+        .replace("{{AGAM_LLM_CLI_PATH}}", xml_escape(llm_cli_path or ""))
     )
     out = launch_agents / "com.agam.watchdog.plist"
     out.write_text(text, encoding="utf-8")
@@ -744,9 +818,9 @@ def run_install(
       4. Install per-agent wiring for each selected target.
       5. (mac) Render the watchdog plist pointing at the shared home.
 
-    ``targets`` is a list of agent names ("claude", "cursor").
+    ``targets`` is a list of agent names ("claude", "cursor", "codex").
     """
-    from agam.agents import ClaudeAgent, CursorAgent
+    from agam.agents import ClaudeAgent, CodexAgent, CursorAgent
     from agam.agents import _copy as agent_copy
     from agam.migrate import migrate_if_needed
 
@@ -788,7 +862,11 @@ def run_install(
         backfill_source_agent(agam_home / "knowledge" / "graph.db", "claude")
 
     # Per-agent wiring.
-    registry = {"claude": ClaudeAgent, "cursor": CursorAgent}
+    registry = {
+        "claude": ClaudeAgent,
+        "cursor": CursorAgent,
+        "codex": CodexAgent,
+    }
     installed: list[str] = []
     for name in targets:
         agent_cls = registry.get(name)
@@ -801,7 +879,13 @@ def run_install(
         write_plist = resolved.platform == "mac"
     wrote_plist = False
     if write_plist:
-        if _render_neutral_plist(home, agam_home) is not None:
+        llm_cli_pin, llm_cli_path = _resolve_watchdog_llm_cli(installed)
+        if _render_neutral_plist(
+            home,
+            agam_home,
+            llm_cli_pin=llm_cli_pin,
+            llm_cli_path=llm_cli_path,
+        ) is not None:
             wrote_plist = True
 
     return MultiInstallResult(

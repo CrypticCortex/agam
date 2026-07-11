@@ -8,6 +8,13 @@ reports which agents are present so the installer can auto-suggest targets.
 
 from .base import AgentTarget, detect_agents
 from .claude import ClaudeAgent
+from .codex import CodexAgent
 from .cursor import CursorAgent
 
-__all__ = ["AgentTarget", "ClaudeAgent", "CursorAgent", "detect_agents"]
+__all__ = [
+    "AgentTarget",
+    "ClaudeAgent",
+    "CodexAgent",
+    "CursorAgent",
+    "detect_agents",
+]

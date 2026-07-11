@@ -351,6 +351,30 @@ def test_post_matching_error_injects(kg_env, tmp_path):
     _assert_real_files_untouched(snapshots)
 
 
+def test_post_codex_tool_response_matching_error_injects(kg_env, tmp_path):
+    """Codex's documented tool_response field is accepted like tool_output."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg,
+        "lesson-codex-error",
+        "Use the known certificate workaround.",
+        "high",
+        trigger_error=["certificate_verify_failed"],
+    )
+    payload = {
+        "session_id": "s-post-codex",
+        "tool_name": "Bash",
+        "tool_response": {
+            "stderr": "SSL: CERTIFICATE_VERIFY_FAILED while fetching",
+        },
+    }
+    r = _run(HOOK_POST, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    parsed = json.loads(r.stdout)
+    assert "lesson-codex-error" in parsed["hookSpecificOutput"]["additionalContext"]
+    _assert_real_files_untouched(snapshots)
+
+
 def test_post_empty_output_skipped(kg_env, tmp_path):
     """Empty tool_output -> exit 0, no injection."""
     env, kg, snapshots = kg_env
@@ -403,6 +427,37 @@ def test_pre_edit_with_matching_file_trigger_injects(kg_env, tmp_path):
     assert "ACTION:" in ctx, "reminder should appear as ACTION line"
     assert "Mirror config edits" in ctx
     assert "file path" in ctx
+    _assert_real_files_untouched(snapshots)
+
+
+def test_pre_codex_apply_patch_with_matching_file_trigger_injects(
+    kg_env, tmp_path
+):
+    """Codex apply_patch headers are mapped to Agam file-path lessons."""
+    env, kg, snapshots = kg_env
+    _insert_lesson(
+        kg,
+        "lesson-codex-patch",
+        "Keep the generated config synchronized.",
+        "high",
+        trigger_file=["/configs/prod.yaml"],
+    )
+    payload = {
+        "session_id": "s-codex-patch",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Update File: /repo/configs/prod.yaml\n"
+                "@@\n-old\n+new\n"
+                "*** End Patch"
+            )
+        },
+    }
+    r = _run(HOOK_PRE, env, payload, cwd=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    parsed = json.loads(r.stdout)
+    assert "lesson-codex-patch" in parsed["hookSpecificOutput"]["additionalContext"]
     _assert_real_files_untouched(snapshots)
 
 
