@@ -8,6 +8,8 @@ none of the heavy lifting below it should ever run in these tests.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 import sys
 import types
@@ -382,7 +384,10 @@ def test_cli_init_returns_1_on_systemexit(monkeypatch):
 
 def _patch_bootstrap_preview(monkeypatch, tmp_path, token_count=1000):
     """Patch scan + token count + estimate so cost preview is non-interactive."""
+    from agam.tools import knowledge_graph
+
     fake_files = [tmp_path / "s1.jsonl"]
+    monkeypatch.setattr(knowledge_graph, "DB_PATH", tmp_path / "synthetic-graph.db")
     monkeypatch.setattr(
         "agam.bootstrap.scan_transcripts", lambda *a, **kw: fake_files
     )
@@ -490,6 +495,7 @@ def test_cli_status_no_crash(monkeypatch, tmp_path, capsys):
     assert f"Agam home:    {tmp_path / '.agam'}" in out
     assert str(tmp_path / ".agam" / "knowledge" / "graph.db") in out
     assert str(tmp_path / ".agam" / "queue") in out
+    assert "Codex scoped recall: disabled" in out
 
 
 def test_cli_status_with_container(monkeypatch, tmp_path, capsys):
@@ -1055,6 +1061,12 @@ def test_cli_doctor_passes_for_codex_only_install(
         home=tmp_path,
         write_plist=False,
     )
+    monkeypatch.setattr(
+        "sqlite3.connect",
+        lambda *_args, **_kwargs: pytest.fail(
+            "doctor opened the sealed legacy graph in scoped mode"
+        ),
+    )
 
     rc = cli.main(["doctor"])
     out = capsys.readouterr().out
@@ -1062,6 +1074,9 @@ def test_cli_doctor_passes_for_codex_only_install(
     assert rc == 0, out
     assert "[FAIL]" not in out
     assert "Codex Agam hooks registered" in out
+    assert "Codex scoped recall" in out
+    assert "disabled" in out
+    assert "/hooks" in out
     assert "codex=/opt/codex/bin/codex" in out
     assert "All checks passed" in out
 
@@ -1327,3 +1342,351 @@ def test_cli_upgrade_cleans_snapshot_on_success(monkeypatch, tmp_path):
     for s in snapshot_seen:
         if s.name.startswith(".agam-upgrade-snap-"):
             assert not s.exists(), f"snapshot survived a successful upgrade: {s}"
+
+
+# ---------------------------------------------------------------------------
+# scoped knowledge + selective wiring
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_scope_policy(tmp_path: Path) -> Path:
+    from agam.vault_registry import initialize_registry
+
+    root = tmp_path / ".agam" / "knowledge" / "scopes"
+    root.mkdir(parents=True, exist_ok=True)
+    initialize_registry(
+        root / "registry.json",
+        guidance_name="Craft",
+        solutions_name="Repairs",
+        agents=("codex",),
+    )
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "codex": {
+                        "recall": True,
+                        "boot-injection": False,
+                        "capture": False,
+                    }
+                },
+            }
+        )
+    )
+    return root
+
+
+def _activate_synthetic_scopes(root: Path) -> tuple[str, ...]:
+    from agam.vault_registry import load_registry
+
+    vault_ids = tuple(vault.id for vault in load_registry(root / "registry.json").active)
+    stores = {}
+    for scope in vault_ids:
+        database = root / scope / "v-synthetic" / "graph.db"
+        database.parent.mkdir(parents=True)
+        database.write_bytes(b"")
+        stores[scope] = {
+            "path": f"{scope}/v-synthetic/graph.db",
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "entities": 0,
+            "relationships": 0,
+            "properties": 0,
+        }
+    manifest = {
+        "version": "v-synthetic",
+        "source_sha256": "1" * 64,
+        "source_snapshot_sha256": "2" * 64,
+        "staging_sha256": "3" * 64,
+        "model": "haiku",
+        "created_at": "2026-07-18T00:00:00Z",
+        "stores": stores,
+    }
+    manifests = root / "manifests"
+    manifests.mkdir()
+    (manifests / "v-synthetic.json").write_text(json.dumps(manifest))
+    (root / "active.json").write_text(
+        json.dumps(
+            {
+                "version": "v-synthetic",
+                "manifest": "manifests/v-synthetic.json",
+            }
+        )
+    )
+    return vault_ids
+
+
+def test_cli_knowledge_classify_outputs_only_opaque_aggregates(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+    from agam.knowledge_classifier import ClassificationRunSummary
+
+    data_home = tmp_path / ".agam"
+    source = tmp_path / "SYNTHETIC_SOURCE_MARKER.db"
+    source.touch()
+    staging = data_home / "knowledge" / "sealed" / "staging" / "run.db"
+    staging.parent.mkdir(parents=True)
+    called = {}
+
+    class FakeRunner:
+        model = "haiku"
+
+        def __init__(self, *, working_directory, model):
+            called["runner"] = (working_directory, model)
+
+    def fake_classify(source_path, staging_path, runner, **kwargs):
+        called["classify"] = (source_path, staging_path, runner, kwargs)
+        return ClassificationRunSummary(
+            run_id="batch_" + "a1" * 12,
+            model="haiku",
+            source_sha256="1" * 64,
+            source_snapshot_sha256="2" * 64,
+            staging_sha256="3" * 64,
+            total=7,
+            accepted=5,
+            review=1,
+            failed=1,
+        )
+
+    monkeypatch.setenv("AGAM_DATA_HOME", str(data_home))
+    monkeypatch.setattr(
+        "agam.knowledge_classifier.ClaudeCliRunner", FakeRunner
+    )
+    monkeypatch.setattr("agam.knowledge_classifier.classify_graph", fake_classify)
+
+    rc = cli.main(
+        [
+            "knowledge",
+            "classify",
+            "--source",
+            str(source),
+            "--staging",
+            str(staging),
+            "--model",
+            "haiku",
+        ]
+    )
+    rendered = capsys.readouterr().out
+    output = json.loads(rendered)
+
+    assert rc == 0
+    assert output == {
+        "status": "classified",
+        "run_id": "batch_" + "a1" * 12,
+        "model": "haiku",
+        "source_sha256": "1" * 64,
+        "source_snapshot_sha256": "2" * 64,
+        "staging_sha256": "3" * 64,
+        "counts": {"total": 7, "accepted": 5, "review": 1, "failed": 1},
+    }
+    assert "SYNTHETIC_SOURCE_MARKER" not in rendered
+    assert str(staging) not in rendered
+    assert called["classify"][0] == source
+    assert Path(called["runner"][0]).name == ".classifier-runner"
+    assert Path(called["runner"][0]).parent == staging.parent
+
+
+def test_cli_knowledge_classify_rejects_staging_outside_sealed_root(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+
+    monkeypatch.setenv("AGAM_DATA_HOME", str(tmp_path / ".agam"))
+    rc = cli.main(
+        [
+            "knowledge",
+            "classify",
+            "--source",
+            str(tmp_path / "source.db"),
+            "--staging",
+            str(tmp_path / "OUTSIDE_MARKER.db"),
+            "--model",
+            "haiku",
+        ]
+    )
+
+    assert rc == 1
+    rendered = capsys.readouterr().err
+    assert json.loads(rendered) == {
+        "status": "error",
+        "code": "invalid_staging_destination",
+    }
+    assert "OUTSIDE_MARKER" not in rendered
+
+
+def test_cli_knowledge_materialize_passes_required_provenance_without_paths(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+    from agam.knowledge_materializer import MaterializationSummary, StoreSummary
+
+    data_home = tmp_path / ".agam"
+    source = tmp_path / "SOURCE_PATH_MARKER.db"
+    staging = data_home / "knowledge" / "sealed" / "staging" / "run.db"
+    guidance_id = "vault_" + "a" * 24
+    solutions_id = "vault_" + "b" * 24
+    called = {}
+
+    def fake_materialize(*args, **kwargs):
+        called["args"] = args
+        called["kwargs"] = kwargs
+        return MaterializationSummary(
+            version="v-synthetic",
+            source_sha256="1" * 64,
+            source_snapshot_sha256="2" * 64,
+            staging_sha256="3" * 64,
+            stores=(
+                StoreSummary(guidance_id, "4" * 64, 3, 2, 1),
+                StoreSummary(solutions_id, "5" * 64, 4, 1, 2),
+            ),
+        )
+
+    monkeypatch.setenv("AGAM_DATA_HOME", str(data_home))
+    monkeypatch.setattr(
+        "agam.knowledge_materializer.materialize_graph", fake_materialize
+    )
+    rc = cli.main(
+        [
+            "knowledge",
+            "materialize",
+            "--source",
+            str(source),
+            "--staging",
+            str(staging),
+            "--source-sha256",
+            "1" * 64,
+            "--source-snapshot-sha256",
+            "2" * 64,
+            "--staging-sha256",
+            "3" * 64,
+            "--version",
+            "v-synthetic",
+        ]
+    )
+    rendered = capsys.readouterr().out
+    output = json.loads(rendered)
+
+    assert rc == 0
+    assert output["status"] == "materialized"
+    assert output["version"] == "v-synthetic"
+    assert set(output["stores"]) == {guidance_id, solutions_id}
+    assert output["stores"][guidance_id]["entities"] == 3
+    assert "SOURCE_PATH_MARKER" not in rendered
+    assert str(staging) not in rendered
+    assert called["kwargs"]["source_snapshot_sha256"] == "2" * 64
+
+
+def test_cli_wire_codex_safe_is_configured_but_requires_hook_review(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+    from agam.codex_permissions_merger import PermissionProfileStatus
+
+    _write_synthetic_scope_policy(tmp_path)
+    installed = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AGAM_DATA_HOME", str(tmp_path / ".agam"))
+    monkeypatch.setattr(
+        "agam.agents.CodexAgent.install",
+        lambda self, home: (
+            installed.append(home)
+            or PermissionProfileStatus(True, True, False)
+        ),
+    )
+
+    rc = cli.main(["wire", "codex"])
+    output = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert installed == [tmp_path]
+    assert output == {
+        "status": "configured",
+        "agent": "codex",
+        "vaults": list(
+            __import__("agam.vault_registry", fromlist=["load_registry"])
+            .load_registry(tmp_path / ".agam" / "knowledge" / "scopes" / "registry.json")
+            .agents["codex"]
+        ),
+        "hook-trust": "review-required",
+        "permission-profile": "agam_scoped",
+        "permission-profile-state": "select-required",
+        "next-actions": ["/hooks", "/permissions"],
+    }
+
+
+def test_cli_wire_codex_refuses_missing_policy(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AGAM_DATA_HOME", str(tmp_path / ".agam"))
+    monkeypatch.setattr(
+        "agam.agents.CodexAgent.install",
+        lambda *_args: pytest.fail("unsafe wire attempted"),
+    )
+
+    rc = cli.main(["wire", "codex"])
+    assert rc == 1
+    assert json.loads(capsys.readouterr().err)["code"] == (
+        "knowledge_policy_unavailable"
+    )
+
+
+@pytest.mark.parametrize("capability", ["boot-injection", "capture"])
+def test_cli_wire_codex_refuses_forbidden_capabilities(
+    monkeypatch, tmp_path, capsys, capability
+):
+    from agam import cli
+
+    root = _write_synthetic_scope_policy(tmp_path)
+    config = root / "config.json"
+    policy = json.loads(config.read_text(encoding="utf-8"))
+    policy["agents"]["codex"][capability] = True
+    config.write_text(json.dumps(policy), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AGAM_DATA_HOME", str(tmp_path / ".agam"))
+    monkeypatch.setattr(
+        "agam.agents.CodexAgent.install",
+        lambda *_args: pytest.fail("unsafe wire attempted"),
+    )
+
+    rc = cli.main(["wire", "codex"])
+
+    assert rc == 1
+    assert json.loads(capsys.readouterr().err) == {
+        "status": "error",
+        "code": "knowledge_policy_unavailable",
+    }
+
+
+def test_cli_wire_show_is_read_only_and_content_free(
+    monkeypatch, tmp_path, capsys
+):
+    from agam import cli
+
+    root = _write_synthetic_scope_policy(tmp_path)
+    vault_ids = _activate_synthetic_scopes(root)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AGAM_DATA_HOME", str(tmp_path / ".agam"))
+    monkeypatch.setattr(
+        "agam.agents.CodexAgent.install",
+        lambda *_args: pytest.fail("--show mutated wiring"),
+    )
+
+    rc = cli.main(["wire", "codex", "--show"])
+    rendered = capsys.readouterr().out
+    output = json.loads(rendered)
+
+    assert rc == 0
+    assert output["agent"] == "codex"
+    assert output["active_version"] == "v-synthetic"
+    assert output["scopes"] == list(vault_ids)
+    assert output["capabilities"] == {
+        "recall": True,
+        "boot-injection": False,
+        "capture": False,
+    }
+    assert output["hook-trust"] in {"unknown", "not-configured"}
+    assert "graph.db" not in rendered
+    assert str(root) not in rendered

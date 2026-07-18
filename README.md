@@ -88,6 +88,43 @@ You can also drive the wizard non-interactively by feeding it a YAML answer file
 uv run agam init --answers my-answers.yaml
 ```
 
+### Set up your vaults
+
+Agam starts with two protected portable roles and lets you choose both display
+names. The names are labels, not filesystem paths; stable opaque IDs keep
+renames safe.
+
+```bash
+agam vault setup \
+  --guidance-name "How I Build" \
+  --solutions-name "Things That Worked"
+agam tui
+```
+
+You can also complete this naming step in the TUI on first launch. Add as many
+restricted vaults as you need later:
+
+```bash
+agam vault add --name "Project North" --hint "knowledge only for Project North"
+agam vault list
+```
+
+New custom vaults are restricted and unselected by default. Use the IDs from
+`agam vault list` to grant an agent an explicit selection, then refresh its
+wiring:
+
+```bash
+agam vault access codex \
+  --vault vault_aaaaaaaaaaaaaaaaaaaaaaaa \
+  --vault vault_bbbbbbbbbbbbbbbbbbbbbbbb
+agam wire codex
+agam wire codex --show
+```
+
+Replace the example IDs with your own. Renaming preserves the ID. Archiving a
+custom vault removes it from active selections but retains its database; it can
+be restored later.
+
 ## Bootstrap walkthrough
 
 The bootstrap pass is optional but strongly recommended. It reads your Claude Code session transcripts and populates the knowledge graph with entities + relationships.
@@ -209,7 +246,7 @@ Use the doctor output together with `~/.agam/logs/watchdog.log` as the first sto
 when automatic learning pauses. Each selected CLI owns and reports its own
 authentication failures.
 
-## TUI
+## Multi-vault TUI
 
 Run the local dashboard with:
 
@@ -217,17 +254,47 @@ Run the local dashboard with:
 agam tui
 ```
 
-The brain can show one animated input wire each for Claude, Cursor, and Codex.
-A wire appears only when Agam-specific hooks for that agent are actually
-installed; having the CLI or editor installed is not enough. The `mind` count
-is therefore the number of wired agents, while `memories` is the entity count
-in the shared graph.
+The TUI is an operator console for Agam's physical vaults and queues:
 
-The `claude N / cursor N / codex N` values report entity provenance from the
-graph's `source-agent` tags, colored yellow, cyan, and green respectively. A
-wired agent can legitimately show zero until one of its sessions has been
-learned. If an expected wire is missing, refresh it with, for example,
-`agam init --target codex`.
+- **Vaults** shows every user-named vault with its role, access class, state,
+  count, and current Codex selection. Press `n` to add, `e` to rename, `A` to
+  archive or restore, and `w` to toggle Codex access. Protected portable roles
+  can be renamed but not archived. Every readable database is resolved through
+  the active manifest and verified digest; there is no fallback to the legacy
+  mixed graph.
+- **Sessions** merges the legacy and file-per-session ingestion queues. Press
+  `s` to sync one row, `D` twice to archive one row, or `d` twice to confirm a
+  bulk drain.
+- **Reviews** exposes unresolved classifier decisions as opaque metadata. Enter
+  reveals one item locally, `h` retries only that item through Claude CLI/Haiku,
+  `x` opens an explicit routing dialog, and `P` twice publishes a new immutable
+  vault version. Unresolved reviews remain omitted.
+- **Worklog**, **Activity**, and **Health** retain the existing operational
+  evidence and diagnostics.
+
+The animated brain can show one input wire each for Claude, Cursor, and Codex.
+A wire appears only when Agam-specific hooks for that agent are installed;
+having a CLI or editor installed is not enough.
+
+The packaged CLI and the optional source-checkout shim both dispatch to
+`agam.tui:main`; there is no separate private TUI implementation to drift from
+the OSS code.
+
+### Migrate an older fixed vault layout
+
+Migration is copy-only and defaults to a dry run. Agam retains the original
+stores and backs up the old metadata before activation.
+
+```bash
+agam vault migrate
+agam vault migrate --apply
+agam vault list
+agam wire codex
+```
+
+The two previously portable stores become the protected roles. Any additional
+stores become restricted custom vaults with neutral temporary names that you
+can rename in the TUI or with `agam vault rename`.
 
 ## Troubleshooting
 
@@ -278,7 +345,7 @@ The repo at `~/coding/agam` is independent; remove it separately if you no longe
 | `agam bootstrap` | Scan transcripts, estimate cost, extract + reconcile into the knowledge graph. Resumable. |
 | `agam status` | Print install health: paths, graph size, queue depth, container detection, resume state. |
 | `agam doctor` | Run deeper installation and invoker diagnostics. |
-| `agam tui` | Open the local dashboard for wiring, provenance, graph, queue, and lessons. |
+| `agam tui` | Open the multi-vault operator console for vaults, session ingestion, sealed reviews, activity, and health. |
 | `agam uninstall` | Preview or remove selected agent wiring and, when no agents remain, the shared data home. |
 | `agam reset` | Remove bootstrap scratch state (`~/.claude/.agam-bootstrap-state.json` and candidates). Dry-run by default; pass `--confirm` to actually delete. Never touches identity files or the graph. |
 

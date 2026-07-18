@@ -206,6 +206,38 @@ def test_container_mode_invokes_docker_exec(tmp_path):
     assert "drain-done" in tail
 
 
+def test_explicit_queue_file_drains_only_selected_generation(tmp_path):
+    home = _make_home(tmp_path)
+    (home / "queue" / "first.json").write_text('{"entry=first":1}')
+    (home / "queue" / "second.json").write_text('{"entry=second":1}')
+    bin_dir = tmp_path / "bin"
+    _write_fake_docker(
+        bin_dir,
+        ps_stdout="my-claude-abc claude-code:latest",
+    )
+
+    result = _run(
+        _env(home, bin_dir, AGAM_QUEUE_FILE="second.json")
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (home / "queue" / "first.json").exists()
+    assert not (home / "queue" / "second.json").exists()
+    assert (home / "processed" / "second.json").exists()
+
+
+def test_explicit_queue_file_rejects_path_traversal(tmp_path):
+    home = _make_home(tmp_path)
+    bin_dir = tmp_path / "bin"
+    _write_fake_docker(bin_dir)
+
+    result = _run(
+        _env(home, bin_dir, AGAM_QUEUE_FILE="../outside.json")
+    )
+
+    assert result.returncode == 2
+
+
 # ---------------------------------------------------------------------------
 # 2. Host mode: docker is never called; host inner script is invoked.
 # ---------------------------------------------------------------------------

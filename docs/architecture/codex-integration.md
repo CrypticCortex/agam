@@ -1,198 +1,200 @@
-# Codex integration
+# Codex scoped-knowledge integration
 
-> Status: implemented in the local OSS runtime. This document describes the current
-> local architecture and operating boundary; it does not specify an enterprise
-> federation or transport layer.
+> Status: implemented. Codex reads only the active vault IDs explicitly selected
+> for it in the content-free vault registry.
 
-## Architecture at a glance
+## Security boundary
 
-Agam treats Codex as another edge connected to the same local brain as Claude Code and
-Cursor. Agent-specific files only adapt lifecycle events; durable identity, knowledge,
-queue state, prompts, and watchdog code live under the neutral data home.
+The old shared-graph design is not the Codex architecture. Codex does not read
+`~/.agam/knowledge/graph.db`, a Claude graph, identity files, transcripts, or a
+caller-supplied `AGAM_KG_PATH`. Missing or invalid scoped policy fails closed;
+there is no legacy fallback.
 
-```text
-Claude Code hooks ----\
-Cursor hooks/rules ----+--> ~/.agam/queue --> watchdog --> ~/.agam/knowledge/graph.db
-Codex hooks ----------/           ^                         |
-                                  +------ prompt recall <---+
-```
+The primary boundary is the selectable Codex filesystem permission profile
+`agam_scoped`. It denies `~/.agam/knowledge` as a whole, then reopens only
+content-free registry, policy, and manifest metadata plus the opaque vault IDs
+selected for Codex. Display names never become filesystem paths or permission
+rules.
 
-The default shared layout is:
+The profile does not reopen unselected vaults, sealed staging, or legacy
+shared-graph paths. The `PreToolUse` scope guard is defense in depth: it
+blocks direct, escaped, indirect, symlinked, URI, shell, Python, SQLite, and
+local-function attempts to reach restricted knowledge. It is not a substitute
+for selecting the filesystem profile.
 
-```text
-~/.agam/
-  AGAM.md, THISAI.md, MUGAM.md, config.yaml
-  knowledge/graph.db
-  prompts/
-  hooks/
-  tools/agam/
-  queue/             pending enrichment generations
-  processing/        atomically claimed work
-  processed/         completed queue entries
-  queue-errors/      entries that exhausted retries
-  transcripts/codex/ normalized immutable snapshots
-  logs/
-```
-
-`AGAM_DATA_HOME`, `AGAM_HOME`, `AGAM_KG_PATH`, and the other documented path variables
-can override these defaults. The normal multi-agent install uses `~/.agam` so switching
-agents does not fork memory.
-
-## Per-agent wiring
-
-The installer maintains a small adapter in each selected agent's own configuration:
-
-| Agent | Wiring | Durable brain |
-|---|---|---|
-| Claude Code | Agam hook commands merged into `~/.claude/settings.json`; helpers under `~/.claude/hooks` and `~/.claude/tools/agam` | `~/.agam` |
-| Cursor | Stop/session-end commands merged into `~/.cursor/hooks.json`; helpers under `~/.cursor/hooks` and `~/.cursor/tools/agam`; recall is refreshed into Cursor's rule digest | `~/.agam` |
-| Codex | Lifecycle commands merged into `~/.codex/hooks.json`; Agam-owned scripts under `~/.codex/hooks/agam` and helpers under `~/.codex/tools/agam` | `~/.agam` |
-
-For Codex, Agam uses the client's official lifecycle hook interface as follows:
-
-| Codex event | Agam handler | Purpose |
-|---|---|---|
-| `UserPromptSubmit` | `graph_recall.py` | Query the graph and return relevant context through `additionalContext`. |
-| `Stop` | `codex_stop.py` | Gate, normalize, snapshot, and enqueue a substantive rollout. |
-| `PreToolUse` (`Bash`, `Edit|Write`) | `lesson_activate.py` | Activate lessons that match a command or edited path. |
-| `PostToolUse` (`Bash`) | `lesson_activate_post.py` | Activate lessons that match command failures and output. |
-
-The merger is idempotent and writes `hooks.json` atomically. It preserves unrelated user
-configuration and deduplicates Agam handlers. The `hooks/agam` namespace is the ownership
-boundary: Agam never writes generic files such as `~/.codex/hooks/graph_recall.py`, even
-if a user has files with the same names. Commands are absolute, guarded for a missing
-script, and carry an absolute tools directory.
-
-## Codex Stop flow and privacy boundary
-
-Codex's rollout JSONL is treated as an evolving private format. `codex_stop.py` receives
-Codex's `session_id`, `transcript_path`, and `cwd`, but the background worker is not given
-the original rollout path. A session is enqueued only when the adapter sees all three of:
-
-- at least six canonical user submissions;
-- credible edit evidence (a successful patch-completion record when available, or a
-  recognized edit/apply-patch call); and
-- a real-work signal near the end of the visible conversation.
-
-For a qualifying Stop, Agam produces a compact, Claude-like JSONL generation at
-`~/.agam/transcripts/codex/<session>-<timestamp>-<uuid>.jsonl`. Normalization retains
-visible user/assistant text, bounded tool inputs/results, and successful edit paths. It
-drops reasoning and encrypted content, images, system/developer/world-state records,
-token accounting, and other internal metadata. Ambiguous Codex `response_item` records
-with `role=user` are also excluded because they can represent environment setup or
-delegated sub-agent prompts rather than a visible user submission.
-
-Every snapshot filename is generation-specific, the file is written atomically, and an
-older generation is never rewritten while a worker may be reading it. This is a data
-minimization boundary, not content redaction or encryption: visible conversation text
-and bounded tool data can still contain sensitive material. Pending, processing, retry,
-and dead-letter references protect their snapshots from cleanup. Completed or superseded
-generations are retained as a two-snapshot recent tail per session; older snapshot files
-are removed after their processed audit records are atomically marked as pruned. Cleanup
-is fail-open, so lock or filesystem uncertainty defers pruning to a later Stop instead of
-risking live work.
-
-Hook failures are fail-open for the coding session. Malformed JSON, rollout schema drift,
-or local filesystem errors can skip an enrichment pass, but must not block Codex Stop.
-
-## Queue concurrency and recovery
-
-Pending entries use an atomic file-per-session replace in `~/.agam/queue`. Before work,
-the watchdog takes a single-flight lock and atomically moves the exact pending file into a
-unique `processing/claim.*` directory. A new Stop can then create a newer pending entry
-for the same session without the current worker archiving or deleting it.
-
-Successful claims move to `processed/`. Failures are retried under generation-specific
-names and eventually move to `queue-errors/`; a claim left by an interrupted watchdog is
-recovered to the queue on the next run. Drains are oldest-first and bounded per tick.
-This design protects both the immutable transcript generation and a concurrently
-re-enqueued session generation.
-
-## Background enrichment with Codex
-
-The host watchdog chooses an authenticated enrichment CLI in the established order
-Claude, Cursor Agent, then Codex, unless `AGAM_LLM_CLI_PIN` selects one explicitly. When
-Codex is selected it runs a noninteractive turn equivalent to:
+## Classification and publication
 
 ```text
-codex exec --ephemeral --disable hooks --sandbox read-only \
-  --skip-git-repo-check --color never --cd ~/.agam \
-  --output-schema <temporary-schema.json> -
+read-only source graph
+        |
+        | backup into sealed staging
+        v
+Claude CLI / Haiku classifier
+  route: one active opaque vault ID | REVIEW
+        |
+        | sealed, resumable classifications
+        v
+validated materializer
+        |
+        +-- vault_<opaque-id>/<version>/graph.db
+        +-- vault_<opaque-id>/<version>/graph.db
+        +-- ... one store per active vault
+        |
+        v
+content-free manifest + atomic active.json
 ```
 
-The prompt is supplied on standard input. `--disable hooks` prevents the watchdog's own
-Codex turn from recursively enqueueing itself; `--ephemeral` avoids a persistent Codex
-session; and the read-only sandbox keeps model execution separate from mutation. Strict
-JSON Schemas constrain the work-log body and knowledge proposals. Agam validates stdout,
-materializes temporary files mechanically, and then uses its existing deterministic
-append/apply pipeline to update local state.
+The source is opened read-only. Classification happens on a sealed staging
+copy. The Claude CLI runner is pinned to Haiku, disables tools, slash commands,
+Chrome, session persistence, project setting sources, auto-memory, and prompt
+history, and uses a replacement classifier system prompt. Model-facing entity
+IDs are opaque. Progress, errors, and CLI output contain only stable codes,
+hashes, IDs, and aggregate counts.
 
-On macOS, the installer records the CLI kind and, when it can resolve it at install time,
-the absolute executable in the launchd plist. This matters because launchd's restricted
-`PATH` often cannot discover CLIs installed through npm, nvm, asdf, editor extensions, or
-other user toolchains. A stale absolute path falls back to the normal probe cascade rather
-than being executed.
+Every classified description starts with its opaque assignment marker, for
+example `[VAULT:vault_aaaaaaaaaaaaaaaaaaaaaaaa]`. A run-level HMAC binds
+metadata, every source row, all
+properties and relationships, and every classification. The checkpoint seal is
+updated with each resumable transaction. Materialization revalidates the seal,
+source and staging fingerprints, official schema digest, and timestamps before
+publishing anything.
 
-## TUI representation
+Routing is deterministic: an accepted assignment is copied only to the matching
+opaque vault store. Unknown IDs, archived destinations, malformed responses,
+and low-confidence results become `REVIEW` and are omitted until resolved.
+Codex readability is independent of classification: it comes only from the
+registry's explicit Codex selection.
 
-The TUI detects wiring, not mere application presence. A wire appears only when Agam's
-owned hook files exist or the relevant agent configuration references them. Claude,
-Cursor, and Codex each get a distinct animated wire feeding the same brain; provenance
-counts in the footer use the same three sources. Therefore an installed Codex CLI alone
-does not create a Codex wire: run the Codex target install first and restart the TUI.
+Properties follow their entity. Relationships are copied only when both ends
+land in the same physical store; cross-scope edges are omitted. Publication
+builds every active immutable store first and switches `active.json` only after
+validation succeeds. Manifests contain relative store paths, hashes, model,
+timestamps, and aggregate counts—not entity text or source paths.
 
-## Migration and compatibility
+## Policy and selective wiring
 
-Older Agam versions stored identity and the graph below `~/.claude`. On install, if the
-neutral graph does not yet exist, Agam copies the legacy knowledge and identity data into
-`~/.agam` and leaves the legacy source untouched. A queue-only `~/.agam` directory does
-not suppress this migration. Migrated untagged graph entities are backfilled with Claude
-provenance.
+`~/.agam/knowledge/scopes/registry.json` is the canonical selection source. It
+contains only vault metadata and explicit per-agent vault IDs. The separate
+`config.json` stores capabilities. Environment scope selection may narrow an
+agent's registry selection but can never expand it.
 
-Existing path environment variables and legacy Claude hook filenames remain readable so
-an upgrade can be rolled out without losing memory. New agent activity writes to the
-neutral graph with its own provenance. Re-running install refreshes code and prompts but
-does not replace an existing shared graph or edited identity files.
+Codex capabilities are deliberately asymmetric:
 
-## Install, trust, and uninstall
+```json
+{
+  "recall": true,
+  "boot-injection": false,
+  "capture": false
+}
+```
 
-Install only the Codex adapter, or combine it with other targets:
+Use `agam wire <agent> --show` to inspect the effective version, opaque vault
+IDs, and capabilities without changing wiring:
 
 ```bash
-agam init --target codex
-agam init --target claude --target cursor --target codex
+agam wire codex
+agam wire codex --show
 ```
 
-After installation, open `/hooks` in Codex and review/trust the Agam command hooks if the
-client marks them as awaiting trust. Trust should be based on the absolute commands under
-`~/.codex/hooks/agam`; installing Agam does not imply that arbitrary commands elsewhere
-in `~/.codex/hooks.json` are owned or endorsed by Agam. `agam doctor` checks that the
-selected wiring, shared graph, and available invoker are coherent.
+The Codex adapter installs only two namespaced hooks under
+`~/.codex/hooks/agam`:
 
-Uninstall is target-aware:
+| Event | Handler | Behavior |
+|---|---|---|
+| `UserPromptSubmit` | `graph_recall.py` | Reads active, verified stores selected for Codex and returns advisory context. |
+| `PreToolUse` (`*`) | `scope_guard.py` | Blocks attempts to access restricted knowledge; unavailable/crashed guard blocks the tool call. |
+
+There is no Codex `Stop` handler, transcript normalization, enrichment queue,
+session capture, lesson post-processing, identity injection, or boot context.
+Recall is prior evidence, not live truth, and tells the agent to verify
+load-bearing facts against current sources.
+
+## Install, trust, and permission selection
+
+Wiring writes configuration; it cannot silently grant trust or select a Codex
+permission profile. After `agam wire codex`:
+
+1. Open `/hooks`, review the absolute commands under
+   `~/.codex/hooks/agam`, and trust them.
+2. Open `/permissions` and select `agam_scoped`.
+3. If wiring reports `legacy-sandbox-conflict`, resolve the legacy sandbox
+   setting before selecting the profile.
+4. Run `agam wire codex --show` and confirm the expected opaque vault IDs are
+   active, with boot injection and capture disabled.
+
+Until those manual steps are complete, hook trust is `review-required` and the
+filesystem profile is `select-required`; installation must not report either as
+active.
+
+## Content-free operator flow
+
+Classification and materialization deliberately require explicit provenance:
 
 ```bash
-agam uninstall --target codex            # dry run
-agam uninstall --target codex --confirm
+# For a live source, first create a transactionally consistent, content-blind
+# snapshot. Keep it under the sealed tree and use the same immutable file for
+# both commands below.
+sqlite3 <live-source.db> ".backup '<sealed-source.db>'"
+
+agam knowledge classify \
+  --source <sealed-source.db> \
+  --staging ~/.agam/knowledge/sealed/staging/<run>.db \
+  --model haiku
+
+agam knowledge materialize \
+  --source <sealed-source.db> \
+  --staging ~/.agam/knowledge/sealed/staging/<run>.db \
+  --source-sha256 <classify-output> \
+  --source-snapshot-sha256 <classify-output> \
+  --staging-sha256 <classify-output>
+
+agam wire codex
 ```
 
-It removes Agam's namespaced Codex scripts/tools and only Agam-owned entries from
-`hooks.json`. Other Codex hooks are preserved. The shared brain and launchd job remain
-while another Agam-wired agent is installed; removing the last target soft-moves shared
-data by default. `--purge` is the explicit destructive option.
+Do not classify a database that active hooks can still mutate. The classifier
+checks source identity, physical bytes, and the logical SQLite snapshot before
+publication; a change at any point fails closed with `source_changed`.
+
+Successful commands print aggregate JSON: run/version IDs, hashes, model,
+per-store counts, permission state, and next actions. Failures print stable
+reason codes. Neither path prints graph rows, model prompts/responses, source
+filenames, or staging paths.
+
+## TUI operator boundary
+
+`agam tui` uses the same physical separation as Codex recall. Its Vaults view
+starts from the registry and `active.json`, validates every selected store path
+and digest through `knowledge_scopes`, and rejects a database containing an
+assignment marker for a different vault. Unselected rows in the rail are
+metadata only and their databases are not opened.
+
+The TUI has two independent queues:
+
+- The Sessions view delegates a selected legacy row to the monitor and a
+  selected file-queue generation to the shared watchdog's basename-only
+  selector. It never maps a merged-table index onto the wrong queue. Bulk drain
+  remains a separately confirmed action across both formats.
+- The Reviews view validates the classifier checkpoint before revealing a row.
+  A one-row Haiku retry and an explicit user decision both go back through the
+  classifier's transaction, per-row HMAC, and run seal. The TUI never updates
+  staging tables directly. Publication revalidates the sealed run, builds a new
+  immutable version, and switches the active pointer atomically. Remaining
+  `REVIEW` rows stay omitted.
+
+Review content is not included in list rows, notifications, subprocess
+arguments, logs, or test fixtures. Repository verification uses synthetic
+graphs and fake runners; Codex does not open the production sealed staging or
+restricted vaults during development.
 
 ## Verification boundary
 
-The implementation is covered by repository tests for agent detection and idempotent
-installation, non-destructive/atomic hook merging, Codex rollout parsing and privacy
-filters, immutable Stop snapshots, concurrent enqueue/claim/retry behavior, structured
-noninteractive Codex invocation, launchd absolute-path handling, migration, CLI
-install/uninstall/doctor behavior, and TUI wiring/provenance.
+Repository tests use synthetic SQLite graphs, fake model runners, and temporary
+homes. The end-to-end proof classifies into portable and restricted user-defined
+vaults, materializes opaque physical stores, installs Codex wiring, populates a
+legacy shared graph, and verifies that recall returns only explicitly selected
+markers while never returning restricted or legacy-only markers.
 
-Those tests use fixtures and fake CLIs. They do not guarantee compatibility with every
-future Codex rollout schema or client release, authenticate a user's Codex account, test
-the actual model/network service, approve local hooks, or establish OS-level isolation
-beyond the requested Codex sandbox. A release check should therefore include the full
-repository suite plus one manual smoke test with the installed Codex version: install,
-review `/hooks`, submit a recall prompt, perform a substantive edit session, observe the
-queue drain, and confirm the Codex wire and provenance in `agam tui`.
+These tests do not classify a user's live graph, authenticate Claude, trust
+hooks, or select the permission profile in a running Codex client. A live
+rollout therefore still requires the manual trust/permission steps above and a
+smoke query after an active manifest has been published.

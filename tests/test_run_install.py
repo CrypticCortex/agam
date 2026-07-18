@@ -4,8 +4,11 @@ import json
 import os
 import plistlib
 import sqlite3
+import tomllib
 
+from agam.codex_permissions_merger import PERMISSION_PROFILE
 from agam.installer import run_install
+from agam.vault_registry import VaultRole, load_registry
 
 
 def _answers(tmp_path):
@@ -29,6 +32,23 @@ def test_installs_shared_home_and_both_agents(tmp_path):
     assert (agam / "AGAM.md").exists()
     assert (agam / "prompts" / "work-log.txt").exists()
     assert (agam / "knowledge" / "graph.db").exists()
+    policy_path = agam / "knowledge" / "scopes" / "config.json"
+    policy = json.loads(policy_path.read_text())
+    registry_path = policy_path.with_name("registry.json")
+    vaults = load_registry(registry_path)
+    assert policy_path.stat().st_mode & 0o777 == 0o600
+    assert policy_path.parent.stat().st_mode & 0o777 == 0o700
+    assert vaults.for_role(VaultRole.GUIDANCE).name == "Guidance"
+    assert vaults.for_role(VaultRole.SOLUTIONS).name == "Solutions"
+    assert len(vaults.selected_for("codex")) == 2
+    assert len(vaults.selected_for("claude")) == 2
+    assert len(vaults.selected_for("cursor")) == 2
+    assert policy["agents"]["codex"] == {
+        "recall": True,
+        "boot-injection": False,
+        "capture": False,
+    }
+    assert not (agam / "knowledge" / "scopes" / "active.json").exists()
     # Shared watchdog hooks/tools copy.
     assert (agam / "hooks" / "agam_watchdog_inner.py").exists()
     assert (agam / "tools" / "agam" / "transcripts.py").exists()
@@ -61,12 +81,38 @@ def test_codex_only(tmp_path):
         tmp_path / ".codex" / "hooks" / "agam" / "graph_recall.py"
     ).exists()
     assert (
+        tmp_path / ".codex" / "hooks" / "agam" / "scope_guard.py"
+    ).exists()
+    assert not (
         tmp_path / ".codex" / "hooks" / "agam" / "codex_stop.py"
     ).exists()
-    assert (tmp_path / ".codex" / "tools" / "agam" / "transcripts.py").exists()
+    assert not (tmp_path / ".codex" / "tools" / "agam").exists()
+    config = json.loads((tmp_path / ".codex" / "hooks.json").read_text())
+    assert set(config["hooks"]) == {"UserPromptSubmit", "PreToolUse"}
+    assert "AGAM_KNOWLEDGE_PROFILE" not in json.dumps(config)
+    assert "AGAM_RECALL_AGENT=codex" in json.dumps(config)
+    permissions = tomllib.loads(
+        (tmp_path / ".codex" / "config.toml").read_text()
+    )["permissions"][PERMISSION_PROFILE]
+    assert permissions["filesystem"][str((tmp_path / ".agam" / "knowledge").resolve())] == "deny"
     assert not (tmp_path / ".claude" / "settings.json").exists()
     assert not (tmp_path / ".cursor" / "hooks.json").exists()
     assert res.targets == ["codex"]
+
+
+def test_install_preserves_existing_scope_policy(tmp_path):
+    scopes = tmp_path / ".agam" / "knowledge" / "scopes"
+    scopes.mkdir(parents=True)
+    policy = scopes / "config.json"
+    custom = {"synthetic-user-policy": True}
+    policy.write_text(json.dumps(custom))
+
+    run_install(
+        _answers(tmp_path), targets=["codex"], home=tmp_path, write_plist=False,
+    )
+
+    assert json.loads(policy.read_text()) == custom
+    assert not (scopes / "active.json").exists()
 
 
 def test_codex_plist_persists_resolved_executable(monkeypatch, tmp_path):

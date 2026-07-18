@@ -22,6 +22,7 @@ install. Use ``agam init --force`` for that.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -484,6 +485,468 @@ def _format_size(n_bytes: int) -> str:
     return f"{size:.1f} GB"
 
 
+def _content_free_error(code: str) -> int:
+    print(json.dumps({"status": "error", "code": code}), file=sys.stderr)
+    return 1
+
+
+def _secure_staging_destination(path: Path, root: Path) -> Path | None:
+    """Resolve a staging destination only when it stays below sealed staging."""
+    try:
+        resolved_root = root.expanduser().resolve(strict=False)
+        resolved = path.expanduser().resolve(strict=False)
+        resolved.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
+def _cmd_knowledge_classify(args: argparse.Namespace) -> int:
+    from agam import paths as agam_paths
+    from agam.knowledge_classifier import (
+        ClaudeCliRunner,
+        ClassifierContractError,
+        classify_graph,
+    )
+
+    source = Path(args.source).expanduser()
+    staging = _secure_staging_destination(
+        Path(args.staging), agam_paths.staging_knowledge_dir()
+    )
+    if staging is None:
+        return _content_free_error("invalid_staging_destination")
+    try:
+        runner_directory = (
+            agam_paths.staging_knowledge_dir() / ".classifier-runner"
+        )
+        if runner_directory.is_symlink():
+            return _content_free_error("runner_environment_unavailable")
+        runner_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(runner_directory, 0o700)
+        runner = ClaudeCliRunner(
+            working_directory=runner_directory, model=args.model
+        )
+        summary = classify_graph(
+            source,
+            staging,
+            runner,
+            model=args.model,
+            batch_size=args.batch_size,
+            neighbor_limit=args.neighbor_limit,
+            parallelism=args.parallelism,
+            retry_failed=args.retry_failed,
+            registry_path=agam_paths.vault_registry_path(),
+        )
+    except ClassifierContractError as error:
+        return _content_free_error(error.code)
+    except Exception:
+        return _content_free_error("classification_failed")
+
+    print(
+        json.dumps(
+            {
+                "status": "classified",
+                "run_id": summary.run_id,
+                "model": summary.model,
+                "source_sha256": summary.source_sha256,
+                "source_snapshot_sha256": summary.source_snapshot_sha256,
+                "staging_sha256": summary.staging_sha256,
+                "counts": {
+                    "total": summary.total,
+                    "accepted": summary.accepted,
+                    "review": summary.review,
+                    "failed": summary.failed,
+                },
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _cmd_knowledge_materialize(args: argparse.Namespace) -> int:
+    from agam import installer, paths as agam_paths
+    from agam.knowledge_materializer import (
+        MaterializationContractError,
+        materialize_graph,
+    )
+
+    staging = _secure_staging_destination(
+        Path(args.staging), agam_paths.staging_knowledge_dir()
+    )
+    if staging is None:
+        return _content_free_error("invalid_staging_destination")
+    try:
+        schema = installer._find_resource("knowledge/graph-schema.sql")
+        summary = materialize_graph(
+            Path(args.source).expanduser(),
+            staging,
+            agam_paths.scopes_dir(),
+            schema,
+            source_sha256=args.source_sha256,
+            source_snapshot_sha256=args.source_snapshot_sha256,
+            staging_sha256=args.staging_sha256,
+            registry_path=agam_paths.vault_registry_path(),
+            version=args.version,
+        )
+    except MaterializationContractError as error:
+        return _content_free_error(error.code)
+    except Exception:
+        return _content_free_error("materialization_failed")
+
+    print(
+        json.dumps(
+            {
+                "status": "materialized",
+                "version": summary.version,
+                "source_sha256": summary.source_sha256,
+                "source_snapshot_sha256": summary.source_snapshot_sha256,
+                "staging_sha256": summary.staging_sha256,
+                "stores": {
+                    store.scope: {
+                        "sha256": store.sha256,
+                        "entities": store.entities,
+                        "relationships": store.relationships,
+                        "properties": store.properties,
+                    }
+                    for store in summary.stores
+                },
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _vault_json(record) -> dict[str, str]:
+    return {
+        "id": record.id,
+        "name": record.name,
+        "role": record.role.value,
+        "access": record.access.value,
+        "state": record.state.value,
+        "routing_hint": record.routing_hint,
+    }
+
+
+def _cmd_vault(args: argparse.Namespace) -> int:
+    from agam import paths as agam_paths
+    from agam.vault_migration import VaultMigrationError, migrate_fixed_layout
+    from agam.vault_registry import (
+        RegistryError,
+        VaultRole,
+        add_vault,
+        archive_vault,
+        initialize_registry,
+        load_registry,
+        rename_vault,
+        restore_vault,
+        set_agent_access,
+    )
+
+    if args.vault_command == "migrate":
+        try:
+            summary = migrate_fixed_layout(
+                agam_paths.scopes_dir(), apply=args.apply
+            )
+        except VaultMigrationError as error:
+            return _content_free_error(error.code)
+        except OSError:
+            return _content_free_error("vault_migration_unavailable")
+        print(
+            json.dumps(
+                {
+                    "status": summary.status,
+                    "vaults": summary.vaults,
+                    "copied_stores": summary.copied_stores,
+                    "version": summary.version,
+                    "data_retained": True,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    path = agam_paths.vault_registry_path()
+    try:
+        if args.vault_command == "setup":
+            if path.exists() or path.is_symlink():
+                registry = load_registry(path)
+                rename_vault(
+                    path,
+                    registry.for_role(VaultRole.GUIDANCE).id,
+                    args.guidance_name,
+                )
+                registry = load_registry(path)
+                rename_vault(
+                    path,
+                    registry.for_role(VaultRole.SOLUTIONS).id,
+                    args.solutions_name,
+                )
+            else:
+                initialize_registry(
+                    path,
+                    guidance_name=args.guidance_name,
+                    solutions_name=args.solutions_name,
+                    agents=SUPPORTED_AGENT_TARGETS,
+                )
+            registry = load_registry(path)
+            output = {
+                "status": "configured",
+                "vaults": [_vault_json(vault) for vault in registry.vaults],
+            }
+        elif args.vault_command == "list":
+            registry = load_registry(path)
+            output = {
+                "status": "ok",
+                "vaults": [_vault_json(vault) for vault in registry.vaults],
+                "agents": {
+                    name: list(selected)
+                    for name, selected in registry.agents.items()
+                },
+            }
+        elif args.vault_command == "add":
+            record = add_vault(path, name=args.name, routing_hint=args.hint)
+            output = {
+                "status": "added",
+                "vault": _vault_json(record),
+                "rewire_required": False,
+            }
+        elif args.vault_command == "rename":
+            record = rename_vault(path, args.vault_id, args.name)
+            output = {
+                "status": "renamed",
+                "vault": _vault_json(record),
+                "rewire_required": False,
+            }
+        elif args.vault_command == "archive":
+            before = load_registry(path)
+            selected = any(
+                args.vault_id in values for values in before.agents.values()
+            )
+            record = archive_vault(path, args.vault_id)
+            output = {
+                "status": "archived",
+                "vault": _vault_json(record),
+                "data_retained": True,
+                "rewire_required": selected,
+            }
+        elif args.vault_command == "restore":
+            record = restore_vault(path, args.vault_id)
+            output = {
+                "status": "restored",
+                "vault": _vault_json(record),
+                "data_retained": True,
+                "rewire_required": False,
+            }
+        else:
+            selected = set_agent_access(
+                path, args.agent, args.vaults or ()
+            )
+            output = {
+                "status": "access-updated",
+                "agent": args.agent,
+                "selected": list(selected),
+                "rewire_required": True,
+            }
+    except RegistryError as error:
+        return _content_free_error(error.code)
+    except OSError:
+        return _content_free_error("vault_registry_unavailable")
+    print(json.dumps(output, sort_keys=True))
+    return 0
+
+
+def _agent_wiring_configured(agent: str, home: Path) -> bool:
+    expected = {
+        "codex": (
+            home / ".codex" / "hooks.json",
+            (
+                home / ".codex" / "hooks" / "agam" / "graph_recall.py",
+                home / ".codex" / "hooks" / "agam" / "scope_guard.py",
+            ),
+        ),
+        "claude": (
+            home / ".claude" / "settings.json",
+            (home / ".claude" / "hooks" / "graph_recall.py",),
+        ),
+        "cursor": (
+            home / ".cursor" / "hooks.json",
+            (home / ".cursor" / "hooks" / "cursor_stop.py",),
+        ),
+    }.get(agent)
+    if expected is None:
+        return False
+    config, hooks = expected
+    if not config.is_file() or not all(hook.is_file() for hook in hooks):
+        return False
+    try:
+        commands = _hook_commands(config)
+    except Exception:
+        return False
+    hooks_configured = all(
+        any(str(hook) in command for command in commands) for hook in hooks
+    )
+    if not hooks_configured or agent != "codex":
+        return hooks_configured
+    from agam.codex_permissions_merger import inspect_permission_profile
+
+    permission = inspect_permission_profile(
+        home / ".codex" / "config.toml",
+        home / ".agam" / "knowledge",
+    )
+    return permission.configured
+
+
+def _wire_report(agent: str) -> dict[str, Any]:
+    from agam import paths as agam_paths
+    from agam.codex_permissions_merger import (
+        PERMISSION_PROFILE,
+        inspect_permission_profile,
+    )
+    from agam.knowledge_scopes import (
+        load_active_manifest,
+        resolve_agent_capabilities,
+        resolve_effective_scopes,
+    )
+    from agam.vault_registry import RegistryError, load_registry
+
+    root = agam_paths.scopes_dir()
+    active = root / "active.json"
+    capabilities = resolve_agent_capabilities(agent, scope_root=root)
+    manifest = load_active_manifest(active, scope_root=root)
+    if agent == "codex":
+        # The verified registry selection is the only source of readable stores.
+        scopes = resolve_effective_scopes(
+            agent,
+            scope_root=root,
+            config_path=root / "config.json",
+            active_path=active,
+            env={},
+        )
+    else:
+        # Other-agent ``--show`` is metadata-only. Do not hash/open restricted
+        # stores merely to render status from an agent process.
+        try:
+            registry = load_registry(root / "registry.json")
+        except RegistryError:
+            scopes = ()
+        else:
+            available = set(manifest["stores"]) if manifest is not None else set()
+            scopes = tuple(
+                vault.id
+                for vault in registry.selected_for(agent)
+                if vault.id in available and capabilities["recall"]
+            )
+    configured = _agent_wiring_configured(agent, _home())
+    permission = (
+        inspect_permission_profile(
+            _home() / ".codex" / "config.toml", root.parent
+        )
+        if agent == "codex"
+        else None
+    )
+    hashes = {}
+    if manifest is not None:
+        hashes = {
+            key: manifest[key]
+            for key in (
+                "source_sha256",
+                "source_snapshot_sha256",
+                "staging_sha256",
+            )
+            if isinstance(manifest.get(key), str)
+        }
+    return {
+        "agent": agent,
+        "configured": configured,
+        "hook-trust": (
+            "unknown" if configured and agent == "codex" else
+            "not-configured" if not configured else "not-applicable"
+        ),
+        "active_version": manifest.get("version") if manifest else None,
+        "hashes": hashes,
+        "scopes": list(scopes),
+        "capabilities": capabilities,
+        "recall-enabled": bool(scopes) and capabilities["recall"],
+        "permission-profile": (
+            {
+                "name": PERMISSION_PROFILE,
+                "configured": permission.configured,
+                "state": (
+                    "legacy-sandbox-conflict"
+                    if permission.legacy_sandbox_conflict
+                    else "select-required"
+                    if permission.select_required
+                    else "not-configured"
+                ),
+            }
+            if permission is not None
+            else None
+        ),
+    }
+
+
+def _cmd_wire(args: argparse.Namespace) -> int:
+    from agam import paths as agam_paths
+    from agam.agents import CodexAgent
+    from agam.knowledge_scopes import _load_policy, resolve_agent_capabilities
+    from agam.vault_registry import load_registry
+
+    if args.show:
+        print(json.dumps(_wire_report(args.agent), sort_keys=True))
+        return 0
+    if args.agent != "codex":
+        return _content_free_error("wire_agent_not_supported")
+    root = agam_paths.scopes_dir()
+    policy = _load_policy(root / "config.json")
+    if (
+        policy is None
+        or not isinstance(policy["agents"].get("codex"), dict)
+    ):
+        return _content_free_error("knowledge_policy_unavailable")
+    capabilities = resolve_agent_capabilities(args.agent, scope_root=root)
+    if capabilities != {
+        "recall": True,
+        "boot-injection": False,
+        "capture": False,
+    }:
+        return _content_free_error("knowledge_policy_unavailable")
+    try:
+        permission = CodexAgent().install(_home())
+    except Exception as error:
+        from agam.codex_permissions_merger import PermissionProfileError
+
+        if isinstance(error, PermissionProfileError):
+            return _content_free_error(error.code)
+        return _content_free_error("wire_failed")
+    output = {
+        "status": "configured",
+        "agent": args.agent,
+        "vaults": list(load_registry(root / "registry.json").agents.get(args.agent, ())),
+    }
+    if args.agent == "codex":
+        permission_state = (
+            "legacy-sandbox-conflict"
+            if permission.legacy_sandbox_conflict
+            else "select-required"
+        )
+        output.update(
+            {
+                "hook-trust": "review-required",
+                "permission-profile": permission.profile,
+                "permission-profile-state": permission_state,
+                "next-actions": (
+                    ["/hooks", "/permissions"]
+                    if permission.select_required
+                    else ["/hooks", "resolve-legacy-sandbox-conflict"]
+                ),
+            }
+        )
+    print(json.dumps(output, sort_keys=True))
+    return 0
+
+
 def _cmd_status(_args: argparse.Namespace) -> int:
     from agam import bootstrap, paths as agam_paths
 
@@ -522,6 +985,16 @@ def _cmd_status(_args: argparse.Namespace) -> int:
         print(f"Container:    {container}")
     else:
         print("Container:    (none detected)")
+
+    codex = _wire_report("codex")
+    print(
+        "Codex scoped recall: "
+        + ("enabled" if codex["recall-enabled"] else "disabled")
+    )
+    if codex["configured"]:
+        print("Codex hook trust: review-required/unknown (open /hooks)")
+    else:
+        print("Codex hook trust: not-configured")
 
     return 0
 
@@ -665,34 +1138,51 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
     # 2. KG present + readable
     kg_path = agam_paths.kg_path()
-    kg_ok = False
-    kg_count = 0
-    if kg_path.exists():
-        try:
-            import sqlite3 as _sql
-            conn = _sql.connect(str(kg_path), timeout=2)
-            kg_count = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-            conn.close()
-            kg_ok = True
-        except Exception as exc:  # noqa: BLE001
-            _check("KG readable", False, str(exc), "agam init --force")
-            fails += 1
-    if kg_ok:
+    scoped_policy = agam_paths.scope_config_path()
+    if scoped_policy.exists() or scoped_policy.is_symlink():
         _check(
-            "KG readable",
-            True,
-            detail=f"{kg_count} entities at {kg_path}",
+            "legacy KG sealed",
+            True if kg_path.exists() else None,
+            detail=(
+                "retained without inspection"
+                if kg_path.exists()
+                else "not present; scoped activation remains fail-closed"
+            ),
         )
-        if kg_count == 0:
+    else:
+        kg_ok = False
+        kg_count = 0
+        if kg_path.exists():
+            try:
+                import sqlite3 as _sql
+                conn = _sql.connect(str(kg_path), timeout=2)
+                kg_count = conn.execute(
+                    "SELECT COUNT(*) FROM entities"
+                ).fetchone()[0]
+                conn.close()
+                kg_ok = True
+            except Exception as exc:  # noqa: BLE001
+                _check("KG readable", False, str(exc), "agam init --force")
+                fails += 1
+        if kg_ok:
             _check(
-                "KG populated",
-                None,
-                "graph is empty -- recall hook will have nothing to inject",
-                fix=f"agam bootstrap --projects {home / '.claude' / 'projects'}",
+                "KG readable",
+                True,
+                detail=f"{kg_count} entities at {kg_path}",
             )
-    elif not kg_path.exists():
-        _check("KG file present", False, str(kg_path), "agam init")
-        fails += 1
+            if kg_count == 0:
+                _check(
+                    "KG populated",
+                    None,
+                    "graph is empty -- recall hook will have nothing to inject",
+                    fix=(
+                        "agam bootstrap --projects "
+                        f"{home / '.claude' / 'projects'}"
+                    ),
+                )
+        elif not kg_path.exists():
+            _check("KG file present", False, str(kg_path), "agam init")
+            fails += 1
 
     # 3. At least one selected agent has complete Agam hook wiring. Claude and
     # Codex use nested command handlers; Cursor uses flat command entries, so
@@ -714,12 +1204,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             "Codex",
             home / ".codex" / "hooks.json",
             home / ".codex" / "hooks" / "agam",
-            (
-                "graph_recall.py",
-                "codex_stop.py",
-                "lesson_activate.py",
-                "lesson_activate_post.py",
-            ),
+            ("graph_recall.py", "scope_guard.py"),
         ),
     )
     wired_agents = 0
@@ -779,6 +1264,22 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             "agam init",
         )
         fails += 1
+
+    if _agent_wiring_configured("codex", home):
+        codex = _wire_report("codex")
+        if codex["recall-enabled"]:
+            _check(
+                "Codex scoped recall",
+                True,
+                detail="enabled; hook trust is not inspectable (verify with /hooks)",
+            )
+        else:
+            _check(
+                "Codex scoped recall",
+                None,
+                detail="disabled: no valid scoped activation; hook review required",
+                fix="materialize scoped knowledge, then review hooks with /hooks",
+            )
 
     # 4. Supported host CLIs. Authentication is intentionally left to the
     # selected CLI; this check only establishes launch-time reachability.
@@ -1902,6 +2403,93 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Reconciliation model slug.",
     )
     p_boot.set_defaults(func=_cmd_bootstrap)
+
+    # -- knowledge classify/materialize
+    p_knowledge = sub.add_parser(
+        "knowledge", help="Classify and physically materialize scoped knowledge."
+    )
+    knowledge_sub = p_knowledge.add_subparsers(
+        dest="knowledge_command", required=True
+    )
+    p_classify = knowledge_sub.add_parser(
+        "classify", help="Classify a sealed staging copy with Claude Haiku."
+    )
+    p_classify.add_argument("--source", required=True)
+    p_classify.add_argument("--staging", required=True)
+    p_classify.add_argument("--model", choices=["haiku"], required=True)
+    p_classify.add_argument("--batch-size", type=int, default=8)
+    p_classify.add_argument("--neighbor-limit", type=int, default=8)
+    p_classify.add_argument("--parallelism", type=int, default=1)
+    p_classify.add_argument("--retry-failed", action="store_true")
+    p_classify.set_defaults(func=_cmd_knowledge_classify)
+
+    p_materialize = knowledge_sub.add_parser(
+        "materialize", help="Publish classified rows into physical scope stores."
+    )
+    p_materialize.add_argument("--source", required=True)
+    p_materialize.add_argument("--staging", required=True)
+    p_materialize.add_argument("--source-sha256", required=True)
+    p_materialize.add_argument("--source-snapshot-sha256", required=True)
+    p_materialize.add_argument("--staging-sha256", required=True)
+    p_materialize.add_argument("--version", default=None)
+    p_materialize.set_defaults(func=_cmd_knowledge_materialize)
+
+    # -- vault lifecycle
+    p_vault = sub.add_parser(
+        "vault", help="Set up and manage user-defined knowledge vaults."
+    )
+    vault_sub = p_vault.add_subparsers(dest="vault_command", required=True)
+    p_vault_setup = vault_sub.add_parser(
+        "setup", help="Name the two protected portable vault roles."
+    )
+    p_vault_setup.add_argument("--guidance-name", required=True)
+    p_vault_setup.add_argument("--solutions-name", required=True)
+    p_vault_setup.set_defaults(func=_cmd_vault)
+    p_vault_list = vault_sub.add_parser("list", help="List vault metadata.")
+    p_vault_list.set_defaults(func=_cmd_vault)
+    p_vault_add = vault_sub.add_parser("add", help="Add a restricted custom vault.")
+    p_vault_add.add_argument("--name", required=True)
+    p_vault_add.add_argument("--hint", default="")
+    p_vault_add.set_defaults(func=_cmd_vault)
+    p_vault_rename = vault_sub.add_parser("rename", help="Rename a vault.")
+    p_vault_rename.add_argument("vault_id")
+    p_vault_rename.add_argument("--name", required=True)
+    p_vault_rename.set_defaults(func=_cmd_vault)
+    p_vault_archive = vault_sub.add_parser(
+        "archive", help="Remove a custom vault from active use while retaining data."
+    )
+    p_vault_archive.add_argument("vault_id")
+    p_vault_archive.set_defaults(func=_cmd_vault)
+    p_vault_restore = vault_sub.add_parser(
+        "restore", help="Restore an archived custom vault."
+    )
+    p_vault_restore.add_argument("vault_id")
+    p_vault_restore.set_defaults(func=_cmd_vault)
+    p_vault_access = vault_sub.add_parser(
+        "access", help="Replace one agent's explicit vault selection."
+    )
+    p_vault_access.add_argument("agent", choices=list(SUPPORTED_AGENT_TARGETS))
+    p_vault_access.add_argument("--vault", dest="vaults", action="append")
+    p_vault_access.set_defaults(func=_cmd_vault)
+    p_vault_migrate = vault_sub.add_parser(
+        "migrate", help="Copy a pre-registry vault layout into opaque vault IDs."
+    )
+    p_vault_migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the migration after reviewing the default dry-run.",
+    )
+    p_vault_migrate.set_defaults(func=_cmd_vault)
+
+    # -- wire
+    p_wire = sub.add_parser(
+        "wire", help="Configure or inspect one agent's scoped knowledge wiring."
+    )
+    p_wire.add_argument("agent", choices=list(SUPPORTED_AGENT_TARGETS))
+    p_wire.add_argument(
+        "--show", action="store_true", help="Inspect without modifying wiring."
+    )
+    p_wire.set_defaults(func=_cmd_wire)
 
     # -- status
     p_status = sub.add_parser("status", help="Print Agam install health.")

@@ -19,15 +19,17 @@ Bindings (top-level):
     r          refresh now
     ?          help
     1..7       jump to tab
-    d          drain queue (sync --all in background)
+    d          confirm/drain all session rows (sync --all in background)
     c          start claude-code container if missing
 
 Per-tab row bindings (DataTables):
     Enter      drill-down modal
-    s          force-sync (queue tab)
-    D          drop queue row to archive (queue tab, with confirm)
-    p          toggle project paused (graph tab, project rows only)
-    a          run lint fix (lint tab) -- evaluates via /bin/sh
+    s          force-sync selected session
+    D          archive selected session (double-press confirmation)
+    h          retry selected sealed review with Claude CLI / Haiku
+    x          resolve selected review through a signed decision dialog
+    P          publish a new immutable vault version (double-press confirmation)
+    a          run lint fix (Health view) -- evaluates via /bin/sh
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -49,7 +52,7 @@ from rich.text import Text
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, ScrollableContainer, Vertical
+from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -150,6 +153,8 @@ NEW_QUEUE_DIR = DATA_HOME / "queue"
 SHARED_PROCESSED = DATA_HOME / "processed"
 SHARED_ERRORS = DATA_HOME / "queue-errors"
 SHARED_WLOG = DATA_HOME / "logs" / "watchdog.log"
+SCOPES_ROOT = DATA_HOME / "knowledge" / "scopes"
+REGISTRY_PATH = SCOPES_ROOT / "registry.json"
 # Back-compatible aliases for callers that imported the old Cursor-era names.
 CURSOR_PROCESSED = SHARED_PROCESSED
 CURSOR_ERRORS = SHARED_ERRORS
@@ -184,6 +189,20 @@ def _find_tool(*candidates: str) -> Path | None:
 # Probe for the kg CLI under both naming conventions.
 KG_CLI = _find_tool("knowledge-graph.py", "knowledge_graph.py")
 WATCHDOG_MONITOR = _find_tool("watchdog-monitor.py", "watchdog_monitor.py")
+_PACKAGE_WATCHDOG = Path(__file__).parent / "hooks" / "agam_watchdog.sh"
+WATCHDOG_SHELL = _PACKAGE_WATCHDOG if _PACKAGE_WATCHDOG.exists() else None
+
+
+def _vault_catalog():
+    from agam.vaults import VaultCatalog
+
+    return VaultCatalog(SCOPES_ROOT, agent="codex")
+
+
+def _review_queue():
+    from agam.review_queue import ReviewQueue
+
+    return ReviewQueue.discover(DATA_HOME)
 
 
 # ---- helpers ------------------------------------------------------------
@@ -354,12 +373,24 @@ def _read_queue() -> list[dict]:
     """Merge both queue sources: legacy .pending-closes.jsonl (personal Claude
     pipeline) + the file-per-session queue/*.json the shared watchdog drains
     (Claude, Cursor, and Codex). Each entry keeps its agent provenance."""
-    entries = list(_read_jsonl(QUEUE_PATH))
+    entries = [
+        {**entry, "_queue_source": "legacy", "_queue_index": index}
+        for index, entry in enumerate(_read_jsonl(QUEUE_PATH))
+    ]
     if NEW_QUEUE_DIR.exists():
         for p in sorted(NEW_QUEUE_DIR.glob("*.json")):
             try:
-                entries.append(json.loads(p.read_text()))
-            except (json.JSONDecodeError, OSError):
+                payload = json.loads(p.read_text())
+                if not isinstance(payload, dict):
+                    continue
+                entries.append(
+                    {
+                        **payload,
+                        "_queue_source": "file",
+                        "_queue_file": str(p),
+                    }
+                )
+            except (json.JSONDecodeError, OSError, TypeError):
                 continue
     return entries
 
@@ -501,10 +532,15 @@ def render_overview() -> Text:
     errors = _error_count()
     inv_label, inv_color = _invoker()
 
-    ent = _kg_query("SELECT COUNT(*) FROM entities")
-    total = ent[0][0] if ent else 0
-    growth = _today_growth()
-    prov = {a: c for a, c in _provenance_counts()}
+    try:
+        vaults = _vault_catalog().summaries()
+    except Exception:
+        vaults = ()
+    counts = {item.scope: item.entities for item in vaults}
+    portable_total = sum(
+        item.entities for item in vaults if item.readable
+    )
+    active_version = vaults[0].version if vaults else None
 
     t = Text()
 
@@ -519,7 +555,7 @@ def render_overview() -> Text:
         "green" if qn == 0 else ("red" if qn > 25 else "yellow"),
     )
     if stale_n:
-        row("stale", f"{stale_n}  (prunable -- queue tab, D)", "orange3")
+        row("stale", f"{stale_n}  (prunable -- Sessions, D)", "orange3")
     row("in-flight", "draining now" if _draining() else "idle",
         "green" if _draining() else "grey50")
     row("daily cap", f"{cap_left}/{cap} left",
@@ -538,16 +574,23 @@ def render_overview() -> Text:
     row("invoker", inv_label, inv_color)
 
     t.append("\nBRAIN\n", style="bold yellow")
-    t.append(f"  {total}", style="bold magenta")
-    t.append(" memories", style="grey50")
-    if growth:
-        t.append(f"   +{growth} today", style="green")
-    t.append("\n  ", style="grey50")
-    t.append(f"claude {prov.get('claude', 0)}", style="yellow3")
-    t.append(" \u00b7 ", style="grey50")
-    t.append(f"cursor {prov.get('cursor', 0)}", style="cyan")
-    t.append(" \u00b7 ", style="grey50")
-    t.append(f"codex {prov.get('codex', 0)}\n", style=_agent_style("codex"))
+    t.append(f"  {portable_total}", style="bold magenta")
+    t.append(" Codex-readable memories\n  ", style="grey50")
+    readable = tuple(
+        (item.name or item.scope, item.entities)
+        for item in vaults
+        if item.readable
+    )
+    for index, (name, count) in enumerate(readable[:2]):
+        if index:
+            t.append(" \u00b7 ", style="grey50")
+        t.append(
+            f"{name[:18]} {count}",
+            style="yellow3" if index == 0 else "cyan",
+        )
+    if active_version:
+        t.append(f"\n  active {active_version[:20]}", style="grey50")
+    t.append("\n")
     return t
 
 
@@ -656,11 +699,11 @@ def render_next_actions() -> Text:
         )
     queue = _read_queue()
     if len(queue) > 25:
-        suggestions.append((f"queue depth high ({len(queue)})", "switch to queue tab to inspect"))
+        suggestions.append((f"queue depth high ({len(queue)})", "switch to Sessions to inspect"))
     if LINT.exists():
         body = LINT.read_text()
         if "fix:" in body:
-            suggestions.append(("lint findings open", "switch to lint tab"))
+            suggestions.append(("lint findings open", "switch to Health"))
     if not suggestions:
         text.append("nothing pressing.", style="green")
         return text
@@ -691,6 +734,139 @@ class DetailScreen(ModalScreen):
         )
 
 
+class VaultEditScreen(ModalScreen[tuple[str, str] | None]):
+    """Compact add/rename dialog for a user-defined vault."""
+
+    BINDINGS = [Binding("escape", "cancel", "cancel")]
+
+    def __init__(
+        self,
+        title: str,
+        *,
+        name: str = "",
+        hint: str = "",
+        include_hint: bool = True,
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._name = name
+        self._hint = hint
+        self._include_hint = include_hint
+
+    def compose(self) -> ComposeResult:
+        children = [
+            Label(f"  {self._title}  ", id="modal-title"),
+            Input(value=self._name, placeholder="Vault name", id="vault-name-input"),
+        ]
+        if self._include_hint:
+            children.append(
+                Input(
+                    value=self._hint,
+                    placeholder="Optional routing hint",
+                    id="vault-hint-input",
+                )
+            )
+        children.extend(
+            [
+                Button("Save", id="vault-save", variant="primary"),
+                Button("Cancel", id="vault-cancel"),
+                Label("  [dim]esc cancels[/dim]  ", id="modal-foot"),
+            ]
+        )
+        yield Container(*children, id="modal-box")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "vault-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "vault-save":
+            return
+        name = self.query_one("#vault-name-input", Input).value.strip()
+        if not name:
+            self.notify("name is required", severity="error")
+            return
+        hint = ""
+        if self._include_hint:
+            hint = self.query_one("#vault-hint-input", Input).value.strip()
+        self.dismiss((name, hint))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class VaultSetupScreen(ModalScreen[tuple[str, str] | None]):
+    """First-run naming for the two protected portable roles."""
+
+    BINDINGS = [Binding("escape", "cancel", "cancel")]
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("  Name your portable vaults  ", id="modal-title"),
+            Label("These two vaults stay available for reusable agent context."),
+            Input(value="Guidance", id="setup-guidance", placeholder="First vault name"),
+            Input(value="Solutions", id="setup-solutions", placeholder="Second vault name"),
+            Button("Create vaults", id="setup-save", variant="primary"),
+            Button("Cancel", id="setup-cancel"),
+            Label("  [dim]Names can be changed later[/dim]  ", id="modal-foot"),
+            id="modal-box",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "setup-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "setup-save":
+            return
+        first = self.query_one("#setup-guidance", Input).value.strip()
+        second = self.query_one("#setup-solutions", Input).value.strip()
+        if not first or not second:
+            self.notify("both names are required", severity="error")
+            return
+        self.dismiss((first, second))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ReviewDecisionScreen(ModalScreen[str | None]):
+    """Explicit vault selection for one already-reviewed item."""
+
+    BINDINGS = [Binding("escape", "cancel", "cancel"), Binding("q", "cancel", "cancel")]
+
+    def __init__(self, vaults) -> None:
+        super().__init__()
+        self._vaults = tuple(vaults)
+        self._routes = {
+            f"route-{index}": vault.scope
+            for index, vault in enumerate(self._vaults)
+        }
+
+    def compose(self) -> ComposeResult:
+        children = [
+            Label("  Resolve sealed review  ", id="modal-title"),
+            Label("Choose the destination deliberately. The decision is integrity-signed."),
+        ]
+        children.extend(
+            Button(
+                f"{vault.name or vault.scope} · {vault.access}",
+                id=f"route-{index}",
+                variant="primary" if index == 0 else "default",
+            )
+            for index, vault in enumerate(self._vaults)
+            if vault.state == "active"
+        )
+        children.append(Label("  [dim]esc cancels[/dim]  ", id="modal-foot"))
+        yield Container(*children, id="modal-box")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        route = self._routes.get(event.button.id or "")
+        if route is not None:
+            self.dismiss(route)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ---- animated brain bar -------------------------------------------------
 
 class BrainBar(Static):
@@ -709,16 +885,23 @@ class BrainBar(Static):
         self._frame = 0
         self._agents: list[str] = []
         self._total = 0
-        self._prov: dict = {}
+        self._vault_counts: dict[str, int] = {}
         self._refresh_stats()
         self.set_interval(0.4, self._animate)
         self.set_interval(10.0, self._refresh_stats)
 
     def _refresh_stats(self) -> None:
         self._agents = _wired_agents(Path.home())
-        ent = _kg_query("SELECT COUNT(*) FROM entities")
-        self._total = ent[0][0] if ent else 0
-        self._prov = {a: c for a, c in _provenance_counts()}
+        try:
+            summaries = _vault_catalog().summaries()
+        except Exception:
+            summaries = ()
+        self._vault_counts = {
+            (item.name or item.scope): item.entities
+            for item in summaries
+            if item.readable
+        }
+        self._total = sum(self._vault_counts.values())
         self.update(self._build())
 
     def _animate(self) -> None:
@@ -805,22 +988,18 @@ class BrainBar(Static):
             out.append("\n")
 
         minds = len(self._agents)
-        cn = self._prov.get("claude", 0)
-        un = self._prov.get("cursor", 0)
-        xn = self._prov.get("codex", 0)
         out.append(f"{minds} mind{'s' if minds != 1 else ''} \u00b7 {self._total} memories  ", style="grey50")
-        out.append(f"claude {cn}", style="yellow3")
-        out.append(" / ", style="grey50")
-        out.append(f"cursor {un}", style="cyan")
-        out.append(" / ", style="grey50")
-        out.append(f"codex {xn}", style=_agent_style("codex"))
+        for index, (name, count) in enumerate(tuple(self._vault_counts.items())[:2]):
+            if index:
+                out.append(" / ", style="grey50")
+            out.append(f"{name[:18]} {count}", style="yellow3" if index == 0 else "cyan")
         return out
 
 
 # ---- the App ------------------------------------------------------------
 
 class AgamApp(App):
-    """Interactive Agam dashboard."""
+    """Keyboard-first operator console for Agam's vaults and queues."""
 
     CSS = """
     Screen { background: #080b14; }
@@ -837,9 +1016,27 @@ class AgamApp(App):
     TabbedContent { background: #080b14; }
     TabPane { padding: 1 2; }
     .pane-static { padding: 1 2; }
+    #vault-layout { height: 1fr; }
+    #vault-left {
+        width: 40;
+        min-width: 36;
+        border-right: solid #293042;
+        padding-right: 1;
+    }
+    #vault-main { width: 1fr; padding-left: 1; }
+    #vault-filter { margin-bottom: 1; }
+    #vault-hint, #review-hint { height: 2; color: #7a7a8a; }
+    #vault-detail {
+        height: 7;
+        border-top: solid #293042;
+        padding: 1 2 0 2;
+        color: #b8bec9;
+    }
     DataTable { background: #080b14; }
     DataTable > .datatable--header { background: #0d1120; color: #e8a849; }
     DataTable > .datatable--cursor { background: #2a2310; }
+    DataTable:focus { border: tall #e8a849; }
+    Input:focus { border: tall #5da9e9; }
     #modal-box {
         background: #0d1120;
         border: thick #e8a849;
@@ -857,55 +1054,91 @@ class AgamApp(App):
         Binding("r", "manual_refresh", "refresh"),
         Binding("?", "toggle_help", "help"),
         Binding("1", "jump('overview')", "overview"),
-        Binding("2", "jump('queue')", "queue"),
-        Binding("3", "jump('graph')", "graph"),
-        Binding("4", "jump('lessons')", "lessons"),
+        Binding("2", "jump('vaults')", "vaults"),
+        Binding("3", "jump('sessions')", "sessions"),
+        Binding("4", "jump('reviews')", "reviews"),
         Binding("5", "jump('worklog')", "worklog"),
         Binding("6", "jump('activity')", "activity"),
-        Binding("7", "jump('lint')", "lint"),
+        Binding("7", "jump('health')", "health"),
         Binding("d", "drain", "drain queue"),
         Binding("c", "start_container", "start container"),
         Binding("enter", "row_detail", "drill"),
         Binding("s", "sync_row", "sync row"),
+        Binding("h", "retry_review", "retry review"),
+        Binding("x", "resolve_review", "resolve review"),
+        Binding("P", "publish_reviews", "publish vaults"),
+        Binding("D", "archive_session", "archive session"),
+        Binding("n", "add_vault", "new vault"),
+        Binding("e", "rename_vault", "rename vault"),
+        Binding("A", "archive_vault", "archive/restore vault"),
+        Binding("w", "toggle_vault_access", "toggle Codex access"),
         Binding("a", "apply_fix", "apply fix"),
-        Binding("p", "toggle_paused", "toggle paused"),
     ]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield BrainBar(id="brain-bar")
         with TabbedContent(initial="overview", id="tabs"):
-            with TabPane("overview", id="overview"):
+            with TabPane("Overview", id="overview"):
                 yield ScrollableContainer(
                     Static(render_overview(), id="overview-stats"),
                     Label("next actions:", classes="pane-static"),
                     Static(render_next_actions(), id="overview-next"),
                 )
-            with TabPane("queue", id="queue"):
+            with TabPane("Vaults", id="vaults"):
+                with Horizontal(id="vault-layout"):
+                    with Vertical(id="vault-left"):
+                        yield Static(
+                            "VAULTS  [dim]Enter select · n add · e rename · A archive/restore · w Codex access[/dim]",
+                            id="vault-hint",
+                        )
+                        yield DataTable(
+                            id="vault-rail", cursor_type="row", zebra_stripes=True
+                        )
+                    with Vertical(id="vault-main"):
+                        yield Input(
+                            placeholder="filter selected vault...",
+                            id="vault-filter",
+                        )
+                        yield DataTable(
+                            id="vault-table", cursor_type="row", zebra_stripes=True
+                        )
+                        yield Static(
+                            "Select a row to inspect its portable context.",
+                            id="vault-detail",
+                        )
+            with TabPane("Sessions", id="sessions"):
                 yield DataTable(id="queue-table", cursor_type="row", zebra_stripes=True)
-            with TabPane("graph", id="graph"):
-                yield Vertical(
-                    Input(placeholder="filter entities...", id="graph-filter"),
-                    DataTable(id="graph-table", cursor_type="row", zebra_stripes=True),
+            with TabPane("Reviews", id="reviews"):
+                yield Static(
+                    "SEALED REVIEW  [dim]Enter reveals · h Haiku retry · x resolve · P publish[/dim]",
+                    id="review-hint",
                 )
-            with TabPane("lessons", id="lessons"):
-                yield DataTable(id="lessons-table", cursor_type="row", zebra_stripes=True)
-            with TabPane("worklog", id="worklog"):
+                yield DataTable(id="review-table", cursor_type="row", zebra_stripes=True)
+            with TabPane("Worklog", id="worklog"):
                 yield ScrollableContainer(Static(id="worklog-static"))
-            with TabPane("activity", id="activity"):
+            with TabPane("Activity", id="activity"):
                 yield Static(render_activity(), id="activity-static", classes="pane-static")
-            with TabPane("lint", id="lint"):
+            with TabPane("Health", id="health"):
                 yield Static(render_lint(), id="lint-static", classes="pane-static")
         yield Footer()
 
     def on_mount(self) -> None:
         self.title = "agam"
-        self.sub_title = "personal knowledge OS"
+        self.sub_title = "vault operator"
+        self._selected_vault = ""
+        self._vault_summaries = ()
+        self._vault_entities = ()
+        self._review_items = ()
         self._populate_queue()
-        self._populate_graph()
-        self._populate_lessons()
+        self._populate_vaults()
+        self._populate_reviews()
         self._populate_worklog()
         self.set_interval(30.0, self._auto_refresh)
+        if not REGISTRY_PATH.exists():
+            self.call_after_refresh(
+                lambda: self.push_screen(VaultSetupScreen(), self._on_vault_setup)
+            )
 
     # ---- generic actions ----
 
@@ -921,7 +1154,10 @@ class AgamApp(App):
         self.query_one("#activity-static", Static).update(render_activity())
         self.query_one("#lint-static", Static).update(render_lint())
         self._populate_queue()
-        self._populate_lessons()
+        self._populate_vaults(
+            self.query_one("#vault-filter", Input).value.strip()
+        )
+        self._populate_reviews()
         self._populate_worklog()
 
     def _auto_refresh(self) -> None:
@@ -933,24 +1169,206 @@ class AgamApp(App):
 
     def action_toggle_help(self) -> None:
         self.notify(
-            "q quit  r refresh  d drain  c start container  / filter  enter drill\n"
-            "1..7 tabs   row actions: s sync  D drop  p pause  a apply fix",
+            "q quit  r refresh  1..7 views  / filter  enter open/select\n"
+            "vaults: n add · e rename · A archive/restore · w Codex access\n"
+            "sessions: s sync one · d drain all · D archive   reviews: h retry · x resolve · P publish",
             severity="information", timeout=8,
         )
 
-    def action_drain(self) -> None:
-        if WATCHDOG_MONITOR is None:
+    def _selected_vault_summary(self):
+        for summary in self._vault_summaries:
+            if summary.scope == self._selected_vault:
+                return summary
+        return None
+
+    def _on_vault_setup(self, names: tuple[str, str] | None) -> None:
+        if names is None:
+            return
+        try:
+            from agam.vault_registry import initialize_registry
+
+            initialize_registry(
+                REGISTRY_PATH,
+                guidance_name=names[0],
+                solutions_name=names[1],
+                agents=("claude", "cursor", "codex"),
+            )
+        except Exception:
+            self.notify("vault setup failed", severity="error")
+            return
+        self._populate_vaults()
+        self.notify("portable vaults created", timeout=3)
+
+    def action_add_vault(self) -> None:
+        if self._active_tab() != "vaults":
+            return
+        self.push_screen(
+            VaultEditScreen("Add custom vault"), self._on_add_vault
+        )
+
+    def _on_add_vault(self, value: tuple[str, str] | None) -> None:
+        if value is None:
+            return
+        try:
+            from agam.vault_registry import add_vault
+
+            record = add_vault(REGISTRY_PATH, name=value[0], routing_hint=value[1])
+        except Exception:
+            self.notify("vault add failed", severity="error")
+            return
+        self._selected_vault = record.id
+        self._populate_vaults()
+        self.notify(f"added {record.name}; restricted by default", timeout=4)
+
+    def action_rename_vault(self) -> None:
+        if self._active_tab() != "vaults":
+            return
+        selected = self._selected_vault_summary()
+        if selected is None:
+            return
+        self.push_screen(
+            VaultEditScreen(
+                "Rename vault",
+                name=selected.name or selected.scope,
+                include_hint=False,
+            ),
+            self._on_rename_vault,
+        )
+
+    def _on_rename_vault(self, value: tuple[str, str] | None) -> None:
+        if value is None:
+            return
+        try:
+            from agam.vault_registry import rename_vault
+
+            record = rename_vault(REGISTRY_PATH, self._selected_vault, value[0])
+        except Exception:
+            self.notify("vault rename failed", severity="error")
+            return
+        self._populate_vaults()
+        self.notify(f"renamed vault to {record.name}", timeout=3)
+
+    def action_archive_vault(self) -> None:
+        if self._active_tab() != "vaults":
+            return
+        selected = self._selected_vault_summary()
+        if selected is None:
+            return
+        if selected.state == "archived":
+            try:
+                from agam.vault_registry import restore_vault
+
+                record = restore_vault(REGISTRY_PATH, selected.scope)
+            except Exception:
+                self.notify("vault restore failed", severity="error")
+                return
+            self._populate_vaults()
+            self.notify(f"restored {record.name}", timeout=3)
+            return
+        if selected.role != "custom":
+            self.notify("protected portable vaults cannot be archived", severity="warning")
+            return
+        now = time.monotonic()
+        pending = getattr(self, "_confirm_vault_archive", None)
+        if pending != selected.scope or now > getattr(
+            self, "_confirm_vault_archive_until", 0.0
+        ):
+            self._confirm_vault_archive = selected.scope
+            self._confirm_vault_archive_until = now + 5.0
             self.notify(
-                f"watchdog-monitor not found in {TOOLS_DIR} or {TOOLS_DIR}/agam",
-                severity="error",
+                f"archive {selected.name}? data is retained; press A again",
+                severity="warning",
+                timeout=5,
             )
             return
         try:
-            subprocess.Popen(
-                [str(WATCHDOG_MONITOR), "sync", "--all"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            from agam.vault_registry import archive_vault
+
+            record = archive_vault(REGISTRY_PATH, selected.scope)
+        except Exception:
+            self.notify("vault archive failed", severity="error")
+            return
+        self._confirm_vault_archive = None
+        self._populate_vaults()
+        self.notify(f"archived {record.name}; all data retained", timeout=4)
+
+    def action_toggle_vault_access(self) -> None:
+        if self._active_tab() != "vaults":
+            return
+        selected = self._selected_vault_summary()
+        if selected is None or selected.state != "active":
+            return
+        try:
+            from agam.vault_registry import load_registry, set_agent_access
+
+            registry = load_registry(REGISTRY_PATH)
+            current = list(registry.agents.get("codex", ()))
+            if selected.scope in current:
+                current.remove(selected.scope)
+                enabled = False
+            else:
+                current.append(selected.scope)
+                enabled = True
+            set_agent_access(REGISTRY_PATH, "codex", current)
+        except Exception:
+            self.notify("access update failed", severity="error")
+            return
+        try:
+            from agam.agents import CodexAgent
+
+            CodexAgent().install(HOME)
+            wiring = "Codex wiring refreshed"
+        except Exception:
+            wiring = "run `agam wire codex` to refresh wiring"
+        self._populate_vaults()
+        state = "enabled" if enabled else "disabled"
+        self.notify(f"Codex access {state}; {wiring}", timeout=5)
+
+    def action_drain(self) -> None:
+        if self._active_tab() != "sessions":
+            return
+        entries = _read_queue()
+        now = time.monotonic()
+        if now > getattr(self, "_confirm_drain_until", 0.0):
+            count = len(entries)
+            self._confirm_drain_until = now + 5.0
+            self.notify(
+                f"drain all {count} session rows? press d again within 5s",
+                severity="warning",
+                timeout=5,
             )
-            self.notify("drain started in background", timeout=3)
+            return
+        self._confirm_drain_until = 0.0
+        try:
+            launched = 0
+            if any(item.get("_queue_source") == "legacy" for item in entries):
+                if WATCHDOG_MONITOR is None:
+                    raise RuntimeError("watchdog_monitor_unavailable")
+                subprocess.Popen(
+                    [str(WATCHDOG_MONITOR), "sync", "--all"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                launched += 1
+            if any(item.get("_queue_source") == "file" for item in entries):
+                if WATCHDOG_SHELL is None:
+                    raise RuntimeError("watchdog_shell_unavailable")
+                environment = os.environ.copy()
+                environment.update(
+                    {"AGAM_HOME": str(DATA_HOME), "AGAM_DATA_HOME": str(DATA_HOME)}
+                )
+                environment.pop("AGAM_QUEUE_FILE", None)
+                subprocess.Popen(
+                    ["/bin/bash", str(WATCHDOG_SHELL)],
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                launched += 1
+            self.notify(
+                "drain started in background" if launched else "session queue is empty",
+                timeout=3,
+            )
         except Exception as e:
             self.notify(f"drain failed: {e}", severity="error")
 
@@ -998,30 +1416,251 @@ class AgamApp(App):
 
     def action_row_detail(self) -> None:
         tab = self._active_tab()
-        if tab == "queue":
+        if tab == "sessions":
             self._queue_row_detail()
-        elif tab == "graph":
-            self._graph_row_detail()
-        elif tab == "lessons":
-            self._lessons_row_detail()
+        elif tab == "vaults":
+            if getattr(self.focused, "id", None) == "vault-rail":
+                self._select_vault_row()
+            else:
+                self._vault_row_detail()
+        elif tab == "reviews":
+            self._review_row_detail()
 
     def action_sync_row(self) -> None:
-        if self._active_tab() != "queue":
+        if self._active_tab() != "sessions":
             return
         idx = self._queue_cursor_idx()
         if idx is None:
             return
-        if WATCHDOG_MONITOR is None:
-            self.notify("watchdog-monitor not installed", severity="error")
+        rows = _queue_state(_read_queue())
+        if idx >= len(rows):
             return
         self.notify(f"force-syncing queue row {idx}...", timeout=4)
         try:
-            subprocess.Popen(
-                [str(WATCHDOG_MONITOR), "sync", str(idx)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            self._start_queue_sync(rows[idx], idx)
         except Exception as e:
             self.notify(f"sync failed: {e}", severity="error")
+
+    def _start_queue_sync(self, entry: dict, display_index: int) -> None:
+        if entry.get("_queue_source") == "file":
+            if WATCHDOG_SHELL is None:
+                raise RuntimeError("watchdog_shell_unavailable")
+            selected = Path(entry["_queue_file"]).resolve(strict=False)
+            queue_root = NEW_QUEUE_DIR.resolve(strict=False)
+            if selected.parent != queue_root or selected.suffix != ".json":
+                raise ValueError("invalid_queue_entry")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "AGAM_HOME": str(DATA_HOME),
+                    "AGAM_DATA_HOME": str(DATA_HOME),
+                    "AGAM_QUEUE_FILE": selected.name,
+                }
+            )
+            subprocess.Popen(
+                ["/bin/bash", str(WATCHDOG_SHELL)],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        if WATCHDOG_MONITOR is None:
+            raise RuntimeError("watchdog_monitor_unavailable")
+        source_index = entry.get("_queue_index", display_index)
+        subprocess.Popen(
+            [str(WATCHDOG_MONITOR), "sync", str(source_index)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def action_archive_session(self) -> None:
+        if self._active_tab() != "sessions":
+            return
+        idx = self._queue_cursor_idx()
+        rows = _queue_state(_read_queue())
+        if idx is None or idx >= len(rows):
+            return
+        now = time.monotonic()
+        pending = getattr(self, "_confirm_archive", None)
+        if not pending or pending[0] != idx or now > pending[1]:
+            self._confirm_archive = (idx, now + 5.0)
+            self.notify(
+                f"archive session row {idx}? press D again within 5s",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        self._confirm_archive = None
+        try:
+            self._archive_queue_entry(rows[idx])
+        except Exception:
+            self.notify("archive failed", severity="error")
+            return
+        self._populate_queue()
+        self.notify(f"archived session row {idx}", timeout=3)
+
+    def action_retry_review(self) -> None:
+        if self._active_tab() != "reviews":
+            return
+        opaque_id = self._selected_review_id()
+        if opaque_id is None or getattr(self, "_review_busy", False):
+            return
+        self._review_busy = True
+        self.notify("retrying selected item with local Claude CLI / Haiku…", timeout=8)
+        self.run_worker(
+            lambda: self._retry_review_worker(opaque_id),
+            thread=True,
+            exclusive=True,
+            group="sealed-review",
+        )
+
+    def action_resolve_review(self) -> None:
+        if self._active_tab() != "reviews" or self._selected_review_id() is None:
+            return
+        try:
+            vaults = tuple(
+                item for item in _vault_catalog().summaries() if item.state == "active"
+            )
+        except Exception:
+            self.notify("vault registry unavailable", severity="error")
+            return
+        self.push_screen(ReviewDecisionScreen(vaults), self._on_review_route)
+
+    def action_publish_reviews(self) -> None:
+        if self._active_tab() != "reviews" or getattr(self, "_review_queue_instance", None) is None:
+            return
+        now = time.monotonic()
+        if now > getattr(self, "_confirm_publish_until", 0.0):
+            unresolved = len(self._review_items)
+            self._confirm_publish_until = now + 5.0
+            self.notify(
+                f"publish a new immutable vault version? {unresolved} unresolved rows stay omitted; press P again",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        self._confirm_publish_until = 0.0
+        if getattr(self, "_review_busy", False):
+            return
+        self._review_busy = True
+        self.notify("building and validating new vault version…", timeout=8)
+        self.run_worker(
+            self._publish_review_worker,
+            thread=True,
+            exclusive=True,
+            group="sealed-review",
+        )
+
+    def _on_review_route(self, route: str | None) -> None:
+        opaque_id = self._selected_review_id()
+        if route is None or opaque_id is None or getattr(self, "_review_busy", False):
+            return
+        self._review_busy = True
+        self.notify("sealing review decision…", timeout=6)
+        self.run_worker(
+            lambda: self._resolve_review_worker(opaque_id, route),
+            thread=True,
+            exclusive=True,
+            group="sealed-review",
+        )
+
+    def _review_finished(self, message: str, *, error: bool = False) -> None:
+        self._review_busy = False
+        self._populate_reviews()
+        self.notify(
+            message,
+            severity="error" if error else "information",
+            timeout=5,
+        )
+
+    def _retry_review_worker(self, opaque_id: str) -> None:
+        try:
+            from agam.knowledge_classifier import ClaudeCliRunner
+
+            runner_dir = DATA_HOME / "knowledge" / "sealed" / "staging" / ".classifier-runner"
+            runner_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            runner = ClaudeCliRunner(working_directory=runner_dir, model="haiku")
+            summary = self._review_queue_instance.retry(opaque_id, runner)
+        except Exception:
+            self.call_from_thread(
+                self._review_finished, "Haiku retry failed; item remains sealed", error=True
+            )
+            return
+        if summary.failed:
+            self.call_from_thread(
+                self._review_finished,
+                "Haiku retry failed; item remains sealed",
+                error=True,
+            )
+        elif summary.review:
+            self.call_from_thread(
+                self._review_finished,
+                "Haiku remains uncertain; review item kept",
+            )
+        else:
+            self.call_from_thread(self._review_finished, "Haiku resolved the review item")
+
+    def _resolve_review_worker(
+        self, opaque_id: str, route: str
+    ) -> None:
+        try:
+            self._review_queue_instance.resolve(opaque_id, vault_id=route)
+        except Exception:
+            self.call_from_thread(
+                self._review_finished,
+                "review decision failed integrity checks",
+                error=True,
+            )
+            return
+        self.call_from_thread(self._review_finished, "review decision sealed")
+
+    def _publish_review_worker(self) -> None:
+        try:
+            from agam import installer
+
+            schema = installer._find_resource("knowledge/graph-schema.sql")
+            summary = self._review_queue_instance.publish(SCOPES_ROOT, schema)
+        except Exception:
+            self.call_from_thread(
+                self._review_finished,
+                "vault publication failed; active version was not changed",
+                error=True,
+            )
+            return
+        self.call_from_thread(self._populate_vaults)
+        self.call_from_thread(
+            self._review_finished, f"published vault version {summary.version}"
+        )
+
+    def _archive_queue_entry(self, entry: dict) -> None:
+        payload = {key: value for key, value in entry.items() if not key.startswith("_")}
+        if entry.get("_queue_source") == "file":
+            selected = Path(entry["_queue_file"]).resolve(strict=True)
+            root = NEW_QUEUE_DIR.resolve(strict=True)
+            if selected.parent != root or selected.suffix != ".json":
+                raise ValueError("invalid_queue_entry")
+            ARCHIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with ARCHIVE_PATH.open("a", encoding="utf-8") as archive:
+                archive.write(json.dumps(payload, sort_keys=True) + "\n")
+            selected.unlink()
+            return
+
+        index = entry.get("_queue_index")
+        rows = _read_jsonl(QUEUE_PATH)
+        if not isinstance(index, int) or not 0 <= index < len(rows):
+            raise ValueError("invalid_queue_entry")
+        ARCHIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ARCHIVE_PATH.open("a", encoding="utf-8") as archive:
+            archive.write(json.dumps(payload, sort_keys=True) + "\n")
+        del rows[index]
+        QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=QUEUE_PATH.parent, delete=False
+        ) as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+            temp_path = Path(handle.name)
+        os.replace(temp_path, QUEUE_PATH)
 
     def action_toggle_paused(self) -> None:
         if self._active_tab() != "graph":
@@ -1056,7 +1695,7 @@ class AgamApp(App):
             self.notify(f"prop error: {e}", severity="error")
 
     def action_apply_fix(self) -> None:
-        if self._active_tab() != "lint":
+        if self._active_tab() != "health":
             return
         if not LINT.exists():
             return
@@ -1085,6 +1724,80 @@ class AgamApp(App):
         self.notify("no fix line found", severity="warning")
 
     # ---- detail openers ----
+
+    def _select_vault_row(self) -> None:
+        try:
+            table = self.query_one("#vault-rail", DataTable)
+            if table.cursor_row is None:
+                return
+            summary = self._vault_summaries[table.cursor_row]
+        except (IndexError, AttributeError):
+            return
+        self._selected_vault = summary.scope
+        self.query_one("#vault-filter", Input).value = ""
+        self._populate_vault_entities()
+        if summary.readable:
+            self.query_one("#vault-table", DataTable).focus()
+        self.notify(f"selected {summary.name or summary.scope}", timeout=2)
+
+    def _vault_row_detail(self) -> None:
+        try:
+            table = self.query_one("#vault-table", DataTable)
+            if table.cursor_row is None:
+                return
+            entity = self._vault_entities[table.cursor_row]
+        except (IndexError, AttributeError):
+            return
+        body = Text()
+        body.append(entity.name, style="bold yellow")
+        body.append(f"  [{entity.kind}]\n", style="grey50")
+        body.append(f"vault: {self._selected_vault}\n\n", style="cyan")
+        body.append(entity.description, style="white")
+        body.append("\n\nread-only · verified active store", style="green")
+        self.push_screen(DetailScreen(entity.name, body))
+
+    def _update_vault_detail(self, index: int) -> None:
+        if not 0 <= index < len(self._vault_entities):
+            return
+        entity = self._vault_entities[index]
+        detail = Text()
+        detail.append(f"{self._selected_vault.upper()}  ", style="bold cyan")
+        detail.append(entity.name, style="bold yellow")
+        detail.append(f"  [{entity.kind}]\n", style="grey50")
+        detail.append(
+            re.sub(
+                r"^\[VAULT:vault_[0-9a-f]{24}\]\s*", "", entity.description
+            ),
+            style="white",
+        )
+        self.query_one("#vault-detail", Static).update(detail)
+
+    def _selected_review_id(self) -> str | None:
+        try:
+            table = self.query_one("#review-table", DataTable)
+            if table.cursor_row is None:
+                return None
+            return self._review_items[table.cursor_row].opaque_id
+        except (IndexError, AttributeError):
+            return None
+
+    def _review_row_detail(self) -> None:
+        opaque_id = self._selected_review_id()
+        if opaque_id is None or getattr(self, "_review_queue_instance", None) is None:
+            return
+        try:
+            detail = self._review_queue_instance.detail(opaque_id)
+        except Exception:
+            self.notify("review detail failed integrity checks", severity="error")
+            return
+        body = Text()
+        body.append(detail.name, style="bold yellow")
+        body.append(f"  [{detail.kind}]\n", style="grey50")
+        body.append(f"opaque id: {detail.opaque_id}\n", style="grey50")
+        body.append(f"reason: {detail.reason_code}\n\n", style="orange3")
+        body.append(detail.description, style="white")
+        body.append("\n\nh = retry with Haiku · x = resolve · esc = close", style="green")
+        self.push_screen(DetailScreen("sealed review", body))
 
     def _queue_cursor_idx(self) -> int | None:
         try:
@@ -1201,6 +1914,111 @@ class AgamApp(App):
 
     # ---- table populators ----
 
+    def _populate_vaults(self, query: str = "") -> None:
+        rail = self.query_one("#vault-rail", DataTable)
+        rail.clear(columns=True)
+        rail.add_columns("vault", "access", "state", "items")
+        try:
+            catalog = _vault_catalog()
+            summaries = catalog.summaries()
+        except Exception:
+            self._vault_summaries = ()
+            self._vault_entities = ()
+            rail.add_row("unavailable", "—", "error", "—")
+            table = self.query_one("#vault-table", DataTable)
+            table.clear(columns=True)
+            table.add_columns("name", "type", "description", "updated")
+            table.add_row("No verified active manifest", "", "run agam doctor", "")
+            return
+        self._vault_catalog_instance = catalog
+        self._vault_summaries = summaries
+        for item in summaries:
+            if item.state == "archived":
+                state = Text("archived", style="grey50")
+                label_style = "grey50"
+            elif item.readable:
+                state = Text("readable", style="green")
+                label_style = "yellow" if item.role == "guidance" else "cyan"
+            else:
+                state = Text("restricted", style="red")
+                label_style = "grey50"
+            rail.add_row(
+                Text(item.name or item.scope, style=label_style),
+                item.access,
+                state,
+                str(item.entities),
+            )
+        if summaries:
+            self.query_one("#vault-hint", Static).update(
+                f"VAULTS  [dim]active {summaries[0].version[:18]} · Enter selects[/dim]"
+            )
+        available = {item.scope for item in summaries}
+        if self._selected_vault not in available:
+            self._selected_vault = summaries[0].scope if summaries else ""
+        self._populate_vault_entities(query)
+
+    def _populate_vault_entities(self, query: str = "") -> None:
+        table = self.query_one("#vault-table", DataTable)
+        table.clear(columns=True)
+        table.add_columns("name", "type", "description", "updated")
+        catalog = getattr(self, "_vault_catalog_instance", None)
+        if catalog is None:
+            return
+        try:
+            rows = catalog.entities(self._selected_vault, query=query)
+        except Exception:
+            self._vault_entities = ()
+            table.add_row("Vault unavailable", "", "verification failed closed", "")
+            return
+        self._vault_entities = rows
+        if not rows:
+            selected = self._selected_vault_summary()
+            name = selected.name if selected is not None else self._selected_vault
+            table.add_row("No matches", "", f"{name} is empty for this filter", "")
+            self.query_one("#vault-detail", Static).update(
+                f"No {name} entities match this filter."
+            )
+            return
+        for entity in rows:
+            table.add_row(
+                Text(entity.name[:36], style="yellow"),
+                Text(entity.kind, style="grey50"),
+                re.sub(
+                    r"^\[VAULT:vault_[0-9a-f]{24}\]\s*", "", entity.description
+                )[:72],
+                (entity.updated or "?").split("T")[0],
+            )
+        self._update_vault_detail(0)
+
+    def _populate_reviews(self) -> None:
+        table = self.query_one("#review-table", DataTable)
+        table.clear(columns=True)
+        table.add_columns("idx", "state", "opaque id", "reason", "classified")
+        try:
+            queue = getattr(self, "_review_queue_instance", None) or _review_queue()
+            if queue is None:
+                raise RuntimeError("review_queue_unavailable")
+            items = queue.items()
+        except Exception:
+            self._review_queue_instance = None
+            self._review_items = ()
+            table.add_row("—", "unavailable", "—", "no sealed review run", "—")
+            return
+        self._review_queue_instance = queue
+        self._review_items = items
+        if not items:
+            table.add_row("—", "clear", "—", "no unresolved reviews", "—")
+            return
+        for index, item in enumerate(items):
+            state = "failed" if item.failed else "review"
+            table.add_row(
+                str(index),
+                Text(state, style="red" if item.failed else "orange3"),
+                item.opaque_id,
+                item.reason_code,
+                item.classified_at[:19],
+            )
+
     def _populate_queue(self) -> None:
         table = self.query_one("#queue-table", DataTable)
         table.clear(columns=True)
@@ -1313,9 +2131,15 @@ class AgamApp(App):
 
     # ---- input handlers ----
 
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id == "vault-table":
+            row = event.data_table.cursor_row
+            if row is not None:
+                self._update_vault_detail(row)
+
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "graph-filter":
-            self._populate_graph(event.value.strip())
+        if event.input.id == "vault-filter":
+            self._populate_vault_entities(event.value.strip())
 
 
 def main() -> int:

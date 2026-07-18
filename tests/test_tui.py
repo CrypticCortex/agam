@@ -7,10 +7,16 @@ developer's real home directory.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
+
+
+GUIDANCE_ID = "vault_" + "a" * 24
+SOLUTIONS_ID = "vault_" + "b" * 24
+CUSTOM_ID = "vault_" + "c" * 24
 
 
 @pytest.fixture
@@ -39,6 +45,20 @@ def tui(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(module, "CURSOR_PROCESSED", data_home / "processed")
     monkeypatch.setattr(module, "CURSOR_ERRORS", data_home / "queue-errors")
     monkeypatch.setattr(module, "CURSOR_WLOG", data_home / "logs" / "watchdog.log")
+    monkeypatch.setattr(module, "SCOPES_ROOT", data_home / "knowledge" / "scopes")
+    monkeypatch.setattr(
+        module,
+        "REGISTRY_PATH",
+        data_home / "knowledge" / "scopes" / "registry.json",
+    )
+    from agam.vault_registry import initialize_registry
+
+    initialize_registry(
+        module.REGISTRY_PATH,
+        guidance_name="Craft",
+        solutions_name="Repairs",
+        agents=("codex",),
+    )
     return module
 
 
@@ -70,7 +90,7 @@ def test_identity_and_graph_fall_back_to_legacy_until_migrated(tui, tmp_path):
 
     (shared / "AGAM.md").write_text("# shared\n")
     shared_graph = shared / "knowledge" / "graph.db"
-    shared_graph.parent.mkdir(parents=True)
+    shared_graph.parent.mkdir(parents=True, exist_ok=True)
     shared_graph.write_bytes(b"shared graph placeholder")
 
     assert tui._identity_home(tmp_path, shared) == shared
@@ -127,41 +147,45 @@ def test_brain_bar_renders_a_travelling_codex_wire(tui):
     assert second.plain != first.plain
 
 
-def test_brain_bar_summary_includes_codex_provenance(tui):
+def test_brain_bar_summary_includes_safe_vault_counts(tui):
     bar = tui.BrainBar()
     bar._agents = ["claude", "cursor", "codex"]
     bar._frame = 0
     bar._total = 19
-    bar._prov = {"claude": 3, "cursor": 5, "codex": 11}
+    bar._vault_counts = {"Craft": 8, "Repairs": 11}
 
     rendered = bar._build().plain
 
     assert "3 minds · 19 memories" in rendered
-    assert "claude 3" in rendered
-    assert "cursor 5" in rendered
-    assert "codex 11" in rendered
+    assert "Craft 8" in rendered
+    assert "Repairs 11" in rendered
 
 
-def test_overview_includes_codex_provenance(tui, monkeypatch):
+def test_overview_includes_codex_safe_vault_counts(tui, monkeypatch):
+    from agam.vaults import VaultSummary
+
     monkeypatch.setattr(tui, "_read_queue", lambda: [])
     monkeypatch.setattr(tui, "_daily_cap", lambda: 8)
     monkeypatch.setattr(tui, "_last_drain_ts", lambda: None)
     monkeypatch.setattr(tui, "_error_count", lambda: 0)
     monkeypatch.setattr(tui, "_invoker", lambda: ("host", "green"))
     monkeypatch.setattr(tui, "_draining", lambda: False)
-    monkeypatch.setattr(tui, "_today_growth", lambda: 0)
-    monkeypatch.setattr(
-        tui,
-        "_provenance_counts",
-        lambda: [("codex", 11), ("cursor", 5), ("claude", 3)],
-    )
-    monkeypatch.setattr(tui, "_kg_query", lambda *_args, **_kwargs: [(19,)])
+    class Catalog:
+        def summaries(self):
+            return (
+                VaultSummary(GUIDANCE_ID, "v-test", 8, 0, 0, True, name="Craft"),
+                VaultSummary(SOLUTIONS_ID, "v-test", 11, 0, 0, True, name="Repairs"),
+                VaultSummary(CUSTOM_ID, "v-test", 40, 0, 0, False, name="Project North"),
+            )
+
+    monkeypatch.setattr(tui, "_vault_catalog", lambda: Catalog())
 
     rendered = tui.render_overview().plain
 
-    assert "claude 3" in rendered
-    assert "cursor 5" in rendered
-    assert "codex 11" in rendered
+    assert "19 Codex-readable memories" in rendered
+    assert "Craft 8" in rendered
+    assert "Repairs 11" in rendered
+    assert "Project North" not in rendered
 
 
 def test_invoker_is_healthy_when_only_codex_is_on_path(tui, monkeypatch):
@@ -173,3 +197,210 @@ def test_invoker_is_healthy_when_only_codex_is_on_path(tui, monkeypatch):
     )
 
     assert tui._invoker() == ("host", "green")
+
+
+def test_operator_console_has_vault_and_both_queue_views(tui, monkeypatch):
+    from agam.review_queue import ReviewItem
+    from agam.vaults import VaultEntity, VaultSummary
+
+    class FakeCatalog:
+        def summaries(self):
+            return (
+                VaultSummary(GUIDANCE_ID, "v-test", 2, 0, 0, True, name="Craft"),
+                VaultSummary(SOLUTIONS_ID, "v-test", 1, 0, 0, True, name="Repairs"),
+                VaultSummary(CUSTOM_ID, "v-test", 4, 0, 0, False, name="Project North"),
+                VaultSummary("vault_" + "d" * 24, "v-test", 3, 0, 0, False, name="Private Notes"),
+            )
+
+        def entities(self, scope, *, query="", limit=200):
+            rows = {
+                GUIDANCE_ID: (
+                    VaultEntity(1, "verify-first", "lesson", "[GENERAL] prove it", "2026"),
+                    VaultEntity(2, "focused-diffs", "lesson", "[GENERAL] stay narrow", "2026"),
+                ),
+                SOLUTIONS_ID: (
+                    VaultEntity(1, "shared-seam", "resolution", "[GENERAL] fix seam", "2026"),
+                ),
+            }[scope]
+            return tuple(row for row in rows if query.lower() in row.name.lower())
+
+    class FakeReviewQueue:
+        def items(self):
+            return (ReviewItem("item_" + "ab" * 12, "ambiguous_scope", False, "2026"),)
+
+    monkeypatch.setattr(tui, "_vault_catalog", lambda: FakeCatalog())
+    monkeypatch.setattr(tui, "_review_queue", lambda: FakeReviewQueue())
+
+    async def scenario():
+        app = tui.AgamApp()
+        async with app.run_test(size=(120, 42)) as pilot:
+            tabs = app.query_one("#tabs", tui.TabbedContent)
+            assert [pane.id for pane in tabs.query(tui.TabPane)] == [
+                "overview",
+                "vaults",
+                "sessions",
+                "reviews",
+                "worklog",
+                "activity",
+                "health",
+            ]
+            assert app.query_one("#vault-rail", tui.DataTable).row_count == 4
+            assert app.query_one("#vault-table", tui.DataTable).row_count == 2
+            assert app.query_one("#review-table", tui.DataTable).row_count == 1
+            await pilot.press("2")
+            assert tabs.active == "vaults"
+
+    asyncio.run(scenario())
+
+
+def test_vault_filter_updates_the_selected_safe_vault(tui, monkeypatch):
+    from agam.vaults import VaultEntity, VaultSummary
+
+    class FakeCatalog:
+        def summaries(self):
+            return (
+                VaultSummary(GUIDANCE_ID, "v-test", 2, 0, 0, True, name="Craft"),
+                VaultSummary(SOLUTIONS_ID, "v-test", 0, 0, 0, True, name="Repairs"),
+            )
+
+        def entities(self, scope, *, query="", limit=200):
+            rows = (
+                VaultEntity(1, "verify-first", "lesson", "[GENERAL] prove it", "2026"),
+                VaultEntity(2, "focused-diffs", "lesson", "[GENERAL] stay narrow", "2026"),
+            )
+            return tuple(row for row in rows if query.lower() in row.name.lower())
+
+    monkeypatch.setattr(tui, "_vault_catalog", lambda: FakeCatalog())
+    monkeypatch.setattr(tui, "_review_queue", lambda: None)
+
+    async def scenario():
+        app = tui.AgamApp()
+        async with app.run_test(size=(90, 32)) as pilot:
+            await pilot.press("2")
+            field = app.query_one("#vault-filter", tui.Input)
+            field.focus()
+            await pilot.press("f", "o", "c", "u", "s")
+            assert app.query_one("#vault-table", tui.DataTable).row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_archive_one_file_queue_row_preserves_audit_record(tui):
+    tui.NEW_QUEUE_DIR.mkdir(parents=True)
+    queued = tui.NEW_QUEUE_DIR / "session-1.json"
+    queued.write_text(
+        json.dumps(
+            {
+                "session_id": "session-1",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "cwd": "/tmp/project",
+                "context": "codex",
+                "agent": "codex",
+                "ts": 1,
+            }
+        )
+    )
+    row = tui._read_queue()[0]
+
+    tui.AgamApp()._archive_queue_entry(row)
+
+    assert not queued.exists()
+    archived = [json.loads(line) for line in tui.ARCHIVE_PATH.read_text().splitlines()]
+    assert archived == [
+        {
+            "agent": "codex",
+            "context": "codex",
+            "cwd": "/tmp/project",
+            "session_id": "session-1",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "ts": 1,
+        }
+    ]
+
+
+def test_sync_one_file_queue_row_targets_exact_generation(tui, monkeypatch, tmp_path):
+    calls = []
+    shell = tmp_path / "agam_watchdog.sh"
+    shell.write_text("#!/bin/bash\n")
+    monkeypatch.setattr(tui, "WATCHDOG_SHELL", shell)
+    monkeypatch.setattr(
+        tui.subprocess,
+        "Popen",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+    entry = {
+        "_queue_source": "file",
+        "_queue_file": str(tui.NEW_QUEUE_DIR / "codex-generation.json"),
+    }
+
+    tui.AgamApp()._start_queue_sync(entry, 7)
+
+    command, kwargs = calls[0]
+    assert command == ["/bin/bash", str(shell)]
+    assert kwargs["env"]["AGAM_QUEUE_FILE"] == "codex-generation.json"
+    assert kwargs["env"]["AGAM_HOME"] == str(tui.DATA_HOME)
+
+
+def test_sync_one_legacy_row_uses_its_source_index(tui, monkeypatch, tmp_path):
+    calls = []
+    monitor = tmp_path / "watchdog_monitor.py"
+    monitor.write_text("#!/usr/bin/env python3\n")
+    monkeypatch.setattr(tui, "WATCHDOG_MONITOR", monitor)
+    monkeypatch.setattr(
+        tui.subprocess,
+        "Popen",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+    entry = {"_queue_source": "legacy", "_queue_index": 2}
+
+    tui.AgamApp()._start_queue_sync(entry, 7)
+
+    assert calls[0][0] == [str(monitor), "sync", "2"]
+
+
+def test_vault_view_renders_fail_closed_state_without_manifest(tui, monkeypatch):
+    def unavailable():
+        raise RuntimeError("no manifest")
+
+    monkeypatch.setattr(tui, "_vault_catalog", unavailable)
+    monkeypatch.setattr(tui, "_review_queue", lambda: None)
+
+    async def scenario():
+        app = tui.AgamApp()
+        async with app.run_test(size=(90, 32)):
+            assert app.query_one("#vault-rail", tui.DataTable).row_count == 1
+            assert app.query_one("#vault-table", tui.DataTable).row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_exposes_keyboard_first_vault_lifecycle_actions(tui):
+    actions = {binding.action for binding in tui.AgamApp.BINDINGS}
+
+    assert {
+        "add_vault",
+        "rename_vault",
+        "archive_vault",
+        "toggle_vault_access",
+    }.issubset(actions)
+
+
+def test_tui_add_callback_creates_restricted_custom_vault(tui, monkeypatch):
+    from agam.vault_registry import initialize_registry, load_registry
+
+    initialize_registry(
+        tui.REGISTRY_PATH,
+        guidance_name="Craft",
+        solutions_name="Repairs",
+        agents=("codex",),
+    )
+    app = tui.AgamApp()
+    monkeypatch.setattr(app, "_populate_vaults", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "notify", lambda *args, **kwargs: None)
+
+    app._on_add_vault(("Project North", "north only"))
+
+    added = load_registry(tui.REGISTRY_PATH).vaults[-1]
+    assert added.name == "Project North"
+    assert added.access.value == "restricted"
+    assert added.routing_hint == "north only"

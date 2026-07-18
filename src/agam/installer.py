@@ -405,6 +405,51 @@ def _create_kg(staging_knowledge: Path) -> None:
         conn.close()
 
 
+def _write_scope_policy(agam_home: Path) -> None:
+    """Create content-free vault metadata once, without activating stores."""
+    from agam.vault_registry import initialize_registry
+
+    scopes = agam_home / "knowledge" / "scopes"
+    scopes.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(scopes, 0o700)
+    initialize_registry(
+        scopes / "registry.json",
+        guidance_name="Guidance",
+        solutions_name="Solutions",
+        agents=("codex", "claude", "cursor"),
+    )
+    config = scopes / "config.json"
+    if config.exists() or config.is_symlink():
+        return
+    policy = {
+        "agents": {
+            "codex": {
+                "recall": True,
+                "boot-injection": False,
+                "capture": False,
+            },
+            "claude": {
+                "recall": True,
+                "boot-injection": False,
+                "capture": False,
+            },
+            "cursor": {
+                "recall": True,
+                "boot-injection": False,
+                "capture": False,
+            },
+        },
+    }
+    descriptor = os.open(
+        config,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(policy, handle, indent=2, ensure_ascii=True)
+        handle.write("\n")
+
+
 def _write_launchd_plist(
     staging_launch_agents: Path,
     paths: InstallPaths,
@@ -847,6 +892,7 @@ def run_install(
     # KG: never clobber an existing/migrated graph.
     if not (agam_home / "knowledge" / "graph.db").exists():
         _create_kg(agam_home / "knowledge")
+    _write_scope_policy(agam_home)
 
     # Shared hooks/tools copy for the watchdog.
     agent_copy.copy_hooks_tree(agam_home / "hooks")

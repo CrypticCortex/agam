@@ -238,7 +238,22 @@ else
     fi
 fi
 
-entries=("$AGAM_HOME"/queue/*.json)
+QUEUE_FILE="${AGAM_QUEUE_FILE:-}"
+if [[ -n "$QUEUE_FILE" ]]; then
+    # TUI item-level drain. Accept one basename only; never let a caller turn
+    # this selector into an arbitrary file read or escape from queue/.
+    if [[ "$QUEUE_FILE" == */* || ! "$QUEUE_FILE" =~ ^[A-Za-z0-9._-]+\.json$ ]]; then
+        log "invalid-queue-file"
+        exit 2
+    fi
+    selected_entry="$AGAM_HOME/queue/$QUEUE_FILE"
+    entries=()
+    if [[ -f "$selected_entry" && ! -L "$selected_entry" ]]; then
+        entries=("$selected_entry")
+    fi
+else
+    entries=("$AGAM_HOME"/queue/*.json)
+fi
 
 if [[ -z "$INVOKER_KIND" ]]; then
     if [[ ${#entries[@]} -gt 0 ]]; then
@@ -330,6 +345,12 @@ run_entry() {
 MAX_PER_RUN="${AGAM_MAX_PER_RUN:-25}"
 MAX_RETRIES="${AGAM_MAX_RETRIES:-3}"
 
+if [[ -n "$QUEUE_FILE" ]]; then
+    entry_stream() { printf '%s\n' "${entries[@]}"; }
+else
+    entry_stream() { ls -1tr "$AGAM_HOME"/queue/*.json 2>/dev/null; }
+fi
+
 drained=0
 ok_n=0
 err_n=0
@@ -407,6 +428,6 @@ while IFS= read -r entry; do
         fi
     fi
     rmdir "$claim_dir" 2>/dev/null || true
-done < <(ls -1tr "$AGAM_HOME"/queue/*.json 2>/dev/null)
+done < <(entry_stream)
 
 log "drain-done ok=$ok_n err=$err_n retry=$retry_n"

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import stat
+import tempfile
 from pathlib import Path
 
 _PKG_ROOT = Path(__file__).resolve().parent.parent  # src/agam/
@@ -28,15 +30,33 @@ def _make_executable(p: Path) -> None:
 
 def copy_files(names: list[str], src_dir: Path, dst_dir: Path, *, executable: bool) -> None:
     """Copy named files from src_dir to dst_dir; chmod +x when executable."""
+    if dst_dir.is_symlink():
+        raise OSError("unsafe destination directory")
     dst_dir.mkdir(parents=True, exist_ok=True)
+    if not dst_dir.is_dir() or dst_dir.is_symlink():
+        raise OSError("unsafe destination directory")
     for name in names:
         src = src_dir / name
         if not src.exists():
             continue
         out = dst_dir / name
-        shutil.copy2(src, out)
-        if executable and out.suffix in (".py", ".sh"):
-            _make_executable(out)
+        if out.is_symlink() or (out.exists() and not out.is_file()):
+            raise OSError("unsafe destination file")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{name}.", suffix=".tmp", dir=dst_dir
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copy2(src, temporary, follow_symlinks=False)
+            if executable and out.suffix in (".py", ".sh"):
+                _make_executable(temporary)
+            os.replace(temporary, out)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def copy_hooks_tree(dst_dir: Path) -> None:

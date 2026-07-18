@@ -73,6 +73,7 @@ class ClaudeAgent(AgentTarget):
         settings_path = self.hook_config_path(home)
         _set_settings_env(settings_path, "AGAM_DATA_HOME", str(agam_home))
         _set_settings_env(settings_path, "AGAM_HOME", str(agam_home))
+        _set_settings_env(settings_path, "AGAM_RECALL_AGENT", "claude")
         _set_settings_env(
             settings_path, "AGAM_KG_PATH", str(agam_home / "knowledge" / "graph.db")
         )
