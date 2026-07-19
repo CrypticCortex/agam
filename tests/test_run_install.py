@@ -115,6 +115,23 @@ def test_install_preserves_existing_scope_policy(tmp_path):
     assert not (scopes / "active.json").exists()
 
 
+def test_install_migrates_fixed_scope_layout_before_creating_registry(tmp_path):
+    from tests.test_vault_migration import _legacy_state
+
+    legacy_root = _legacy_state(tmp_path / ".agam" / "knowledge")
+
+    run_install(
+        _answers(tmp_path), targets=["codex"], home=tmp_path, write_plist=False,
+    )
+
+    registry = json.loads((legacy_root / "registry.json").read_text())
+    active = json.loads((legacy_root / "active.json").read_text())
+    manifest = json.loads((legacy_root / active["manifest"]).read_text())
+    assert set(manifest["stores"]) == {
+        vault["id"] for vault in registry["vaults"]
+    }
+
+
 def test_codex_plist_persists_resolved_executable(monkeypatch, tmp_path):
     tool_dir = tmp_path / "custom & toolchain"
     tool_dir.mkdir()

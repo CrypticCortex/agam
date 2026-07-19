@@ -11,7 +11,13 @@ from agam.knowledge_scopes import (
     resolve_agent_capabilities,
     resolve_effective_scopes,
 )
-from agam.vault_registry import add_vault, initialize_registry, set_agent_access
+from agam.vault_registry import (
+    add_vault,
+    archive_vault,
+    initialize_registry,
+    rename_vault,
+    set_agent_access,
+)
 
 
 def _write_json(path: Path, value: object) -> Path:
@@ -153,3 +159,32 @@ def test_agent_capabilities_are_separate_from_vault_selection(tmp_path):
     assert resolve_agent_capabilities(
         "unknown", config_path=config, scope_root=root
     ) == {"recall": False, "boot-injection": False, "capture": False}
+
+
+def test_display_name_change_does_not_invalidate_published_manifest(tmp_path):
+    root, registry, _, _, active = _state(tmp_path)
+    manifest_path = root / "manifests" / "v-test.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["registry_sha256"] = hashlib.sha256(
+        (root / "registry.json").read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    rename_vault(root / "registry.json", registry.vaults[0].id, "New Label")
+
+    assert load_active_manifest(active, scope_root=root) is not None
+
+
+def test_archiving_vault_keeps_other_published_stores_available(tmp_path):
+    root, registry, custom, config, active = _state(tmp_path)
+
+    archive_vault(root / "registry.json", custom.id)
+
+    assert load_active_manifest(active, scope_root=root) is not None
+    assert resolve_effective_scopes(
+        "claude",
+        config_path=config,
+        active_path=active,
+        scope_root=root,
+        env={},
+    ) == tuple(vault.id for vault in registry.vaults)

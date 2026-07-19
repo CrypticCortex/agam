@@ -6,8 +6,10 @@ import hashlib
 import json
 from pathlib import Path
 
-from agam.vault_migration import migrate_fixed_layout
-from agam.vault_registry import VaultRole, load_registry
+import pytest
+
+from agam.vault_migration import VaultMigrationError, migrate_fixed_layout
+from agam.vault_registry import VaultRole, initialize_registry, load_registry
 
 
 def _write(path: Path, value: object) -> Path:
@@ -99,3 +101,43 @@ def test_migration_is_idempotent_after_registry_exists(tmp_path):
     assert first.version == second.version
     assert second.status == "already-migrated"
     assert second.copied_stores == 0
+
+
+def test_recovers_registry_created_before_legacy_layout_was_migrated(tmp_path):
+    root = _legacy_state(tmp_path)
+    premature = initialize_registry(
+        root / "registry.json",
+        guidance_name="My Craft",
+        solutions_name="Repair Library",
+        agents=("codex",),
+    )
+    protected_ids = tuple(vault.id for vault in premature.vaults)
+
+    preview = migrate_fixed_layout(root)
+
+    assert preview.status == "dry-run"
+    assert preview.vaults == 3
+
+    migrated = migrate_fixed_layout(root, apply=True)
+    registry = load_registry(root / "registry.json")
+    assert migrated.status == "migrated"
+    assert tuple(vault.id for vault in registry.vaults[:2]) == protected_ids
+    assert [vault.name for vault in registry.vaults] == [
+        "My Craft",
+        "Repair Library",
+        "Vault 1",
+    ]
+    assert registry.agents["codex"] == protected_ids
+    backup = next((root / "migration-backups").iterdir())
+    assert (backup / "registry.json").exists()
+
+
+def test_rejects_path_shaped_legacy_store_id(tmp_path):
+    root = _legacy_state(tmp_path)
+    manifest_path = root / "manifests" / "v-old.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["stores"]["../escape"] = manifest["stores"].pop("legacy-c")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(VaultMigrationError, match="invalid_legacy_metadata"):
+        migrate_fixed_layout(root)

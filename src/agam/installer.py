@@ -407,11 +407,14 @@ def _create_kg(staging_knowledge: Path) -> None:
 
 def _write_scope_policy(agam_home: Path) -> None:
     """Create content-free vault metadata once, without activating stores."""
+    from agam.vault_migration import migrate_fixed_layout
     from agam.vault_registry import initialize_registry
 
     scopes = agam_home / "knowledge" / "scopes"
     scopes.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(scopes, 0o700)
+    if (scopes / "active.json").exists() or (scopes / "active.json").is_symlink():
+        migrate_fixed_layout(scopes, apply=True)
     initialize_registry(
         scopes / "registry.json",
         guidance_name="Guidance",

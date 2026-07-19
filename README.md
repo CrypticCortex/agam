@@ -285,6 +285,10 @@ the OSS code.
 Migration is copy-only and defaults to a dry run. Agam retains the original
 stores and backs up the old metadata before activation.
 
+Installer reruns detect this migration automatically, including the recovery
+case where an earlier upgrade created `registry.json` before copying the old
+stores. Existing vault names, opaque IDs, and agent selections are preserved.
+
 ```bash
 agam vault migrate
 agam vault migrate --apply

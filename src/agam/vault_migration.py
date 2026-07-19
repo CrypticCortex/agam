@@ -16,6 +16,7 @@ from agam.vault_registry import (
     VaultRole,
     add_vault,
     initialize_registry,
+    is_vault_id,
     load_registry,
     set_agent_access,
 )
@@ -126,18 +127,32 @@ def migrate_fixed_layout(
 ) -> MigrationSummary:
     root = Path(scope_root)
     registry_path = root / "registry.json"
+    pointer, manifest, policy, manifest_path = _load_legacy(root)
+    registry = None
     if registry_path.exists() or registry_path.is_symlink():
         registry = load_registry(registry_path)
-        active = _json_object(root / "active.json")
+    store_ids = tuple(manifest["stores"])
+    if not all(
+        isinstance(item, str) and _VERSION_RE.fullmatch(item)
+        for item in store_ids
+    ):
+        raise VaultMigrationError("invalid_legacy_metadata")
+    opaque_ids = tuple(is_vault_id(item) for item in store_ids)
+    if any(opaque_ids):
+        if (
+            registry is None
+            or not all(opaque_ids)
+            or not set(store_ids).issubset(vault.id for vault in registry.vaults)
+        ):
+            raise VaultMigrationError("invalid_legacy_metadata")
         return MigrationSummary(
             "already-migrated",
             len(registry.vaults),
             0,
-            str(active.get("version", "")),
+            str(pointer.get("version", "")),
         )
 
-    pointer, manifest, policy, manifest_path = _load_legacy(root)
-    old_ids = tuple(manifest["stores"])
+    old_ids = store_ids
     portable = _legacy_selection(policy, "codex")
     if len(portable) != 2 or not set(portable).issubset(old_ids):
         raise VaultMigrationError("portable_roles_unavailable")
@@ -150,15 +165,23 @@ def migrate_fixed_layout(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = root / "migration-backups" / f"{stamp}-{secrets.token_hex(4)}"
     backup.mkdir(parents=True, mode=0o700)
-    for source in (root / "config.json", root / "active.json", manifest_path):
+    backup_sources = [root / "config.json", root / "active.json", manifest_path]
+    if registry is not None:
+        backup_sources.append(registry_path)
+    for source in backup_sources:
         shutil.copy2(source, backup / source.name)
 
     temporary_registry = root / f".registry-migration-{secrets.token_hex(6)}.json"
-    registry = initialize_registry(
-        temporary_registry,
-        guidance_name="Guidance",
-        solutions_name="Solutions",
-    )
+    if registry is None:
+        registry = initialize_registry(
+            temporary_registry,
+            guidance_name="Guidance",
+            solutions_name="Solutions",
+        )
+    else:
+        shutil.copy2(registry_path, temporary_registry)
+        os.chmod(temporary_registry, 0o600)
+        registry = load_registry(temporary_registry)
     mapping = {
         portable[0]: registry.for_role(VaultRole.GUIDANCE).id,
         portable[1]: registry.for_role(VaultRole.SOLUTIONS).id,
@@ -174,12 +197,13 @@ def migrate_fixed_layout(
     registry = load_registry(temporary_registry)
     old_agents = policy.get("agents") if isinstance(policy.get("agents"), dict) else {}
     for agent in old_agents:
-        selected = tuple(
-            mapping[item]
-            for item in _legacy_selection(policy, agent)
-            if item in mapping
-        )
-        set_agent_access(temporary_registry, agent, selected)
+        if agent not in registry.agents:
+            selected = tuple(
+                mapping[item]
+                for item in _legacy_selection(policy, agent)
+                if item in mapping
+            )
+            set_agent_access(temporary_registry, agent, selected)
     registry = load_registry(temporary_registry)
 
     new_stores = {}

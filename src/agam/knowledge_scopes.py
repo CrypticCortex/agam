@@ -227,14 +227,8 @@ def load_active_manifest(
         return None
 
     stores = manifest["stores"]
-    declared_registry_hash = manifest.get("registry_sha256")
-    if (
-        declared_registry_hash is not None
-        and _sha256_file(resolved_root / "registry.json") != declared_registry_hash
-    ):
-        return None
-    active_ids = {vault.id for vault in registry.active}
-    if not set(stores).issubset(active_ids):
+    known_ids = {vault.id for vault in registry.vaults}
+    if not set(stores).issubset(known_ids):
         return None
     for entry in stores.values():
         if (
